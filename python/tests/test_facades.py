@@ -31,6 +31,21 @@ class CapturingClient:
             if method == "getChildren":
                 return [{"id": 12, "name": "Child", "kind": "pixel"}]
             return {"id": 11, "name": "Layer 1"}
+        if namespace == "selection":
+            if method == "get":
+                return {"bounds": {"top": 1, "left": 2, "bottom": 40, "right": 50}, "docId": args[0], "solid": True, "typename": "Selection"}
+            bounds = args[1] if method in {"selectRectangle", "selectEllipse"} else {"top": 0, "left": 0, "bottom": 50, "right": 50}
+            return {"bounds": bounds, "docId": args[0], "solid": method in {"selectAll", "selectRectangle"}, "typename": "Selection"}
+        if namespace == "channel":
+            channel = {"id": 21, "name": "Alpha 1", "kind": "maskedArea", "opacity": 50, "visible": True, "typename": "Channel"}
+            if method in {"getChannels", "getActiveChannels", "getComponentChannels"}:
+                return [channel]
+            if method == "getByName":
+                return channel if args[1] == "Alpha 1" else None
+            if method == "add":
+                return {**channel, "name": args[1] or "Alpha 2"}
+            if method == "remove":
+                return channel
         if namespace == "raw" and method == "evalJs":
             return {"source": args[0], "args": list(args[1:])}
         if namespace == "raw" and method == "getPath":
@@ -59,6 +74,37 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(app.active_layer.name, "Layer 1")
         self.assertFalse(app.active_layer.hasChildren)
         self.assertEqual(app.active_layer.layers[0].name, "Child")
+        self.assertEqual(app.selection.bounds["top"], 1)
+        self.assertEqual(app.channels[0].name, "Alpha 1")
+        selection = app.activeDocument.selection
+        self.assertEqual(selection.bounds["right"], 50)
+        self.assertEqual(selection.doc_id, 7)
+        self.assertEqual(selection.typename, "Selection")
+        self.assertTrue(selection.selectRectangle({"top": 4, "left": 5, "bottom": 9, "right": 10}).solid)
+        self.assertEqual(client.calls[-1]["method"], "selectRectangle")
+        self.assertEqual(selection.select_all(command_name="All").docId, 7)
+        self.assertEqual(client.calls[-1]["options"]["commandName"], "All")
+        selection.select_ellipse({"top": 1, "left": 1, "bottom": 2, "right": 2})
+        selection.selectPolygon([{"x": 1, "y": 2}], commandName="Poly")
+        selection.select_row(4)
+        selection.selectColumn(5)
+        selection.expand(2)
+        selection.contract(1)
+        selection.feather(0.5)
+        selection.smooth(2)
+        selection.grow(12)
+        selection.translateBoundary(1, 2)
+        selection.inverse()
+        selection.deselect()
+        selection.save("Saved selection")
+        channel = app.activeDocument.channels[0]
+        self.assertEqual(channel.name, "Alpha 1")
+        self.assertEqual(channel.kind, "maskedArea")
+        self.assertEqual(app.activeDocument.activeChannels[0].opacity, 50)
+        self.assertEqual(app.activeDocument.component_channels[0].typename, "Channel")
+        self.assertEqual(app.activeDocument.getChannel("Alpha 1").visible, True)
+        app.activeDocument.get_channel("Alpha 1").remove(command_name="Remove")
+        self.assertEqual(client.calls[-1]["options"]["commandName"], "Remove")
         self.assertEqual(app.dom.app.activeDocument.get()["path"], ["app", "activeDocument"])
         self.assertEqual(app.dom.app.activeDocument.createLayer({"name": "x"}, modal=True)["path"], ["app", "activeDocument", "createLayer"])
         with app.executeAsModal(commandName="Hide"):

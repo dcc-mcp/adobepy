@@ -23,12 +23,31 @@ export const photoshopAdapter: HostAdapter = {
       bridgeKind: "uxp",
       bridgeVersion: "0.1.0",
       hostVersion: photoshopVersion(),
-      namespaces: ["app", "document", "layer", "action", "raw"],
+      namespaces: ["app", "document", "layer", "selection", "channel", "action", "raw"],
       features: ["batchPlay", "executeAsModal"],
       methods: {
         app: ["getVersion", "getDocuments"],
         document: ["getActive", "getById", "getLayers", "getActiveLayers", "saveAs", "export"],
         layer: ["getActive", "getChildren"],
+        selection: [
+          "get",
+          "selectAll",
+          "deselect",
+          "inverse",
+          "selectRectangle",
+          "selectEllipse",
+          "selectPolygon",
+          "selectRow",
+          "selectColumn",
+          "expand",
+          "contract",
+          "feather",
+          "smooth",
+          "grow",
+          "translateBoundary",
+          "save"
+        ],
+        channel: ["getChannels", "getActiveChannels", "getComponentChannels", "getByName", "add", "remove"],
         action: ["batchPlay"],
         raw: ["evalJs", "getPath", "callPath"]
       }
@@ -45,6 +64,36 @@ export const photoshopAdapter: HostAdapter = {
     if (request.namespace === "document" && request.method === "export") return saveDocument(request, true);
     if (request.namespace === "layer" && request.method === "getActive") return serializeLayer(activeLayer());
     if (request.namespace === "layer" && request.method === "getChildren") return layerChildren(request);
+    if (request.namespace === "selection" && request.method === "get") return selectionGet(request);
+    if (request.namespace === "selection" && request.method === "selectAll") return selectionCall(request, "selectAll", [], "Select all");
+    if (request.namespace === "selection" && request.method === "deselect") return selectionCall(request, "deselect", [], "Deselect");
+    if (request.namespace === "selection" && request.method === "inverse") return selectionCall(request, "inverse", [], "Invert selection");
+    if (request.namespace === "selection" && request.method === "selectRectangle") {
+      return selectionCall(request, "selectRectangle", request.args?.slice(1) ?? [], "Select rectangle");
+    }
+    if (request.namespace === "selection" && request.method === "selectEllipse") {
+      return selectionCall(request, "selectEllipse", request.args?.slice(1) ?? [], "Select ellipse");
+    }
+    if (request.namespace === "selection" && request.method === "selectPolygon") {
+      return selectionCall(request, "selectPolygon", request.args?.slice(1) ?? [], "Select polygon");
+    }
+    if (request.namespace === "selection" && request.method === "selectRow") return selectionCall(request, "selectRow", request.args?.slice(1) ?? [], "Select row");
+    if (request.namespace === "selection" && request.method === "selectColumn") return selectionCall(request, "selectColumn", request.args?.slice(1) ?? [], "Select column");
+    if (request.namespace === "selection" && request.method === "expand") return selectionCall(request, "expand", request.args?.slice(1) ?? [], "Expand selection");
+    if (request.namespace === "selection" && request.method === "contract") return selectionCall(request, "contract", request.args?.slice(1) ?? [], "Contract selection");
+    if (request.namespace === "selection" && request.method === "feather") return selectionCall(request, "feather", request.args?.slice(1) ?? [], "Feather selection");
+    if (request.namespace === "selection" && request.method === "smooth") return selectionCall(request, "smooth", request.args?.slice(1) ?? [], "Smooth selection");
+    if (request.namespace === "selection" && request.method === "grow") return selectionCall(request, "grow", request.args?.slice(1) ?? [], "Grow selection");
+    if (request.namespace === "selection" && request.method === "translateBoundary") {
+      return selectionCall(request, "translateBoundary", request.args?.slice(1) ?? [], "Translate selection boundary");
+    }
+    if (request.namespace === "selection" && request.method === "save") return selectionCall(request, "save", request.args?.slice(1) ?? [], "Save selection");
+    if (request.namespace === "channel" && request.method === "getChannels") return documentChannels(request, "channels");
+    if (request.namespace === "channel" && request.method === "getActiveChannels") return documentChannels(request, "activeChannels");
+    if (request.namespace === "channel" && request.method === "getComponentChannels") return documentChannels(request, "componentChannels");
+    if (request.namespace === "channel" && request.method === "getByName") return channelByName(request);
+    if (request.namespace === "channel" && request.method === "add") return channelAdd(request);
+    if (request.namespace === "channel" && request.method === "remove") return channelRemove(request);
     if (request.namespace === "action" && request.method === "batchPlay") return batchPlay(request);
     if (request.namespace === "raw" && request.method === "evalJs") return evalJavaScript(asString(request.args?.[0]) ?? "", request.args?.slice(1) ?? []);
     if (request.namespace === "raw" && request.method === "getPath") return getPath(request);
@@ -124,12 +173,48 @@ function serializeLayer(layer: unknown) {
   };
 }
 
+function serializeSelection(selection: unknown) {
+  if (!isObject(selection)) return null;
+  return {
+    bounds: serializeBounds(property(selection, "bounds")),
+    docId: property(selection, "docId"),
+    solid: property(selection, "solid"),
+    typename: asString(property(selection, "typename"))
+  };
+}
+
+function serializeBounds(bounds: unknown) {
+  if (!isObject(bounds)) return null;
+  return {
+    top: scalarValue(property(bounds, "top")),
+    left: scalarValue(property(bounds, "left")),
+    bottom: scalarValue(property(bounds, "bottom")),
+    right: scalarValue(property(bounds, "right"))
+  };
+}
+
+function serializeChannel(channel: unknown) {
+  if (!isObject(channel)) return null;
+  return {
+    id: property(channel, "id"),
+    name: asString(property(channel, "name")),
+    kind: asString(property(channel, "kind")) ?? property(channel, "kind"),
+    opacity: asNumber(property(channel, "opacity")) ?? property(channel, "opacity"),
+    visible: property(channel, "visible"),
+    typename: asString(property(channel, "typename"))
+  };
+}
+
 function serializeDocuments(documents: unknown[]) {
   return documents.map(serializeDocument).filter((document) => document !== null);
 }
 
 function serializeLayers(layers: unknown) {
   return asArray(layers).map(serializeLayer).filter((layer) => layer !== null);
+}
+
+function serializeChannels(channels: unknown) {
+  return asArray(channels).map(serializeChannel).filter((channel) => channel !== null);
 }
 
 function documentLayers(request: RpcRequest) {
@@ -150,10 +235,93 @@ function layerChildren(request: RpcRequest) {
   return serializeLayers(property(layer, "layers"));
 }
 
+function selectionGet(request: RpcRequest) {
+  const selection = selectionForDocument(request.args?.[0]);
+  return serializeSelection(selection);
+}
+
+async function selectionCall(request: RpcRequest, method: string, args: unknown[], defaultCommandName: string) {
+  const selection = selectionForDocument(request.args?.[0]);
+  const fn = property<Callable>(selection, method);
+  if (!fn) unavailable(`Photoshop selection.${method}`);
+  return withModal(request, defaultCommandName, async () => {
+    await maybePromise(fn.apply(selection, args));
+    return serializeSelection(selection);
+  });
+}
+
+function selectionForDocument(documentId: unknown) {
+  const document = findDocument(documentId);
+  if (!document) unavailable("Photoshop document selection");
+  const selection = property(document, "selection");
+  if (!selection) unavailable("Photoshop document.selection");
+  return selection;
+}
+
+function documentChannels(request: RpcRequest, collectionName: string) {
+  const document = findDocument(request.args?.[0]);
+  if (!document) return [];
+  return serializeChannels(property(document, collectionName));
+}
+
+function channelByName(request: RpcRequest) {
+  const document = findDocument(request.args?.[0]);
+  if (!document) return null;
+  return serializeChannel(findChannel(document, request.args?.[1]));
+}
+
+async function channelAdd(request: RpcRequest) {
+  const document = findDocument(request.args?.[0]);
+  if (!document) unavailable("Photoshop document channels");
+  const channels = property(document, "channels");
+  const add = property<Callable>(channels, "add");
+  if (!add) unavailable("Photoshop channels.add");
+  return withModal(request, "Add channel", async () => {
+    const channel = await maybePromise(add.call(channels));
+    const name = asString(request.args?.[1]);
+    if (name && isObject(channel)) (channel as Record<string, unknown>).name = name;
+    return serializeChannel(channel);
+  });
+}
+
+async function channelRemove(request: RpcRequest) {
+  const document = findDocument(request.args?.[0]);
+  if (!document) unavailable("Photoshop channel");
+  const channel = findChannel(document, request.args?.[1]);
+  if (!channel) unavailable("Photoshop channel");
+  const remove = property<Callable>(channel, "remove");
+  if (!remove) unavailable("Photoshop channel.remove");
+  return withModal(request, "Remove channel", async () => {
+    await maybePromise(remove.call(channel));
+    return serializeChannel(channel);
+  });
+}
+
 function findLayer(id: unknown) {
   if (id === undefined || id === null) return activeLayer();
   for (const document of openDocuments()) {
     const match = findLayerInTree(property(document, "layers"), id) ?? findLayerInTree(property(document, "activeLayers"), id);
+    if (match) return match;
+  }
+  return undefined;
+}
+
+function findChannel(document: unknown, idOrName: unknown) {
+  if (idOrName === undefined || idOrName === null) return undefined;
+  const channelCollections = [property(document, "channels"), property(document, "activeChannels"), property(document, "componentChannels")];
+  for (const collection of channelCollections) {
+    const getByName = property<Callable>(collection, "getByName");
+    if (getByName && typeof idOrName === "string") {
+      try {
+        const channel = getByName.call(collection, idOrName);
+        if (channel) return channel;
+      } catch {
+        // Some Photoshop channel collections throw when a name is missing; continue with manual matching.
+      }
+    }
+    const match = asArray(collection).find((channel) => {
+      return String(property(channel, "id")) === String(idOrName) || asString(property(channel, "name")) === String(idOrName);
+    });
     if (match) return match;
   }
   return undefined;

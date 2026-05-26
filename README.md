@@ -55,4 +55,9 @@ from adobe.photoshop import Photoshop
 app = Photoshop()
 for layer in app.activeLayers:
     print(layer.name)
+
+doc = app.activeDocument
+doc.selection.select_rectangle({"top": 10, "left": 10, "bottom": 256, "right": 256})
+for channel in doc.channels:
+    print(channel.name)
 ```

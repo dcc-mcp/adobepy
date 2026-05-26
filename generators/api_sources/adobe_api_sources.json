@@ -71,11 +71,11 @@
         },
         {
           "name": "Selection and channels",
-          "level": "planned",
+          "level": "mvp",
           "trackedBy": 6,
           "docRefs": ["Photoshop UXP API"],
-          "irNamespaces": [],
-          "facadeObjects": []
+          "irNamespaces": ["selection", "channel"],
+          "facadeObjects": ["SelectionProxy", "ChannelProxy"]
         },
         {
           "name": "Text and typography",

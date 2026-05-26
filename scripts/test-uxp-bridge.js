@@ -76,6 +76,46 @@ function error(message) {
 
 async function testPhotoshopBridge() {
   const events = [];
+  const channels = [
+    {
+      id: 21,
+      name: "Alpha 1",
+      kind: "maskedArea",
+      opacity: 50,
+      visible: true,
+      typename: "Channel",
+      remove: async () => events.push({ kind: "channel.remove" })
+    },
+    { id: 22, name: "Red", kind: "component", visible: true, typename: "Channel" }
+  ];
+  channels.getByName = (name) => channels.find((channel) => channel.name === name);
+  channels.add = async () => {
+    const channel = { id: 23, name: "Alpha 2", kind: "maskedArea", visible: true, typename: "Channel" };
+    channels.push(channel);
+    return channel;
+  };
+  const selection = {
+    bounds: { top: 1, left: 2, bottom: 99, right: 100 },
+    docId: 9,
+    solid: true,
+    typename: "Selection",
+    selectRectangle: async (bounds, mode, feather, antiAlias) => {
+      events.push({ kind: "selection.selectRectangle", bounds, mode, feather, antiAlias });
+      selection.bounds = bounds;
+      selection.solid = true;
+    },
+    selectAll: async () => {
+      events.push({ kind: "selection.selectAll" });
+      selection.bounds = { top: 0, left: 0, bottom: 1080, right: 1920 };
+      selection.solid = true;
+    },
+    deselect: async () => {
+      events.push({ kind: "selection.deselect" });
+      selection.bounds = null;
+      selection.solid = false;
+    },
+    inverse: async () => events.push({ kind: "selection.inverse" })
+  };
   const document = {
     id: 9,
     title: "demo.psd",
@@ -88,6 +128,10 @@ async function testPhotoshopBridge() {
       { id: 7, name: "Layer 1", kind: "pixel", opacity: 80, visible: true },
       { id: 8, name: "Group", kind: "group", layers: [{ id: 10, name: "Child" }] }
     ],
+    selection,
+    channels,
+    activeChannels: [channels[0]],
+    componentChannels: [channels[1]],
     saveAs: {
       psd: async (entry, options, asCopy) => events.push({ kind: "saveAs", url: entry.url, options, asCopy }),
       png: async (entry, options, asCopy) => events.push({ kind: "saveAs", url: entry.url, options, asCopy })
@@ -121,6 +165,8 @@ async function testPhotoshopBridge() {
   assert.strictEqual(env.sent[0].type, "hello");
   assert.strictEqual(env.sent[0].capabilities.hostVersion, "26.5.1");
   assert.ok(env.sent[0].capabilities.methods.document.includes("getLayers"));
+  assert.ok(env.sent[0].capabilities.methods.selection.includes("selectRectangle"));
+  assert.ok(env.sent[0].capabilities.methods.channel.includes("getChannels"));
   assert.ok(env.sent[0].capabilities.methods.raw.includes("getPath"));
   assert.strictEqual(result(await rpc(env, "photoshop", "app", "getVersion")), "26.5.1");
   assert.strictEqual(result(await rpc(env, "photoshop", "app", "getDocuments"))[0].resolution, 72);
@@ -129,6 +175,18 @@ async function testPhotoshopBridge() {
   assert.strictEqual(result(await rpc(env, "photoshop", "document", "getActiveLayers", [9]))[0].opacity, 80);
   assert.strictEqual(result(await rpc(env, "photoshop", "layer", "getActive")).id, 7);
   assert.strictEqual(result(await rpc(env, "photoshop", "layer", "getChildren", [8]))[0].name, "Child");
+  assert.strictEqual(result(await rpc(env, "photoshop", "selection", "get", [9])).bounds.right, 100);
+  assert.strictEqual(
+    result(await rpc(env, "photoshop", "selection", "selectRectangle", [9, { top: 4, left: 5, bottom: 9, right: 10 }, "replace", 0, true], { modal: true })).bounds.left,
+    5
+  );
+  assert.strictEqual(result(await rpc(env, "photoshop", "selection", "selectAll", [9], { modal: true })).bounds.bottom, 1080);
+  assert.strictEqual(result(await rpc(env, "photoshop", "channel", "getChannels", [9]))[0].name, "Alpha 1");
+  assert.strictEqual(result(await rpc(env, "photoshop", "channel", "getActiveChannels", [9]))[0].opacity, 50);
+  assert.strictEqual(result(await rpc(env, "photoshop", "channel", "getComponentChannels", [9]))[0].name, "Red");
+  assert.strictEqual(result(await rpc(env, "photoshop", "channel", "getByName", [9, "Alpha 1"])).id, 21);
+  assert.strictEqual(result(await rpc(env, "photoshop", "channel", "add", [9, "Mask"], { modal: true })).name, "Mask");
+  assert.strictEqual(result(await rpc(env, "photoshop", "channel", "remove", [9, 21], { modal: true })).id, 21);
   assert.strictEqual(result(await rpc(env, "photoshop", "raw", "getPath", [["app", "activeDocument", "layers", 0, "name"]], {})), "Layer 1");
   assert.deepStrictEqual(result(await rpc(env, "photoshop", "action", "batchPlay", [[{ _obj: "hide" }], { synchronousExecution: true }], { modal: true, commandName: "Hide" })), [{ _obj: "hide" }]);
   assert.deepStrictEqual(result(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/out.psd", format: "psd" }], { modal: true, commandName: "Save" })).id, 9);
@@ -136,6 +194,8 @@ async function testPhotoshopBridge() {
   assert.strictEqual(error(await rpc(env, "photoshop", "bad", "missing")).code, -32601);
   assert.ok(events.some((event) => event.kind === "modal" && event.commandName === "Hide"));
   assert.ok(events.some((event) => event.kind === "saveAs" && event.url === "file:///C:/out.psd"));
+  assert.ok(events.some((event) => event.kind === "selection.selectRectangle"));
+  assert.ok(events.some((event) => event.kind === "channel.remove"));
 }
 
 async function testInDesignBridge() {

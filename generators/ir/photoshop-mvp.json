@@ -12,7 +12,9 @@
         {"name": "documents", "type": "list[Document]", "source": "app.getDocuments"},
         {"name": "active_document", "type": "Document | None", "source": "document.getActive"},
         {"name": "active_layer", "type": "Layer | None", "source": "layer.getActive"},
-        {"name": "active_layers", "type": "list[Layer]", "source": "document.getActiveLayers"}
+        {"name": "active_layers", "type": "list[Layer]", "source": "document.getActiveLayers"},
+        {"name": "selection", "type": "Selection | None", "source": "selection.get"},
+        {"name": "channels", "type": "list[Channel]", "source": "channel.getChannels"}
       ]
     },
     {
@@ -31,6 +33,38 @@
       "methods": [
         {"name": "getActive", "returns": "Layer | None"},
         {"name": "getChildren", "returns": "list[Layer]"}
+      ]
+    },
+    {
+      "name": "selection",
+      "methods": [
+        {"name": "get", "returns": "Selection | None"},
+        {"name": "selectAll", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "deselect", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "inverse", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "selectRectangle", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "selectEllipse", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "selectPolygon", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "selectRow", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "selectColumn", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "expand", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "contract", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "feather", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "smooth", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "grow", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "translateBoundary", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "save", "returns": "Selection", "mutatesState": true, "requiresModalWhenMutating": true}
+      ]
+    },
+    {
+      "name": "channel",
+      "methods": [
+        {"name": "getChannels", "returns": "list[Channel]"},
+        {"name": "getActiveChannels", "returns": "list[Channel]"},
+        {"name": "getComponentChannels", "returns": "list[Channel]"},
+        {"name": "getByName", "returns": "Channel | None"},
+        {"name": "add", "returns": "Channel", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "remove", "returns": "Channel", "mutatesState": true, "requiresModalWhenMutating": true}
       ]
     },
     {"name": "action", "methods": [{"name": "batchPlay", "returns": "Any", "mutatesState": true, "requiresModalWhenMutating": true}]},
@@ -58,10 +92,15 @@
         {"name": "typename", "type": "str | None"},
         {"name": "layers", "type": "list[Layer]"},
         {"name": "active_layers", "type": "list[Layer]"},
+        {"name": "selection", "type": "Selection"},
+        {"name": "channels", "type": "list[Channel]"},
+        {"name": "active_channels", "type": "list[Channel]"},
+        {"name": "component_channels", "type": "list[Channel]"},
         {"name": "dom", "type": "PhotoshopDomProxy"}
       ],
       "methods": [
         {"name": "refresh", "returns": "Document"},
+        {"name": "getChannel", "returns": "Channel | None"},
         {"name": "saveAs", "returns": "Any"},
         {"name": "export", "returns": "Any"}
       ]
@@ -79,6 +118,45 @@
         {"name": "layers", "type": "list[Layer]"}
       ],
       "methods": [{"name": "hide", "returns": "Any"}]
+    },
+    {
+      "name": "SelectionProxy",
+      "properties": [
+        {"name": "bounds", "type": "dict[str, Any] | None"},
+        {"name": "doc_id", "type": "int | str | None"},
+        {"name": "solid", "type": "bool | None"},
+        {"name": "typename", "type": "str | None"}
+      ],
+      "methods": [
+        {"name": "refresh", "returns": "Selection"},
+        {"name": "selectAll", "returns": "Selection"},
+        {"name": "deselect", "returns": "Selection"},
+        {"name": "inverse", "returns": "Selection"},
+        {"name": "selectRectangle", "returns": "Selection"},
+        {"name": "selectEllipse", "returns": "Selection"},
+        {"name": "selectPolygon", "returns": "Selection"},
+        {"name": "selectRow", "returns": "Selection"},
+        {"name": "selectColumn", "returns": "Selection"},
+        {"name": "expand", "returns": "Selection"},
+        {"name": "contract", "returns": "Selection"},
+        {"name": "feather", "returns": "Selection"},
+        {"name": "smooth", "returns": "Selection"},
+        {"name": "grow", "returns": "Selection"},
+        {"name": "translateBoundary", "returns": "Selection"},
+        {"name": "save", "returns": "Selection"}
+      ]
+    },
+    {
+      "name": "ChannelProxy",
+      "properties": [
+        {"name": "id", "type": "int | str | None"},
+        {"name": "name", "type": "str | None"},
+        {"name": "kind", "type": "str | None"},
+        {"name": "opacity", "type": "Any"},
+        {"name": "visible", "type": "bool | None"},
+        {"name": "typename", "type": "str | None"}
+      ],
+      "methods": [{"name": "remove", "returns": "Channel"}]
     },
     {
       "name": "PhotoshopDomProxy",

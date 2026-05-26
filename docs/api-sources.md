@@ -20,7 +20,7 @@ IR, bridge capabilities, Python facade, and Pythonic aliases.
 
 | Host | Bridge | MVP targets | Planned targets | Coverage | Next targets |
 | --- | --- | ---: | ---: | ---: | --- |
-| Photoshop | UXP | 5 | 3 | 62.5% | Selection and channels; text and typography; smart objects, filters, and export presets |
+| Photoshop | UXP | 6 | 2 | 75.0% | Text and typography; smart objects, filters, and export presets |
 | InDesign | UXP | 2 | 3 | 40.0% | Pages and spreads; text frames, stories, and styles; swatches, colors, links, and export/package workflows |
 | Premiere Pro | UXP | 2 | 3 | 40.0% | Sequences, tracks, clips, and markers; project items, media import, and bins; encoder/export workflows |
 | After Effects | CEP/ExtendScript | 2 | 3 | 40.0% | Compositions and footage items; layers, masks, effects, and text; render queue and output modules |
@@ -41,6 +41,9 @@ IR, bridge capabilities, Python facade, and Pythonic aliases.
 - UXP hosts should prefer typed DOM APIs over raw script execution. Photoshop
   keeps `action.batchPlay` because Adobe documents it as the advanced escape
   hatch below the DOM model.
+- Photoshop selection and channel coverage should use the typed UXP DOM surface
+  first: `document.selection` for pixel selections and `document.channels` /
+  `activeChannels` / `componentChannels` for channel access.
 - CEP/ExtendScript hosts should keep raw `evalExtendScript` available but should
   not mix raw scripting into typed facade methods without an IR entry and replay
   fixture.

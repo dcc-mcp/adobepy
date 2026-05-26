@@ -86,6 +86,14 @@ class Photoshop(PhotoshopSession):
     def active_layers(self) -> list["LayerProxy"]:
         return self.app.active_layers
 
+    @property
+    def selection(self) -> "SelectionProxy | None":
+        return self.app.selection
+
+    @property
+    def channels(self) -> list["ChannelProxy"]:
+        return self.app.channels
+
     def eval_js(self, source: str, *args: Any, timeout_ms: int | None = None) -> Any:
         return self.invoke("raw", "evalJs", source, *args, options=_timeout_options(timeout_ms))
 
@@ -192,6 +200,16 @@ class PhotoshopApp:
     @property
     def activeLayers(self) -> list["LayerProxy"]:
         return self.active_layers
+
+    @property
+    def selection(self) -> "SelectionProxy | None":
+        document = self.active_document
+        return document.selection if document else None
+
+    @property
+    def channels(self) -> list["ChannelProxy"]:
+        document = self.active_document
+        return document.channels if document else []
 
 
 class PhotoshopAction:
@@ -343,6 +361,40 @@ class DocumentProxy:
         return self.active_layers
 
     @property
+    def selection(self) -> "SelectionProxy":
+        return SelectionProxy(self._session, self.id)
+
+    @property
+    def channels(self) -> list["ChannelProxy"]:
+        payload = self._session.invoke("channel", "getChannels", self.id)
+        return [ChannelProxy(self._session, self.id, channel) for channel in payload or []]
+
+    @property
+    def active_channels(self) -> list["ChannelProxy"]:
+        payload = self._session.invoke("channel", "getActiveChannels", self.id)
+        return [ChannelProxy(self._session, self.id, channel) for channel in payload or []]
+
+    @property
+    def activeChannels(self) -> list["ChannelProxy"]:
+        return self.active_channels
+
+    @property
+    def component_channels(self) -> list["ChannelProxy"]:
+        payload = self._session.invoke("channel", "getComponentChannels", self.id)
+        return [ChannelProxy(self._session, self.id, channel) for channel in payload or []]
+
+    @property
+    def componentChannels(self) -> list["ChannelProxy"]:
+        return self.component_channels
+
+    def get_channel(self, name: str) -> "ChannelProxy | None":
+        payload = self._session.invoke("channel", "getByName", self.id, name)
+        return ChannelProxy(self._session, self.id, payload) if payload else None
+
+    def getChannel(self, name: str) -> "ChannelProxy | None":
+        return self.get_channel(name)
+
+    @property
     def dom(self) -> PhotoshopDomProxy:
         return PhotoshopDomProxy(self._session, ["app", "activeDocument"])
 
@@ -403,6 +455,238 @@ class DocumentProxy:
                 timeout_ms=timeout_ms,
             ),
         )
+
+
+class SelectionProxy:
+    def __init__(self, session: PhotoshopSession, document_id: int | str | None) -> None:
+        self._session = session
+        self._document_id = document_id
+        self._payload: dict[str, Any] = {}
+        self.refresh()
+
+    @property
+    def bounds(self) -> dict[str, Any] | None:
+        value = self._payload.get("bounds")
+        return value if isinstance(value, dict) else None
+
+    @property
+    def doc_id(self) -> int | str | None:
+        return self._payload.get("docId")
+
+    @property
+    def docId(self) -> int | str | None:
+        return self.doc_id
+
+    @property
+    def solid(self) -> bool | None:
+        value = self._payload.get("solid")
+        return bool(value) if value is not None else None
+
+    @property
+    def typename(self) -> str | None:
+        return self._payload.get("typename")
+
+    def refresh(self) -> "SelectionProxy":
+        self._payload = self._session.invoke("selection", "get", self._document_id) or {}
+        return self
+
+    def select_all(self, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("selectAll", command_name=command_name, default_command_name="Select all")
+
+    def selectAll(self, *, commandName: str | None = None) -> "SelectionProxy":
+        return self.select_all(command_name=commandName)
+
+    def deselect(self, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("deselect", command_name=command_name, default_command_name="Deselect")
+
+    def inverse(self, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("inverse", command_name=command_name, default_command_name="Invert selection")
+
+    def select_rectangle(
+        self,
+        bounds: dict[str, Any],
+        mode: str | None = None,
+        feather: float | int = 0,
+        anti_alias: bool = True,
+        *,
+        command_name: str | None = None,
+    ) -> "SelectionProxy":
+        return self._invoke(
+            "selectRectangle",
+            bounds,
+            mode,
+            feather,
+            anti_alias,
+            command_name=command_name,
+            default_command_name="Select rectangle",
+        )
+
+    def selectRectangle(
+        self,
+        bounds: dict[str, Any],
+        mode: str | None = None,
+        feather: float | int = 0,
+        antiAlias: bool = True,
+        *,
+        commandName: str | None = None,
+    ) -> "SelectionProxy":
+        return self.select_rectangle(bounds, mode, feather, antiAlias, command_name=commandName)
+
+    def select_ellipse(
+        self,
+        bounds: dict[str, Any],
+        mode: str | None = None,
+        feather: float | int = 0,
+        anti_alias: bool = True,
+        *,
+        command_name: str | None = None,
+    ) -> "SelectionProxy":
+        return self._invoke(
+            "selectEllipse",
+            bounds,
+            mode,
+            feather,
+            anti_alias,
+            command_name=command_name,
+            default_command_name="Select ellipse",
+        )
+
+    def selectEllipse(
+        self,
+        bounds: dict[str, Any],
+        mode: str | None = None,
+        feather: float | int = 0,
+        antiAlias: bool = True,
+        *,
+        commandName: str | None = None,
+    ) -> "SelectionProxy":
+        return self.select_ellipse(bounds, mode, feather, antiAlias, command_name=commandName)
+
+    def select_polygon(
+        self,
+        points: list[dict[str, Any]],
+        mode: str | None = None,
+        feather: float | int = 0,
+        anti_alias: bool = True,
+        *,
+        command_name: str | None = None,
+    ) -> "SelectionProxy":
+        return self._invoke(
+            "selectPolygon",
+            points,
+            mode,
+            feather,
+            anti_alias,
+            command_name=command_name,
+            default_command_name="Select polygon",
+        )
+
+    def selectPolygon(
+        self,
+        points: list[dict[str, Any]],
+        mode: str | None = None,
+        feather: float | int = 0,
+        antiAlias: bool = True,
+        *,
+        commandName: str | None = None,
+    ) -> "SelectionProxy":
+        return self.select_polygon(points, mode, feather, antiAlias, command_name=commandName)
+
+    def select_row(self, y: int | float, mode: str | None = None, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("selectRow", y, mode, command_name=command_name, default_command_name="Select row")
+
+    def selectRow(self, y: int | float, mode: str | None = None, *, commandName: str | None = None) -> "SelectionProxy":
+        return self.select_row(y, mode, command_name=commandName)
+
+    def select_column(self, x: int | float, mode: str | None = None, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("selectColumn", x, mode, command_name=command_name, default_command_name="Select column")
+
+    def selectColumn(self, x: int | float, mode: str | None = None, *, commandName: str | None = None) -> "SelectionProxy":
+        return self.select_column(x, mode, command_name=commandName)
+
+    def expand(self, by: int | float, apply_effect_at_canvas_bounds: bool = False, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("expand", by, apply_effect_at_canvas_bounds, command_name=command_name, default_command_name="Expand selection")
+
+    def contract(self, by: int | float, apply_effect_at_canvas_bounds: bool = False, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("contract", by, apply_effect_at_canvas_bounds, command_name=command_name, default_command_name="Contract selection")
+
+    def feather(self, by: int | float, apply_effect_at_canvas_bounds: bool = False, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("feather", by, apply_effect_at_canvas_bounds, command_name=command_name, default_command_name="Feather selection")
+
+    def smooth(self, radius: int | float, apply_effect_at_canvas_bounds: bool = False, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("smooth", radius, apply_effect_at_canvas_bounds, command_name=command_name, default_command_name="Smooth selection")
+
+    def grow(self, tolerance: int | float, anti_alias: bool = True, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("grow", tolerance, anti_alias, command_name=command_name, default_command_name="Grow selection")
+
+    def translate_boundary(self, delta_x: int | float, delta_y: int | float, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("translateBoundary", delta_x, delta_y, command_name=command_name, default_command_name="Translate selection boundary")
+
+    def translateBoundary(self, deltaX: int | float, deltaY: int | float, *, commandName: str | None = None) -> "SelectionProxy":
+        return self.translate_boundary(deltaX, deltaY, command_name=commandName)
+
+    def save(self, channel_name: str | None = None, *, command_name: str | None = None) -> "SelectionProxy":
+        return self._invoke("save", channel_name, command_name=command_name, default_command_name="Save selection")
+
+    def _invoke(
+        self,
+        method: str,
+        *args: Any,
+        command_name: str | None = None,
+        default_command_name: str,
+    ) -> "SelectionProxy":
+        payload = self._session.invoke(
+            "selection",
+            method,
+            self._document_id,
+            *args,
+            options=self._session.modal_options(command_name=command_name, default_command_name=default_command_name),
+        )
+        self._payload = payload or {}
+        return self
+
+
+@dataclass
+class ChannelProxy:
+    _session: PhotoshopSession
+    _document_id: int | str | None
+    _payload: dict[str, Any]
+
+    @property
+    def id(self) -> int | str | None:
+        return self._payload.get("id")
+
+    @property
+    def name(self) -> str | None:
+        return self._payload.get("name")
+
+    @property
+    def kind(self) -> str | None:
+        return self._payload.get("kind")
+
+    @property
+    def opacity(self) -> Any:
+        return self._payload.get("opacity")
+
+    @property
+    def visible(self) -> bool | None:
+        value = self._payload.get("visible")
+        return bool(value) if value is not None else None
+
+    @property
+    def typename(self) -> str | None:
+        return self._payload.get("typename")
+
+    def remove(self, *, command_name: str | None = None) -> "ChannelProxy":
+        payload = self._session.invoke(
+            "channel",
+            "remove",
+            self._document_id,
+            self.id or self.name,
+            options=self._session.modal_options(command_name=command_name, default_command_name="Remove channel"),
+        )
+        self._payload = payload or {}
+        return self
 
 
 @dataclass
