@@ -84,7 +84,13 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
-      - run: python -m pip install --upgrade "coverage[toml]" setuptools wheel
+      - run: python -m pip install --upgrade "coverage[toml]" setuptools wheel build twine
+      - name: Check Python distribution
+        run: |
+          python -m build
+          python -m twine check dist/*
+          python scripts/check_wheel_compat.py dist
+          python scripts/smoke_wheel_install.py dist
       - name: Build package
         shell: pwsh
         run: ./scripts/package-release.ps1 -SkipTests
