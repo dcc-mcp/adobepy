@@ -102,6 +102,14 @@ class Photoshop(PhotoshopSession):
     def activeText(self) -> "TextItemProxy | None":
         return self.active_text
 
+    @property
+    def export_presets(self) -> list["ExportPreset"]:
+        return self.app.export_presets
+
+    @property
+    def exportPresets(self) -> list["ExportPreset"]:
+        return self.export_presets
+
     def eval_js(self, source: str, *args: Any, timeout_ms: int | None = None) -> Any:
         return self.invoke("raw", "evalJs", source, *args, options=_timeout_options(timeout_ms))
 
@@ -228,6 +236,15 @@ class PhotoshopApp:
     def activeText(self) -> "TextItemProxy | None":
         return self.active_text
 
+    @property
+    def export_presets(self) -> list["ExportPreset"]:
+        payload = self._session.invoke("export", "getPresets")
+        return [ExportPreset.from_payload(preset) for preset in payload or []]
+
+    @property
+    def exportPresets(self) -> list["ExportPreset"]:
+        return self.export_presets
+
 
 class PhotoshopAction:
     def __init__(self, session: PhotoshopSession) -> None:
@@ -320,6 +337,58 @@ class PhotoshopDomProxy:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.call(*args, **kwargs)
+
+
+class ExportPreset:
+    def __init__(
+        self,
+        name: str,
+        format: str,
+        *,
+        as_copy: bool = True,
+        options: dict[str, Any] | None = None,
+        description: str | None = None,
+    ) -> None:
+        self._name = name
+        self._format = format
+        self._as_copy = as_copy
+        self._options = dict(options or {})
+        self._description = description
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "ExportPreset":
+        options = payload.get("options")
+        return cls(
+            name=str(payload.get("name") or ""),
+            format=str(payload.get("format") or payload.get("name") or ""),
+            as_copy=bool(payload.get("asCopy", True)),
+            options=dict(options) if isinstance(options, dict) else {},
+            description=str(payload.get("description")) if payload.get("description") is not None else None,
+        )
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def format(self) -> str:
+        return self._format
+
+    @property
+    def as_copy(self) -> bool:
+        return self._as_copy
+
+    @property
+    def asCopy(self) -> bool:
+        return self.as_copy
+
+    @property
+    def options(self) -> dict[str, Any]:
+        return dict(self._options)
+
+    @property
+    def description(self) -> str | None:
+        return self._description
 
 
 @dataclass
@@ -415,6 +484,10 @@ class DocumentProxy:
     def dom(self) -> PhotoshopDomProxy:
         return PhotoshopDomProxy(self._session, ["app", "activeDocument"])
 
+    @property
+    def exports(self) -> "DocumentExportProxy":
+        return DocumentExportProxy(self)
+
     def refresh(self) -> "DocumentProxy":
         payload = self._session.invoke("document", "getById", self.id)
         self._payload = payload or {}
@@ -425,6 +498,8 @@ class DocumentProxy:
         path: str,
         *,
         format: str = "psd",
+        options: dict[str, Any] | None = None,
+        as_copy: bool = False,
         modal: bool | None = None,
         command_name: str | None = None,
         timeout_ms: int | None = None,
@@ -432,7 +507,7 @@ class DocumentProxy:
         return self._session.invoke(
             "document",
             "saveAs",
-            {"id": self.id, "path": path, "format": format},
+            {"id": self.id, "path": path, "format": format, "options": options or {}, "asCopy": as_copy},
             options=self._session.modal_options(
                 modal=modal,
                 command_name=command_name,
@@ -446,17 +521,21 @@ class DocumentProxy:
         path: str,
         *,
         format: str = "psd",
+        options: dict[str, Any] | None = None,
+        asCopy: bool = False,
         modal: bool | None = None,
         commandName: str | None = None,
         timeoutMs: int | None = None,
     ) -> Any:
-        return self.save_as(path, format=format, modal=modal, command_name=commandName, timeout_ms=timeoutMs)
+        return self.save_as(path, format=format, options=options, as_copy=asCopy, modal=modal, command_name=commandName, timeout_ms=timeoutMs)
 
     def export(
         self,
         path: str,
         *,
         format: str = "png",
+        options: dict[str, Any] | None = None,
+        as_copy: bool = True,
         modal: bool | None = None,
         command_name: str | None = None,
         timeout_ms: int | None = None,
@@ -464,7 +543,7 @@ class DocumentProxy:
         return self._session.invoke(
             "document",
             "export",
-            {"id": self.id, "path": path, "format": format},
+            {"id": self.id, "path": path, "format": format, "options": options or {}, "asCopy": as_copy},
             options=self._session.modal_options(
                 modal=modal,
                 command_name=command_name,
@@ -472,6 +551,88 @@ class DocumentProxy:
                 timeout_ms=timeout_ms,
             ),
         )
+
+    def export_with_preset(
+        self,
+        preset: str | ExportPreset,
+        path: str,
+        *,
+        options: dict[str, Any] | None = None,
+        modal: bool | None = None,
+        command_name: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> Any:
+        preset_name = preset.name if isinstance(preset, ExportPreset) else preset
+        return self._session.invoke(
+            "export",
+            "exportWithPreset",
+            {"id": self.id, "path": path, "preset": preset_name, "options": options or {}},
+            options=self._session.modal_options(
+                modal=modal,
+                command_name=command_name,
+                default_command_name="Export document",
+                timeout_ms=timeout_ms,
+            ),
+        )
+
+    def exportWithPreset(
+        self,
+        preset: str | ExportPreset,
+        path: str,
+        *,
+        options: dict[str, Any] | None = None,
+        modal: bool | None = None,
+        commandName: str | None = None,
+        timeoutMs: int | None = None,
+    ) -> Any:
+        return self.export_with_preset(preset, path, options=options, modal=modal, command_name=commandName, timeout_ms=timeoutMs)
+
+
+class DocumentExportProxy:
+    def __init__(self, document: DocumentProxy) -> None:
+        self._document = document
+
+    @property
+    def presets(self) -> list[ExportPreset]:
+        payload = self._document._session.invoke("export", "getPresets")
+        return [ExportPreset.from_payload(preset) for preset in payload or []]
+
+    def with_preset(
+        self,
+        preset: str | ExportPreset,
+        path: str,
+        *,
+        options: dict[str, Any] | None = None,
+        command_name: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> Any:
+        return self._document.export_with_preset(preset, path, options=options, command_name=command_name, timeout_ms=timeout_ms)
+
+    def withPreset(
+        self,
+        preset: str | ExportPreset,
+        path: str,
+        *,
+        options: dict[str, Any] | None = None,
+        commandName: str | None = None,
+        timeoutMs: int | None = None,
+    ) -> Any:
+        return self.with_preset(preset, path, options=options, command_name=commandName, timeout_ms=timeoutMs)
+
+    def png(self, path: str, *, options: dict[str, Any] | None = None, command_name: str | None = None, timeout_ms: int | None = None) -> Any:
+        return self.with_preset("png", path, options=options, command_name=command_name, timeout_ms=timeout_ms)
+
+    def png_small(self, path: str, *, options: dict[str, Any] | None = None, command_name: str | None = None, timeout_ms: int | None = None) -> Any:
+        return self.with_preset("png_small", path, options=options, command_name=command_name, timeout_ms=timeout_ms)
+
+    def jpg_high(self, path: str, *, options: dict[str, Any] | None = None, command_name: str | None = None, timeout_ms: int | None = None) -> Any:
+        return self.with_preset("jpg_high", path, options=options, command_name=command_name, timeout_ms=timeout_ms)
+
+    def jpg_medium(self, path: str, *, options: dict[str, Any] | None = None, command_name: str | None = None, timeout_ms: int | None = None) -> Any:
+        return self.with_preset("jpg_medium", path, options=options, command_name=command_name, timeout_ms=timeout_ms)
+
+    def psd_copy(self, path: str, *, options: dict[str, Any] | None = None, command_name: str | None = None, timeout_ms: int | None = None) -> Any:
+        return self.with_preset("psd_copy", path, options=options, command_name=command_name, timeout_ms=timeout_ms)
 
 
 class SelectionProxy:
@@ -934,9 +1095,29 @@ class LayerProxy:
         return self.has_children
 
     @property
+    def is_smart_object(self) -> bool:
+        return bool(self._payload.get("isSmartObject"))
+
+    @property
+    def isSmartObject(self) -> bool:
+        return self.is_smart_object
+
+    @property
     def layers(self) -> list["LayerProxy"]:
         payload = self._session.invoke("layer", "getChildren", self.id)
         return [LayerProxy(self._session, layer) for layer in payload or []]
+
+    @property
+    def filters(self) -> "LayerFilterProxy":
+        return LayerFilterProxy(self)
+
+    @property
+    def smart_object(self) -> "SmartObjectProxy":
+        return SmartObjectProxy(self)
+
+    @property
+    def smartObject(self) -> "SmartObjectProxy":
+        return self.smart_object
 
     @property
     def text_item(self) -> "TextItemProxy | None":
@@ -954,6 +1135,132 @@ class LayerProxy:
             command_name=command_name,
             default_command_name="Hide layer",
         )
+
+    def _replace_payload(self, payload: dict[str, Any] | None) -> "LayerProxy":
+        self._payload = payload or {}
+        return self
+
+
+class LayerFilterProxy:
+    def __init__(self, layer: LayerProxy) -> None:
+        self._layer = layer
+
+    def apply(self, method: str, *args: Any, command_name: str | None = None) -> LayerProxy:
+        payload = self._layer._session.invoke(
+            "filter",
+            "apply",
+            self._layer.id,
+            method,
+            *args,
+            options=self._layer._session.modal_options(command_name=command_name, default_command_name=f"Apply {method}"),
+        )
+        return self._layer._replace_payload(payload)
+
+    def apply_gaussian_blur(self, radius: int | float, *, command_name: str | None = None) -> LayerProxy:
+        return self._invoke("applyGaussianBlur", radius, command_name=command_name, default_command_name="Apply Gaussian blur")
+
+    def applyGaussianBlur(self, radius: int | float, *, commandName: str | None = None) -> LayerProxy:
+        return self.apply_gaussian_blur(radius, command_name=commandName)
+
+    def apply_high_pass(self, radius: int | float, *, command_name: str | None = None) -> LayerProxy:
+        return self._invoke("applyHighPass", radius, command_name=command_name, default_command_name="Apply high pass")
+
+    def applyHighPass(self, radius: int | float, *, commandName: str | None = None) -> LayerProxy:
+        return self.apply_high_pass(radius, command_name=commandName)
+
+    def apply_sharpen(self, *, command_name: str | None = None) -> LayerProxy:
+        return self._invoke("applySharpen", command_name=command_name, default_command_name="Apply sharpen")
+
+    def applySharpen(self, *, commandName: str | None = None) -> LayerProxy:
+        return self.apply_sharpen(command_name=commandName)
+
+    def apply_smart_blur(
+        self,
+        radius: int | float,
+        threshold: int | float,
+        quality: str | None = None,
+        mode: str | None = None,
+        *,
+        command_name: str | None = None,
+    ) -> LayerProxy:
+        args = [radius, threshold]
+        if quality is not None:
+            args.append(quality)
+        if mode is not None:
+            args.append(mode)
+        return self._invoke("applySmartBlur", *args, command_name=command_name, default_command_name="Apply smart blur")
+
+    def applySmartBlur(
+        self,
+        radius: int | float,
+        threshold: int | float,
+        quality: str | None = None,
+        mode: str | None = None,
+        *,
+        commandName: str | None = None,
+    ) -> LayerProxy:
+        return self.apply_smart_blur(radius, threshold, quality, mode, command_name=commandName)
+
+    def _invoke(
+        self,
+        method: str,
+        *args: Any,
+        command_name: str | None = None,
+        default_command_name: str,
+    ) -> LayerProxy:
+        payload = self._layer._session.invoke(
+            "filter",
+            method,
+            self._layer.id,
+            *args,
+            options=self._layer._session.modal_options(command_name=command_name, default_command_name=default_command_name),
+        )
+        return self._layer._replace_payload(payload)
+
+
+class SmartObjectProxy:
+    def __init__(self, layer: LayerProxy) -> None:
+        self._layer = layer
+
+    def convert_to_smart_object(self, *, command_name: str | None = None) -> LayerProxy:
+        return self._invoke("convertToSmartObject", command_name=command_name, default_command_name="Convert to smart object")
+
+    def convertToSmartObject(self, *, commandName: str | None = None) -> LayerProxy:
+        return self.convert_to_smart_object(command_name=commandName)
+
+    def new_smart_object_via_copy(self, *, command_name: str | None = None) -> LayerProxy:
+        return self._invoke("newSmartObjectViaCopy", command_name=command_name, default_command_name="New smart object via copy")
+
+    def newSmartObjectViaCopy(self, *, commandName: str | None = None) -> LayerProxy:
+        return self.new_smart_object_via_copy(command_name=commandName)
+
+    def edit_contents(self, *, command_name: str | None = None) -> LayerProxy:
+        return self._invoke("editContents", command_name=command_name, default_command_name="Edit smart object contents")
+
+    def editContents(self, *, commandName: str | None = None) -> LayerProxy:
+        return self.edit_contents(command_name=commandName)
+
+    def replace_contents(self, path: str, *, command_name: str | None = None) -> LayerProxy:
+        return self._invoke("replaceContents", path, command_name=command_name, default_command_name="Replace smart object contents")
+
+    def replaceContents(self, path: str, *, commandName: str | None = None) -> LayerProxy:
+        return self.replace_contents(path, command_name=commandName)
+
+    def _invoke(
+        self,
+        method: str,
+        *args: Any,
+        command_name: str | None = None,
+        default_command_name: str,
+    ) -> LayerProxy:
+        payload = self._layer._session.invoke(
+            "smartObject",
+            method,
+            self._layer.id,
+            *args,
+            options=self._layer._session.modal_options(command_name=command_name, default_command_name=default_command_name),
+        )
+        return self._layer._replace_payload(payload)
 
 
 def connect(

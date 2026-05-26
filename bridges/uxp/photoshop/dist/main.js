@@ -119,6 +119,44 @@
   }
 
   // bridges/uxp/photoshop/src/host.ts
+  var FILTER_METHOD_PREFIX = "apply";
+  var EXPORT_PRESETS = [
+    {
+      name: "png",
+      format: "png",
+      asCopy: true,
+      options: { compression: 6 },
+      description: "PNG copy with balanced compression."
+    },
+    {
+      name: "png_small",
+      format: "png",
+      asCopy: true,
+      options: { compression: 9 },
+      description: "PNG copy with maximum compression."
+    },
+    {
+      name: "jpg_high",
+      format: "jpg",
+      asCopy: true,
+      options: { quality: 12 },
+      description: "High quality JPEG copy."
+    },
+    {
+      name: "jpg_medium",
+      format: "jpg",
+      asCopy: true,
+      options: { quality: 8 },
+      description: "Medium quality JPEG copy."
+    },
+    {
+      name: "psd_copy",
+      format: "psd",
+      asCopy: true,
+      options: { embedColorProfile: true },
+      description: "Layer-preserving Photoshop copy."
+    }
+  ];
   var photoshopAdapter = {
     capabilities() {
       return {
@@ -126,7 +164,7 @@
         bridgeKind: "uxp",
         bridgeVersion: "0.1.0",
         hostVersion: photoshopVersion(),
-        namespaces: ["app", "document", "layer", "selection", "channel", "text", "action", "raw"],
+        namespaces: ["app", "document", "layer", "selection", "channel", "text", "filter", "smartObject", "export", "action", "raw"],
         features: ["batchPlay", "executeAsModal"],
         methods: {
           app: ["getVersion", "getDocuments"],
@@ -165,6 +203,9 @@
             "convertToShape",
             "createWorkPath"
           ],
+          filter: ["apply", "applyGaussianBlur", "applyHighPass", "applySharpen", "applySmartBlur"],
+          smartObject: ["convertToSmartObject", "newSmartObjectViaCopy", "editContents", "replaceContents"],
+          export: ["getPresets", "exportWithPreset"],
           action: ["batchPlay"],
           raw: ["evalJs", "getPath", "callPath"]
         }
@@ -225,6 +266,23 @@
       if (request.namespace === "text" && request.method === "convertToPointText") return textCall(request, "convertToPointText", "Convert to point text");
       if (request.namespace === "text" && request.method === "convertToShape") return textCall(request, "convertToShape", "Convert text to shape");
       if (request.namespace === "text" && request.method === "createWorkPath") return textCall(request, "createWorkPath", "Create text work path");
+      if (request.namespace === "filter" && request.method === "apply") return layerFilterCall(request, filterMethodName(request.args?.[1]), request.args?.slice(2) ?? []);
+      if (request.namespace === "filter" && request.method === "applyGaussianBlur") {
+        return layerFilterCall(request, "applyGaussianBlur", request.args?.slice(1) ?? [], "Apply Gaussian blur");
+      }
+      if (request.namespace === "filter" && request.method === "applyHighPass") {
+        return layerFilterCall(request, "applyHighPass", request.args?.slice(1) ?? [], "Apply high pass");
+      }
+      if (request.namespace === "filter" && request.method === "applySharpen") return layerFilterCall(request, "applySharpen", request.args?.slice(1) ?? [], "Apply sharpen");
+      if (request.namespace === "filter" && request.method === "applySmartBlur") {
+        return layerFilterCall(request, "applySmartBlur", request.args?.slice(1) ?? [], "Apply smart blur");
+      }
+      if (request.namespace === "smartObject" && request.method === "convertToSmartObject") return smartObjectConvert(request);
+      if (request.namespace === "smartObject" && request.method === "newSmartObjectViaCopy") return smartObjectBatchPlay(request, [{ _obj: "placedLayerMakeCopy" }], "New smart object via copy");
+      if (request.namespace === "smartObject" && request.method === "editContents") return smartObjectBatchPlay(request, [{ _obj: "placedLayerEditContents" }], "Edit smart object contents");
+      if (request.namespace === "smartObject" && request.method === "replaceContents") return smartObjectReplaceContents(request);
+      if (request.namespace === "export" && request.method === "getPresets") return EXPORT_PRESETS.map(serializeExportPreset);
+      if (request.namespace === "export" && request.method === "exportWithPreset") return exportWithPreset(request);
       if (request.namespace === "action" && request.method === "batchPlay") return batchPlay(request);
       if (request.namespace === "raw" && request.method === "evalJs") return evalJavaScript(asString(request.args?.[0]) ?? "", request.args?.slice(1) ?? []);
       if (request.namespace === "raw" && request.method === "getPath") return getPath(request);
@@ -285,7 +343,17 @@
       opacity: asNumber(property(layer, "opacity")) ?? property(layer, "opacity"),
       visible: property(layer, "visible"),
       typename: asString(property(layer, "typename")),
-      hasChildren: asArray(property(layer, "layers")).length > 0
+      hasChildren: asArray(property(layer, "layers")).length > 0,
+      isSmartObject: isSmartObjectLayer(layer)
+    };
+  }
+  function serializeExportPreset(preset) {
+    return {
+      name: preset.name,
+      format: preset.format,
+      asCopy: preset.asCopy,
+      options: { ...preset.options },
+      description: preset.description
     };
   }
   function serializeSelection(selection) {
@@ -498,6 +566,69 @@
       return serializeTextItem(isObject(result) ? result : textItem, findLayer(request.args?.[0]));
     });
   }
+  async function layerFilterCall(request, method, args, defaultCommandName) {
+    const layer = findLayer(request.args?.[0]);
+    if (!layer) unavailable("Photoshop layer");
+    const fn = property(layer, method);
+    if (!fn) unavailable(`Photoshop layer.${method}`);
+    return withModal(request, defaultCommandName ?? `Apply ${method}`, async () => {
+      const result = await maybePromise(fn.apply(layer, args));
+      return serializeLayer(isObject(result) ? result : layer);
+    });
+  }
+  function filterMethodName(value) {
+    const method = asString(value);
+    if (!method || !method.startsWith(FILTER_METHOD_PREFIX)) unavailable("Photoshop layer filter method");
+    return method;
+  }
+  async function smartObjectConvert(request) {
+    return smartObjectBatchPlay(request, [{ _obj: "newPlacedLayer" }], "Convert to smart object");
+  }
+  async function smartObjectReplaceContents(request) {
+    const path = asString(request.args?.[1]);
+    if (!path) unavailable("Photoshop smart object replacement path");
+    const layerId = request.args?.[0];
+    const descriptor = {
+      _obj: "placedLayerReplaceContents",
+      null: await actionFileReference(path)
+    };
+    const numericLayerId = asNumber(layerId);
+    if (numericLayerId !== void 0) descriptor.layerID = numericLayerId;
+    return smartObjectBatchPlay(request, [descriptor], "Replace smart object contents");
+  }
+  async function smartObjectBatchPlay(request, descriptors, defaultCommandName) {
+    const layer = findLayer(request.args?.[0]);
+    if (!layer) unavailable("Photoshop layer");
+    const layerId = property(layer, "id") ?? request.args?.[0];
+    const commands = [selectLayerDescriptor(layerId), ...descriptors];
+    await runBatchPlay(request, commands, {}, defaultCommandName);
+    return serializeLayer(activeLayer() ?? layer);
+  }
+  async function exportWithPreset(request) {
+    const payload = requestPayload(request);
+    const presetName = asString(payload.preset) ?? asString(request.args?.[1]) ?? "png";
+    const preset = exportPreset(presetName);
+    const options = { ...preset.options, ...isObject(payload.options) ? payload.options : {} };
+    const saveRequest = {
+      ...request,
+      args: [
+        {
+          ...payload,
+          preset: preset.name,
+          format: asString(payload.format) ?? preset.format,
+          asCopy: typeof payload.asCopy === "boolean" ? payload.asCopy : preset.asCopy,
+          options
+        }
+      ]
+    };
+    return saveDocument(saveRequest, true);
+  }
+  function exportPreset(name) {
+    const normalized = name.toLowerCase().replace(/-/g, "_");
+    const preset = EXPORT_PRESETS.find((item) => item.name === normalized || item.format === normalized);
+    if (!preset) unavailable(`Photoshop export preset ${name}`);
+    return preset;
+  }
   function findLayer(id) {
     if (id === void 0 || id === null) return activeLayer();
     for (const document of openDocuments()) {
@@ -505,6 +636,15 @@
       if (match) return match;
     }
     return void 0;
+  }
+  function isSmartObjectLayer(layer) {
+    const kind = asString(property(layer, "kind")) ?? "";
+    if (kind.toLowerCase().includes("smart")) return true;
+    try {
+      return property(layer, "smartObject") !== void 0;
+    } catch {
+      return false;
+    }
   }
   function textItemForLayer(layerId) {
     const layer = findLayer(layerId);
@@ -548,12 +688,29 @@
     return void 0;
   }
   async function batchPlay(request) {
-    const action = property(photoshopModule(), "action");
-    const runBatchPlay = property(action, "batchPlay");
-    if (!runBatchPlay) unavailable("Photoshop action.batchPlay");
     const descriptors = request.args?.[0] ?? [];
     const actionOptions = isObject(request.args?.[1]) ? request.args?.[1] : {};
-    return withModal(request, "Run batchPlay", () => maybePromise(runBatchPlay.call(action, descriptors, actionOptions)));
+    return runBatchPlay(request, asArray(descriptors), actionOptions, "Run batchPlay");
+  }
+  async function runBatchPlay(request, descriptors, actionOptions, defaultCommandName) {
+    const action = property(photoshopModule(), "action");
+    const runBatchPlay2 = property(action, "batchPlay");
+    if (!runBatchPlay2) unavailable("Photoshop action.batchPlay");
+    return withModal(request, defaultCommandName, () => maybePromise(runBatchPlay2.call(action, descriptors, actionOptions)));
+  }
+  function selectLayerDescriptor(layerId) {
+    return {
+      _obj: "select",
+      _target: [layerReference(layerId)],
+      makeVisible: false
+    };
+  }
+  function layerReference(layerId) {
+    const id = asNumber(layerId);
+    if (id !== void 0) return { _ref: "layer", _id: id };
+    const name = asString(layerId);
+    if (name) return { _ref: "layer", _name: name };
+    return { _ref: "layer", _enum: "ordinal", _value: "targetEnum" };
   }
   function getPath(request) {
     const path = normalizePath(request.args?.[0]);
@@ -654,17 +811,19 @@
     const path = asString(payload.path);
     if (!path) unavailable("Photoshop save path");
     const format = normalizeFormat(asString(payload.format) ?? "psd");
-    return withModal(request, asCopy ? "Export document" : "Save document", async () => {
+    const saveOptions = isObject(payload.options) ? payload.options : {};
+    const saveAsCopy = typeof payload.asCopy === "boolean" ? payload.asCopy : asCopy;
+    return withModal(request, saveAsCopy ? "Export document" : "Save document", async () => {
       const entry = await fileEntry(path);
       const saveAs = property(document, "saveAs");
       const saveFormat = property(saveAs, format);
       if (saveFormat) {
-        await maybePromise(saveFormat.call(saveAs, entry, {}, asCopy));
+        await maybePromise(saveFormat.call(saveAs, entry, saveOptions, saveAsCopy));
         return serializeDocument(document);
       }
       const directSaveAs = property(document, "saveAs");
       if (directSaveAs) {
-        await maybePromise(directSaveAs.call(document, entry, { format }, asCopy));
+        await maybePromise(directSaveAs.call(document, entry, { ...saveOptions, format }, saveAsCopy));
         return serializeDocument(document);
       }
       unavailable(`Photoshop document.saveAs.${format}`);
@@ -689,6 +848,26 @@
     }
     const getFileForSaving = property(localFileSystem, "getFileForSaving");
     if (getFileForSaving) return await maybePromise(getFileForSaving.call(localFileSystem, fileName(path)));
+    return path;
+  }
+  async function actionFileReference(path) {
+    const entry = await fileEntryForOpening(path);
+    const localFileSystem = property(property(uxpModule(), "storage"), "localFileSystem");
+    const createSessionToken = property(localFileSystem, "createSessionToken");
+    const token = createSessionToken ? await maybePromise(createSessionToken.call(localFileSystem, entry)) : path;
+    return { _path: token, _kind: "local" };
+  }
+  async function fileEntryForOpening(path) {
+    const localFileSystem = property(property(uxpModule(), "storage"), "localFileSystem");
+    const getEntryWithUrl = property(localFileSystem, "getEntryWithUrl");
+    if (getEntryWithUrl) {
+      try {
+        return await maybePromise(getEntryWithUrl.call(localFileSystem, toFileUrl(path)));
+      } catch {
+      }
+    }
+    const getFileForOpening = property(localFileSystem, "getFileForOpening");
+    if (getFileForOpening) return await maybePromise(getFileForOpening.call(localFileSystem));
     return path;
   }
   async function withModal(request, defaultCommandName, work) {

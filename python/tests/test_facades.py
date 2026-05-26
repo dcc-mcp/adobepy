@@ -26,11 +26,11 @@ class CapturingClient:
         if namespace == "document" and method == "getById":
             return {"id": args[0], "name": "demo", "width": 100, "height": 50}
         if namespace == "document" and method in {"getLayers", "getActiveLayers"}:
-            return [{"id": 11, "name": "Layer 1", "kind": "pixel", "opacity": 80, "visible": True}]
+            return [{"id": 11, "name": "Layer 1", "kind": "pixel", "opacity": 80, "visible": True, "isSmartObject": False}]
         if namespace == "layer":
             if method == "getChildren":
                 return [{"id": 12, "name": "Child", "kind": "pixel"}]
-            return {"id": 11, "name": "Layer 1", "kind": "text"}
+            return {"id": 11, "name": "Layer 1", "kind": "text", "isSmartObject": False}
         if namespace == "selection":
             if method == "get":
                 return {"bounds": {"top": 1, "left": 2, "bottom": 40, "right": 50}, "docId": args[0], "solid": True, "typename": "Selection"}
@@ -74,6 +74,18 @@ class CapturingClient:
                 return {**payload, "orientation": args[1]}
             if method in {"resetCharacterStyle", "convertToParagraphText", "convertToPointText", "convertToShape", "createWorkPath"}:
                 return payload
+        if namespace == "filter":
+            return {"id": args[0], "name": "Layer 1", "kind": "pixel", "lastFilter": method}
+        if namespace == "smartObject":
+            return {"id": args[0], "name": "Layer 1", "kind": "smartObject", "isSmartObject": True}
+        if namespace == "export":
+            if method == "getPresets":
+                return [
+                    {"name": "png", "format": "png", "asCopy": True, "options": {"compression": 6}},
+                    {"name": "jpg_high", "format": "jpg", "asCopy": True, "options": {"quality": 12}},
+                ]
+            if method == "exportWithPreset":
+                return {"id": args[0]["id"], "name": "demo", "path": args[0]["path"], "width": 100, "height": 50}
         if namespace == "raw" and method == "evalJs":
             return {"source": args[0], "args": list(args[1:])}
         if namespace == "raw" and method == "getPath":
@@ -104,6 +116,7 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(app.active_layer.layers[0].name, "Child")
         self.assertEqual(app.activeText.contents, "Hello")
         self.assertEqual(app.active_text.characterStyle.size, 24)
+        self.assertEqual(app.exportPresets[0].format, "png")
         self.assertEqual(app.selection.bounds["top"], 1)
         self.assertEqual(app.channels[0].name, "Alpha 1")
         selection = app.activeDocument.selection
@@ -145,6 +158,12 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(client.calls[-1]["options"]["commandName"], "Tone")
         app.activeDocument.saveAs("C:/x.psd", commandName="Save")
         app.activeDocument.export("C:/x.png", timeout_ms=3)
+        app.activeDocument.export_with_preset("jpg_high", "C:/x.jpg", options={"quality": 10})
+        self.assertEqual(client.calls[-1]["namespace"], "export")
+        self.assertEqual(client.calls[-1]["args"][0]["options"]["quality"], 10)
+        app.activeDocument.exports.png("C:/x.png")
+        self.assertEqual(client.calls[-1]["method"], "exportWithPreset")
+        self.assertEqual(app.activeDocument.exports.presets[1].name, "jpg_high")
         text = app.activeLayer.text_item
         self.assertEqual(text.contents, "Hello")
         self.assertTrue(text.isPointText)
@@ -161,6 +180,19 @@ class FacadeTests(unittest.TestCase):
         text.convert_to_point_text()
         text.convert_to_shape()
         text.createWorkPath()
+        layer = app.activeLayer
+        self.assertFalse(layer.isSmartObject)
+        self.assertEqual(layer.filters.apply_gaussian_blur(2, command_name="Blur").id, 11)
+        self.assertEqual(client.calls[-1]["method"], "applyGaussianBlur")
+        self.assertEqual(client.calls[-1]["options"]["commandName"], "Blur")
+        layer.filters.apply("applyHighPass", 4)
+        layer.filters.applySharpen()
+        layer.filters.applySmartBlur(3, 12, "high")
+        self.assertTrue(layer.smart_object.convert_to_smart_object(command_name="Smart").isSmartObject)
+        self.assertEqual(client.calls[-1]["options"]["commandName"], "Smart")
+        layer.smartObject.newSmartObjectViaCopy()
+        layer.smartObject.editContents()
+        layer.smartObject.replace_contents("C:/replacement.psb")
         app.activeLayer.hide()
         self.assertTrue(client.calls[-1]["options"]["modal"])
         self.assertIsInstance(connect_photoshop(broker_url="http://x"), Photoshop)

@@ -66,4 +66,11 @@ if text:
     text.set_contents("Hello from Python")
     text.character_style.update(size=36, tracking=20)
     text.paragraph_style.update(justification="center")
+
+layer = app.activeLayer
+if layer:
+    layer.filters.apply_gaussian_blur(2)
+    layer.smart_object.convert_to_smart_object()
+
+doc.exports.jpg_high("C:/renders/demo.jpg")
 ```

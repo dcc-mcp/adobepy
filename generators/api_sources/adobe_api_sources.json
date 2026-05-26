@@ -16,6 +16,18 @@
         {
           "name": "Photoshop batchPlay",
           "url": "https://developer.adobe.com/photoshop/uxp/ps_reference/media/batchplay/"
+        },
+        {
+          "name": "Photoshop Layer",
+          "url": "https://developer.adobe.com/photoshop/uxp/2022/ps_reference/classes/layer/"
+        },
+        {
+          "name": "Photoshop Document",
+          "url": "https://developer.adobe.com/photoshop/uxp/2022/ps_reference/classes/document/"
+        },
+        {
+          "name": "UXP local file system",
+          "url": "https://developer.adobe.com/photoshop/uxp/2021/uxp/reference-js/Modules/uxp/Persistent%20File%20Storage/FileSystemProvider/"
         }
       ],
       "secondaryRefs": [
@@ -87,11 +99,11 @@
         },
         {
           "name": "Smart objects, filters, and export presets",
-          "level": "planned",
+          "level": "mvp",
           "trackedBy": 6,
-          "docRefs": ["Photoshop UXP API", "Photoshop batchPlay"],
-          "irNamespaces": [],
-          "facadeObjects": []
+          "docRefs": ["Photoshop Layer", "Photoshop Document", "Photoshop batchPlay", "UXP local file system"],
+          "irNamespaces": ["filter", "smartObject", "export"],
+          "facadeObjects": ["LayerFilterProxy", "SmartObjectProxy", "DocumentExportProxy", "ExportPreset"]
         }
       ]
     },

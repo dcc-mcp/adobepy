@@ -15,7 +15,8 @@
         {"name": "active_layers", "type": "list[Layer]", "source": "document.getActiveLayers"},
         {"name": "selection", "type": "Selection | None", "source": "selection.get"},
         {"name": "channels", "type": "list[Channel]", "source": "channel.getChannels"},
-        {"name": "active_text", "type": "TextItem | None", "source": "text.getActive"}
+        {"name": "active_text", "type": "TextItem | None", "source": "text.getActive"},
+        {"name": "export_presets", "type": "list[ExportPreset]", "source": "export.getPresets"}
       ]
     },
     {
@@ -85,6 +86,32 @@
         {"name": "createWorkPath", "returns": "TextItem", "mutatesState": true, "requiresModalWhenMutating": true}
       ]
     },
+    {
+      "name": "filter",
+      "methods": [
+        {"name": "apply", "returns": "Layer", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "applyGaussianBlur", "returns": "Layer", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "applyHighPass", "returns": "Layer", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "applySharpen", "returns": "Layer", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "applySmartBlur", "returns": "Layer", "mutatesState": true, "requiresModalWhenMutating": true}
+      ]
+    },
+    {
+      "name": "smartObject",
+      "methods": [
+        {"name": "convertToSmartObject", "returns": "Layer", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "newSmartObjectViaCopy", "returns": "Layer", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "editContents", "returns": "Layer", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "replaceContents", "returns": "Layer", "mutatesState": true, "requiresModalWhenMutating": true}
+      ]
+    },
+    {
+      "name": "export",
+      "methods": [
+        {"name": "getPresets", "returns": "list[ExportPreset]"},
+        {"name": "exportWithPreset", "returns": "Any", "mutatesState": true, "requiresModalWhenMutating": true}
+      ]
+    },
     {"name": "action", "methods": [{"name": "batchPlay", "returns": "Any", "mutatesState": true, "requiresModalWhenMutating": true}]},
     {
       "name": "raw",
@@ -114,13 +141,15 @@
         {"name": "channels", "type": "list[Channel]"},
         {"name": "active_channels", "type": "list[Channel]"},
         {"name": "component_channels", "type": "list[Channel]"},
-        {"name": "dom", "type": "PhotoshopDomProxy"}
+        {"name": "dom", "type": "PhotoshopDomProxy"},
+        {"name": "exports", "type": "DocumentExportProxy"}
       ],
       "methods": [
         {"name": "refresh", "returns": "Document"},
         {"name": "getChannel", "returns": "Channel | None"},
         {"name": "saveAs", "returns": "Any"},
-        {"name": "export", "returns": "Any"}
+        {"name": "export", "returns": "Any"},
+        {"name": "exportWithPreset", "returns": "Any"}
       ]
     },
     {
@@ -133,10 +162,57 @@
         {"name": "visible", "type": "bool | None"},
         {"name": "typename", "type": "str | None"},
         {"name": "has_children", "type": "bool"},
+        {"name": "is_smart_object", "type": "bool"},
+        {"name": "filters", "type": "LayerFilterProxy"},
+        {"name": "smart_object", "type": "SmartObjectProxy"},
         {"name": "text_item", "type": "TextItem | None"},
         {"name": "layers", "type": "list[Layer]"}
       ],
       "methods": [{"name": "hide", "returns": "Any"}]
+    },
+    {
+      "name": "ExportPreset",
+      "properties": [
+        {"name": "name", "type": "str"},
+        {"name": "format", "type": "str"},
+        {"name": "as_copy", "type": "bool"},
+        {"name": "options", "type": "dict[str, Any]"},
+        {"name": "description", "type": "str | None"}
+      ],
+      "methods": []
+    },
+    {
+      "name": "DocumentExportProxy",
+      "properties": [{"name": "presets", "type": "list[ExportPreset]"}],
+      "methods": [
+        {"name": "withPreset", "returns": "Any"},
+        {"name": "png", "returns": "Any"},
+        {"name": "png_small", "returns": "Any"},
+        {"name": "jpg_high", "returns": "Any"},
+        {"name": "jpg_medium", "returns": "Any"},
+        {"name": "psd_copy", "returns": "Any"}
+      ]
+    },
+    {
+      "name": "LayerFilterProxy",
+      "properties": [],
+      "methods": [
+        {"name": "apply", "returns": "Layer"},
+        {"name": "applyGaussianBlur", "returns": "Layer"},
+        {"name": "applyHighPass", "returns": "Layer"},
+        {"name": "applySharpen", "returns": "Layer"},
+        {"name": "applySmartBlur", "returns": "Layer"}
+      ]
+    },
+    {
+      "name": "SmartObjectProxy",
+      "properties": [],
+      "methods": [
+        {"name": "convertToSmartObject", "returns": "Layer"},
+        {"name": "newSmartObjectViaCopy", "returns": "Layer"},
+        {"name": "editContents", "returns": "Layer"},
+        {"name": "replaceContents", "returns": "Layer"}
+      ]
     },
     {
       "name": "SelectionProxy",

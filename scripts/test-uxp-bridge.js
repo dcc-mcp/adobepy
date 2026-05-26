@@ -146,7 +146,26 @@ async function testPhotoshopBridge() {
     convertToShape: async () => events.push({ kind: "text.convertToShape" }),
     createWorkPath: async () => events.push({ kind: "text.createWorkPath" })
   };
-  const textLayer = { id: 7, name: "Layer 1", kind: "text", opacity: 80, visible: true, textItem };
+  const textLayer = {
+    id: 7,
+    name: "Layer 1",
+    kind: "text",
+    opacity: 80,
+    visible: true,
+    textItem,
+    applyGaussianBlur: async (radius) => {
+      events.push({ kind: "filter.applyGaussianBlur", radius });
+    },
+    applyHighPass: async (radius) => {
+      events.push({ kind: "filter.applyHighPass", radius });
+    },
+    applySharpen: async () => {
+      events.push({ kind: "filter.applySharpen" });
+    },
+    applySmartBlur: async (radius, threshold, quality) => {
+      events.push({ kind: "filter.applySmartBlur", radius, threshold, quality });
+    }
+  };
   textItem.parent = textLayer;
   const document = {
     id: 9,
@@ -166,7 +185,8 @@ async function testPhotoshopBridge() {
     componentChannels: [channels[1]],
     saveAs: {
       psd: async (entry, options, asCopy) => events.push({ kind: "saveAs", url: entry.url, options, asCopy }),
-      png: async (entry, options, asCopy) => events.push({ kind: "saveAs", url: entry.url, options, asCopy })
+      png: async (entry, options, asCopy) => events.push({ kind: "saveAs", url: entry.url, options, asCopy }),
+      jpg: async (entry, options, asCopy) => events.push({ kind: "saveAs", url: entry.url, options, asCopy })
     }
   };
   const env = await loadBundle("bridges/uxp/photoshop/dist/main.js", {
@@ -175,6 +195,7 @@ async function testPhotoshopBridge() {
       action: {
         batchPlay: async (descriptors, options) => {
           events.push({ kind: "batchPlay", descriptors, options });
+          if (descriptors.some((descriptor) => descriptor._obj === "newPlacedLayer")) textLayer.kind = "smartObject";
           return descriptors;
         }
       },
@@ -188,7 +209,9 @@ async function testPhotoshopBridge() {
     uxp: {
       storage: {
         localFileSystem: {
-          createEntryWithUrl: async (url) => ({ url })
+          createEntryWithUrl: async (url) => ({ url }),
+          getEntryWithUrl: async (url) => ({ url }),
+          createSessionToken: async (entry) => `token:${entry.url}`
         }
       }
     }
@@ -200,6 +223,9 @@ async function testPhotoshopBridge() {
   assert.ok(env.sent[0].capabilities.methods.selection.includes("selectRectangle"));
   assert.ok(env.sent[0].capabilities.methods.channel.includes("getChannels"));
   assert.ok(env.sent[0].capabilities.methods.text.includes("setContents"));
+  assert.ok(env.sent[0].capabilities.methods.filter.includes("applyGaussianBlur"));
+  assert.ok(env.sent[0].capabilities.methods.smartObject.includes("convertToSmartObject"));
+  assert.ok(env.sent[0].capabilities.methods.export.includes("exportWithPreset"));
   assert.ok(env.sent[0].capabilities.methods.raw.includes("getPath"));
   assert.strictEqual(result(await rpc(env, "photoshop", "app", "getVersion")), "26.5.1");
   assert.strictEqual(result(await rpc(env, "photoshop", "app", "getDocuments"))[0].resolution, 72);
@@ -232,6 +258,19 @@ async function testPhotoshopBridge() {
   assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToPointText", [7], { modal: true })).isPointText, true);
   assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToShape", [7], { modal: true })).typename, "TextItem");
   assert.strictEqual(result(await rpc(env, "photoshop", "text", "createWorkPath", [7], { modal: true })).typename, "TextItem");
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applyGaussianBlur", [7, 2], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "apply", [7, "applyHighPass", 4], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySharpen", [7], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySmartBlur", [7, 3, 12, "high"], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "convertToSmartObject", [7], { modal: true })).isSmartObject, true);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "newSmartObjectViaCopy", [7], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "editContents", [7], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "replaceContents", [7, "C:/replacement.psb"], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "export", "getPresets"))[0].name, "png");
+  assert.deepStrictEqual(
+    result(await rpc(env, "photoshop", "export", "exportWithPreset", [{ id: 9, path: "C:/out.jpg", preset: "jpg_high", options: { quality: 10 } }], { modal: true })).id,
+    9
+  );
   assert.strictEqual(result(await rpc(env, "photoshop", "raw", "getPath", [["app", "activeDocument", "layers", 0, "name"]], {})), "Layer 1");
   assert.deepStrictEqual(result(await rpc(env, "photoshop", "action", "batchPlay", [[{ _obj: "hide" }], { synchronousExecution: true }], { modal: true, commandName: "Hide" })), [{ _obj: "hide" }]);
   assert.deepStrictEqual(result(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/out.psd", format: "psd" }], { modal: true, commandName: "Save" })).id, 9);
@@ -242,6 +281,10 @@ async function testPhotoshopBridge() {
   assert.ok(events.some((event) => event.kind === "selection.selectRectangle"));
   assert.ok(events.some((event) => event.kind === "channel.remove"));
   assert.ok(events.some((event) => event.kind === "text.convertToShape"));
+  assert.ok(events.some((event) => event.kind === "filter.applyGaussianBlur" && event.radius === 2));
+  assert.ok(events.some((event) => event.kind === "batchPlay" && event.descriptors.some((descriptor) => descriptor._obj === "newPlacedLayer")));
+  assert.ok(events.some((event) => event.kind === "batchPlay" && event.descriptors.some((descriptor) => descriptor._obj === "placedLayerReplaceContents")));
+  assert.ok(events.some((event) => event.kind === "saveAs" && event.url === "file:///C:/out.jpg" && event.options.quality === 10));
 }
 
 async function testInDesignBridge() {

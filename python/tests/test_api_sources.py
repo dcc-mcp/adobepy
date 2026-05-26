@@ -20,7 +20,8 @@ class ApiSourceTests(unittest.TestCase):
         by_host = {row["host"]: row for row in rows}
         self.assertEqual(set(by_host), {"after-effects", "illustrator", "indesign", "photoshop", "premiere"})
         self.assertGreater(by_host["photoshop"]["mvp"], by_host["premiere"]["mvp"])
-        self.assertGreater(by_host["photoshop"]["planned"], 0)
+        self.assertEqual(by_host["photoshop"]["planned"], 0)
+        self.assertEqual(by_host["photoshop"]["percent"], 100.0)
         self.assertIn("Sequences, tracks, clips, and markers", by_host["premiere"]["next"])
 
 
