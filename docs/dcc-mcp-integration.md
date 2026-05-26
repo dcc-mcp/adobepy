@@ -41,6 +41,20 @@ Recommended lifecycle:
 The broker port is separate from the MCP server port. The MCP server should not
 proxy raw WebSocket messages; it should call the Python facade.
 
+For `dcc-mcp-photoshop`, this replaces the adapter-owned
+`PhotoshopBridge` WebSocket server and `get_bridge().call("ps.*")` RPC dialect.
+The UXP plugin becomes an `adobepy` bridge client, the broker owns the
+JSON-RPC/capability contract, and skill code uses `Photoshop()` sessions.
+
+Recommended dependency change:
+
+```toml
+dependencies = [
+    "adobepy>=0.1.0",
+    "dcc-mcp-core>=0.12.29,<1.0.0",
+]
+```
+
 ## Migrating dcc-mcp-photoshop
 
 Current skill shape:
@@ -71,6 +85,33 @@ def list_layers(**kwargs):
     )
 ```
 
+Helper mapping:
+
+| Existing `dcc-mcp-photoshop` helper | adobepy replacement |
+| --- | --- |
+| `get_bridge().call("ps.listLayers")` | `Photoshop().activeLayers` or `Photoshop().activeDocument.layers` |
+| `get_bridge().call("ps.executeScript")` | `Photoshop().eval_js(...)` or `adobe.raw.eval_js("photoshop", ...)` |
+| `ps_success(...)` | `adobe.dcc_mcp.adobe_success(...)` or `action_result(...)` |
+| `ps_error(...)` / `ps_from_exception(...)` | `adobe_error(...)` / `adobe_exception(...)` |
+| `with_photoshop` | `with_adobe("Photoshop skill failed")` |
+
+Before calling a method family that may depend on bridge version, gate it with
+capabilities instead of probing private bridge state:
+
+```python
+from adobe.dcc_mcp import action_result
+from adobe.photoshop import Photoshop
+
+
+def list_layers(**kwargs):
+    app = Photoshop()
+    app.require_method("document", "getActiveLayers")
+    return action_result(
+        "Listed active Photoshop layers",
+        lambda: {"layers": [layer.name for layer in app.activeLayers]},
+    )
+```
+
 For lower-level calls that are not covered by the facade yet, keep the escape
 hatch explicit:
 
@@ -93,6 +134,10 @@ def raw_batch_play(**kwargs):
 `dcc-mcp-core` is installed, the helpers return the same skill result dicts as
 `skill_success`, `skill_error`, and `skill_exception`. Without it, they return a
 compatible plain dict so tests and docs can run without a DCC runtime.
+
+Keep the compatibility layer optional: `adobepy` must not require
+`dcc-mcp-core` at import time, and DCC MCP adapters should continue to own MCP
+server lifecycle, tool naming, and skill discovery.
 
 Known adobepy errors are mapped under `context["adobepy"]`:
 

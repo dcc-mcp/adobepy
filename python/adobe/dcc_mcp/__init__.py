@@ -32,7 +32,7 @@ _RECOVERY_PROMPTS = {
     UnauthorizedError: "Verify ADOBEPY_TOKEN matches the running broker session.",
     CapabilityError: "Check bridge capabilities before calling this Adobe API.",
     MethodNotFoundError: "Update the bridge or use a supported Adobe API method.",
-    ModalRequiredError: "Run the Photoshop operation inside execute_as_modal().",
+    ModalRequiredError: "Run the mutating Adobe operation inside the host modal or command context.",
     AdobePermissionError: "Check host permissions and file-system access.",
     SerializationError: "Return JSON-serializable values from the bridge call.",
     HostScriptError: "Inspect the host script error and bridge diagnostics.",
