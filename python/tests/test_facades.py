@@ -271,12 +271,77 @@ class CapturingClient:
                 "timebase": 25,
                 "typename": "Sequence",
             }
+            root_item = {
+                "id": "root",
+                "name": "Project Root",
+                "itemType": "bin",
+                "treePath": "/",
+                "childCount": 2,
+                "isBin": True,
+                "typename": "FolderItem",
+            }
             if method == "getActive":
                 return {"id": "project-1", "guid": "project-1", "name": "cut", "path": "C:/cut", "itemCount": 3}
             if method == "getSequences":
                 return [sequence]
             if method == "getActiveSequence":
                 return sequence
+            if method == "getRootItem":
+                return root_item
+            if method == "importFiles":
+                return [
+                    {
+                        "id": "media-2",
+                        "name": "new.mov",
+                        "itemType": "clip",
+                        "mediaPath": args[0]["filePaths"][0],
+                        "parentId": args[0]["targetBin"] or "root",
+                        "isClip": True,
+                        "isOffline": False,
+                        "typename": "ClipProjectItem",
+                    }
+                ]
+        if host == "premiere" and namespace == "projectItem":
+            bin_item = {
+                "id": "bin-1",
+                "name": "Dailies",
+                "itemType": "bin",
+                "treePath": "/Dailies",
+                "parentId": "root",
+                "childCount": 1,
+                "isBin": True,
+                "typename": "FolderItem",
+            }
+            media_item = {
+                "id": "media-1",
+                "name": "shot.mov",
+                "itemType": "clip",
+                "mediaPath": "C:/media/shot.mov",
+                "treePath": "/Dailies/shot.mov",
+                "parentId": "bin-1",
+                "isClip": True,
+                "canProxy": True,
+                "hasProxy": False,
+                "isOffline": False,
+                "typename": "ClipProjectItem",
+            }
+            if method == "getChildren":
+                return [bin_item] if args[0] == "root" else [media_item]
+            if method == "getSelected":
+                return [media_item]
+            if method == "findByMediaPath":
+                return [media_item] if "shot" in args[1] else []
+        if host == "premiere" and namespace == "bin" and method == "create":
+            return {
+                "id": "bin-2",
+                "name": args[0]["name"],
+                "itemType": "bin",
+                "treePath": f"/{args[0]['name']}",
+                "parentId": args[0]["parentId"],
+                "childCount": 0,
+                "isBin": True,
+                "typename": "FolderItem",
+            }
         if host == "premiere" and namespace == "sequence":
             if method == "getVideoTracks":
                 return [{"id": "v1", "name": "V1", "index": 0, "mediaType": "video", "isLocked": False, "isMuted": False, "isTargeted": True}]
@@ -538,6 +603,20 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(sequence.markers[0].markerType, "comment")
         self.assertEqual(sequence.create_marker("Review", start=42, command_name="Add marker").name, "Review")
         self.assertEqual(premiere_client.calls[-1]["options"]["commandName"], "Add marker")
+        root = premiere.project.root_item
+        self.assertTrue(root.isBin)
+        self.assertEqual(root.children[0].name, "Dailies")
+        media_item = root.children[0].children[0]
+        self.assertEqual(media_item.media_path, "C:/media/shot.mov")
+        self.assertTrue(media_item.canProxy)
+        self.assertFalse(media_item.isOffline)
+        self.assertEqual(root.findItemsMatchingMediaPath("shot")[0].typename, "ClipProjectItem")
+        self.assertEqual(premiere.project.selected_items[0].name, "shot.mov")
+        self.assertEqual(root.create_bin("Plates", command_name="Create Plates").name, "Plates")
+        self.assertEqual(premiere_client.calls[-1]["options"]["commandName"], "Create Plates")
+        imported = premiere.project.import_files("C:/media/new.mov", target_bin=root, command_name="Import")
+        self.assertEqual(imported[0].parentId, "root")
+        self.assertEqual(imported[0].mediaPath, "C:/media/new.mov")
 
     def test_legacy_cep_facades(self):
         ae = AfterEffects(client=CapturingClient())

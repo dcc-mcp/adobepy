@@ -177,7 +177,7 @@
       "runtimeModule": "premierepro",
       "entryPoint": "require('premierepro')",
       "ir": "generators/ir/premiere-mvp.json",
-      "trackedBy": [5, 7, 15],
+      "trackedBy": [5, 7, 15, 16],
       "officialDocs": [
         {
           "name": "Premiere Pro UXP API",
@@ -219,11 +219,11 @@
         },
         {
           "name": "Project items, media import, and bins",
-          "level": "planned",
-          "trackedBy": 7,
+          "level": "mvp",
+          "trackedBy": 16,
           "docRefs": ["Premiere Pro DOM API"],
-          "irNamespaces": [],
-          "facadeObjects": []
+          "irNamespaces": ["projectItem", "bin"],
+          "facadeObjects": ["ProjectItemProxy"]
         },
         {
           "name": "Encoder/export workflows",

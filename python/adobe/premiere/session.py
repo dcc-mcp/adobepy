@@ -150,6 +150,24 @@ class ProjectProxy:
         payload = self._session.invoke("project", "getSequences")
         return [SequenceProxy(self._session, sequence) for sequence in payload or []]
 
+    @property
+    def root_item(self) -> "ProjectItemProxy | None":
+        payload = self._session.invoke("project", "getRootItem")
+        return ProjectItemProxy(self._session, payload) if payload else None
+
+    @property
+    def rootItem(self) -> "ProjectItemProxy | None":
+        return self.root_item
+
+    @property
+    def selected_items(self) -> list["ProjectItemProxy"]:
+        payload = self._session.invoke("projectItem", "getSelected")
+        return [ProjectItemProxy(self._session, item) for item in payload or []]
+
+    @property
+    def selectedItems(self) -> list["ProjectItemProxy"]:
+        return self.selected_items
+
     def get_sequence(self, id_or_name: Any) -> "SequenceProxy | None":
         for sequence in self.sequences:
             if id_or_name in {sequence.id, sequence.sequence_id, sequence.name}:
@@ -158,6 +176,215 @@ class ProjectProxy:
 
     def getSequence(self, idOrName: Any) -> "SequenceProxy | None":
         return self.get_sequence(idOrName)
+
+    def import_files(
+        self,
+        paths: str | list[str],
+        *,
+        target_bin: "ProjectItemProxy | str | None" = None,
+        suppress_ui: bool = True,
+        as_numbered_stills: bool = False,
+        command_name: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> list["ProjectItemProxy"]:
+        payload = self._session.invoke(
+            "project",
+            "importFiles",
+            {
+                "filePaths": [paths] if isinstance(paths, str) else list(paths),
+                "targetBin": _item_key(target_bin),
+                "suppressUI": suppress_ui,
+                "asNumberedStills": as_numbered_stills,
+            },
+            options=self._session.modal_options(
+                command_name=command_name,
+                default_command_name="Import media",
+                timeout_ms=timeout_ms,
+            ),
+        )
+        return [ProjectItemProxy(self._session, item) for item in payload or []]
+
+    def importFiles(
+        self,
+        paths: str | list[str],
+        *,
+        targetBin: "ProjectItemProxy | str | None" = None,
+        suppressUI: bool = True,
+        asNumberedStills: bool = False,
+        commandName: str | None = None,
+        timeoutMs: int | None = None,
+    ) -> list["ProjectItemProxy"]:
+        return self.import_files(
+            paths,
+            target_bin=targetBin,
+            suppress_ui=suppressUI,
+            as_numbered_stills=asNumberedStills,
+            command_name=commandName,
+            timeout_ms=timeoutMs,
+        )
+
+    def import_media(self, paths: str | list[str], **kwargs: Any) -> list["ProjectItemProxy"]:
+        return self.import_files(paths, **kwargs)
+
+
+@dataclass
+class ProjectItemProxy:
+    _session: PremiereSession
+    _payload: dict[str, Any]
+
+    @property
+    def id(self) -> Any:
+        return self._payload.get("id")
+
+    @property
+    def name(self) -> str | None:
+        return self._payload.get("name")
+
+    @property
+    def type(self) -> Any:
+        return self._payload.get("type")
+
+    @property
+    def item_type(self) -> str | None:
+        return self._payload.get("itemType") or self._payload.get("item_type")
+
+    @property
+    def itemType(self) -> str | None:
+        return self.item_type
+
+    @property
+    def path(self) -> str | None:
+        return self._payload.get("path")
+
+    @property
+    def media_path(self) -> str | None:
+        return self._payload.get("mediaPath") or self._payload.get("media_path")
+
+    @property
+    def mediaPath(self) -> str | None:
+        return self.media_path
+
+    @property
+    def tree_path(self) -> str | None:
+        return self._payload.get("treePath") or self._payload.get("tree_path")
+
+    @property
+    def treePath(self) -> str | None:
+        return self.tree_path
+
+    @property
+    def parent_id(self) -> Any:
+        return self._payload.get("parentId") or self._payload.get("parent_id")
+
+    @property
+    def parentId(self) -> Any:
+        return self.parent_id
+
+    @property
+    def child_count(self) -> int:
+        return int(self._payload.get("childCount") or 0)
+
+    @property
+    def childCount(self) -> int:
+        return self.child_count
+
+    @property
+    def children(self) -> list["ProjectItemProxy"]:
+        payload = self._session.invoke("projectItem", "getChildren", self._item_key)
+        return [ProjectItemProxy(self._session, item) for item in payload or []]
+
+    @property
+    def is_bin(self) -> bool:
+        return bool(self._payload.get("isBin"))
+
+    @property
+    def isBin(self) -> bool:
+        return self.is_bin
+
+    @property
+    def is_clip(self) -> bool:
+        return bool(self._payload.get("isClip"))
+
+    @property
+    def isClip(self) -> bool:
+        return self.is_clip
+
+    @property
+    def is_sequence(self) -> bool:
+        return bool(self._payload.get("isSequence"))
+
+    @property
+    def isSequence(self) -> bool:
+        return self.is_sequence
+
+    @property
+    def can_proxy(self) -> bool | None:
+        return self._payload.get("canProxy")
+
+    @property
+    def canProxy(self) -> bool | None:
+        return self.can_proxy
+
+    @property
+    def has_proxy(self) -> bool | None:
+        return self._payload.get("hasProxy")
+
+    @property
+    def hasProxy(self) -> bool | None:
+        return self.has_proxy
+
+    @property
+    def is_offline(self) -> bool | None:
+        return self._payload.get("isOffline")
+
+    @property
+    def isOffline(self) -> bool | None:
+        return self.is_offline
+
+    @property
+    def typename(self) -> str | None:
+        return self._payload.get("typename")
+
+    def create_bin(
+        self,
+        name: str,
+        *,
+        make_unique: bool = True,
+        command_name: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> "ProjectItemProxy":
+        payload = self._session.invoke(
+            "bin",
+            "create",
+            {"parentId": self._item_key, "name": name, "makeUnique": make_unique},
+            options=self._session.modal_options(
+                command_name=command_name,
+                default_command_name="Create bin",
+                timeout_ms=timeout_ms,
+            ),
+        )
+        return ProjectItemProxy(self._session, payload or {})
+
+    def createBin(
+        self,
+        name: str,
+        *,
+        makeUnique: bool = True,
+        commandName: str | None = None,
+        timeoutMs: int | None = None,
+    ) -> "ProjectItemProxy":
+        return self.create_bin(name, make_unique=makeUnique, command_name=commandName, timeout_ms=timeoutMs)
+
+    def find_items_matching_media_path(self, match: str, *, ignore_subclips: bool = False) -> list["ProjectItemProxy"]:
+        payload = self._session.invoke("projectItem", "findByMediaPath", self._item_key, match, ignore_subclips)
+        return [ProjectItemProxy(self._session, item) for item in payload or []]
+
+    def findItemsMatchingMediaPath(self, match: str, *, ignoreSubclips: bool = False) -> list["ProjectItemProxy"]:
+        return self.find_items_matching_media_path(match, ignore_subclips=ignoreSubclips)
+
+    @property
+    def _item_key(self) -> Any:
+        return self.id or self.tree_path or self.media_path or self.name
 
 
 @dataclass
@@ -498,3 +725,9 @@ async def connect_async(
     timeout: float = 30.0,
 ) -> PremiereSession:
     return connect(broker_url=broker_url, token=token, target=target, timeout=timeout)
+
+
+def _item_key(item: "ProjectItemProxy | str | None") -> Any:
+    if isinstance(item, ProjectItemProxy):
+        return item.id or item.tree_path or item.media_path or item.name
+    return item

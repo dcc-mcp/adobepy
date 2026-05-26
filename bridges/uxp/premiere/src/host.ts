@@ -12,14 +12,16 @@ export const premiereAdapter: HostAdapter = {
       bridgeKind: "uxp",
       bridgeVersion: "0.1.0",
       hostVersion: premiereVersion(),
-      namespaces: ["app", "project", "sequence", "track", "clip", "marker", "raw"],
-      features: ["project", "sequence", "track", "clip", "marker"],
+      namespaces: ["app", "project", "sequence", "track", "clip", "projectItem", "bin", "marker", "raw"],
+      features: ["project", "sequence", "track", "clip", "projectItem", "bin", "marker"],
       methods: {
         app: ["getVersion"],
-        project: ["getActive", "getSequences", "getActiveSequence"],
+        project: ["getActive", "getSequences", "getActiveSequence", "getRootItem", "importFiles"],
         sequence: ["getVideoTracks", "getAudioTracks"],
         track: ["getClips"],
         clip: ["getSelected"],
+        projectItem: ["getChildren", "getSelected", "findByMediaPath"],
+        bin: ["create"],
         marker: ["getMarkers", "create"],
         raw: ["evalJs"]
       }
@@ -30,6 +32,8 @@ export const premiereAdapter: HostAdapter = {
     if (request.namespace === "project" && request.method === "getActive") return serializeProject(await activeProject());
     if (request.namespace === "project" && request.method === "getSequences") return serializeSequences(await projectSequences(await activeProject()));
     if (request.namespace === "project" && request.method === "getActiveSequence") return serializeSequence(await activeSequence());
+    if (request.namespace === "project" && request.method === "getRootItem") return serializeProjectItem(await rootProjectItem());
+    if (request.namespace === "project" && request.method === "importFiles") return importFiles(request);
     if (request.namespace === "sequence" && request.method === "getVideoTracks") {
       return serializeTracks(sequenceTracks(await requireSequence(request.args?.[0]), "video"), "video");
     }
@@ -38,6 +42,10 @@ export const premiereAdapter: HostAdapter = {
     }
     if (request.namespace === "track" && request.method === "getClips") return trackClips(request);
     if (request.namespace === "clip" && request.method === "getSelected") return selectedClips(await requireSequence(request.args?.[0]));
+    if (request.namespace === "projectItem" && request.method === "getChildren") return projectItemChildren(request);
+    if (request.namespace === "projectItem" && request.method === "getSelected") return selectedProjectItems();
+    if (request.namespace === "projectItem" && request.method === "findByMediaPath") return projectItemsByMediaPath(request);
+    if (request.namespace === "bin" && request.method === "create") return createBin(request);
     if (request.namespace === "marker" && request.method === "getMarkers") return sequenceMarkers(await requireSequence(request.args?.[0]));
     if (request.namespace === "marker" && request.method === "create") return createMarker(request);
     if (request.namespace === "raw" && request.method === "evalJs") return evalJavaScript(asString(request.args?.[0]) ?? "", request.args?.slice(1) ?? []);
@@ -120,6 +128,97 @@ function serializeProject(project: unknown) {
     path: asString(property(project, "path")),
     itemCount: asNumber(property(project, "itemCount")) ?? asNumber(property(project, "numItems"))
   };
+}
+
+async function rootProjectItem(project?: unknown) {
+  project = project ?? (await activeProject());
+  const getRootItem = property<Callable>(project, "getRootItem");
+  if (getRootItem) return await maybePromise(getRootItem.call(project));
+  return property(project, "rootItem") ?? property(project, "root") ?? property(project, "rootProjectItem");
+}
+
+async function requireProjectItem(idOrName: unknown) {
+  const project = await activeProject();
+  const root = await rootProjectItem(project);
+  const item = findProjectItem(root, idOrName);
+  if (!item) unavailable("Premiere project item");
+  return item;
+}
+
+async function importFiles(request: RpcRequest) {
+  const project = await activeProject();
+  if (!project) unavailable("Premiere project");
+  const payload = isObject(request.args?.[0]) ? request.args?.[0] : { filePaths: request.args?.[0] };
+  const filePaths = normalizeFilePaths(property(payload, "filePaths") ?? property(payload, "paths") ?? property(payload, "path"));
+  if (filePaths.length === 0) unavailable("Premiere import file paths");
+  const targetBinId = property(payload, "targetBin") ?? property(payload, "target_bin") ?? property(payload, "targetBinId") ?? property(payload, "target_bin_id");
+  const targetBin = targetBinId === undefined || targetBinId === null ? await rootProjectItem(project) : await requireProjectItem(targetBinId);
+  const importProjectFiles = property<Callable>(project, "importFiles");
+  if (!importProjectFiles) unavailable("Premiere project.importFiles");
+  const suppressUI = booleanValue(property(payload, "suppressUI") ?? property(payload, "suppress_ui")) ?? true;
+  const asNumberedStills = booleanValue(property(payload, "asNumberedStills") ?? property(payload, "as_numbered_stills")) ?? false;
+  const result = await maybePromise(importProjectFiles.call(project, filePaths, suppressUI, targetBin, asNumberedStills));
+  const resultItems = collectionItems(result);
+  if (resultItems.length > 0) return serializeProjectItems(resultItems);
+  return serializeProjectItems(findImportedProjectItems(filePaths, targetBin ?? (await rootProjectItem(project))));
+}
+
+async function projectItemChildren(request: RpcRequest) {
+  const item = request.args?.[0] === undefined || request.args?.[0] === null ? await rootProjectItem() : await requireProjectItem(request.args?.[0]);
+  return serializeProjectItems(projectItemChildObjects(item));
+}
+
+async function selectedProjectItems() {
+  const premiere = premiereModule();
+  const project = await activeProject();
+  const projectUtils = property(premiere, "ProjectUtils") ?? property(premiere, "projectUtils");
+  const getSelection = property<Callable>(projectUtils, "getSelection");
+  if (getSelection) return serializeProjectItems(collectionItems(await maybePromise(getSelection.call(projectUtils, project))));
+  const selection = property(project, "selection") ?? property(premiere, "selection");
+  return serializeProjectItems(collectionItems(selection));
+}
+
+async function projectItemsByMediaPath(request: RpcRequest) {
+  const root = request.args?.[0] === undefined || request.args?.[0] === null ? await rootProjectItem() : await requireProjectItem(request.args?.[0]);
+  const matchString = asString(request.args?.[1]) ?? "";
+  const ignoreSubclips = booleanValue(request.args?.[2]) ?? false;
+  if (!matchString) unavailable("Premiere media path match");
+  const directFind = property<Callable>(root, "findItemsMatchingMediaPath");
+  if (directFind) return serializeProjectItems(collectionItems(await maybePromise(directFind.call(root, matchString, ignoreSubclips))));
+  return serializeProjectItems(findProjectItemsMatchingMediaPath(root, matchString));
+}
+
+async function createBin(request: RpcRequest) {
+  const project = await activeProject();
+  const payload = isObject(request.args?.[0]) ? request.args?.[0] : { parentId: request.args?.[0], name: request.args?.[1] };
+  const name = asString(property(payload, "name"));
+  if (!name) unavailable("Premiere bin name");
+  const parentId = property(payload, "parentId") ?? property(payload, "parent_id");
+  const parent = parentId === undefined || parentId === null ? await rootProjectItem(project) : await requireProjectItem(parentId);
+  if (!parent) unavailable("Premiere parent bin");
+  const makeUnique = booleanValue(property(payload, "makeUnique") ?? property(payload, "make_unique")) ?? true;
+  const createDirect = property<Callable>(parent, "createBin");
+  if (createDirect) {
+    const created = await maybePromise(createDirect.call(parent, name, makeUnique));
+    return serializeProjectItem(isObject(created) ? created : findProjectItem(parent, name));
+  }
+  const createAction = property<Callable>(parent, "createBinAction");
+  const executeTransaction = property<Callable>(project, "executeTransaction");
+  if (createAction && executeTransaction) {
+    await maybePromise(
+      executeTransaction.call(
+        project,
+        (compoundAction: unknown) => {
+          const action = createAction.call(parent, name, makeUnique);
+          const addAction = property<Callable>(compoundAction, "addAction") ?? property<Callable>(compoundAction, "add");
+          if (addAction) addAction.call(compoundAction, action);
+        },
+        asString(request.options?.commandName) ?? "Create bin"
+      )
+    );
+    return serializeProjectItem(findProjectItem(parent, name));
+  }
+  unavailable("Premiere bin.create");
 }
 
 function serializeSequences(sequences: unknown[]) {
@@ -267,6 +366,126 @@ function serializeMarker(marker: unknown) {
     markerType: asString(property(marker, "markerType")) ?? asString(property(marker, "marker_type")),
     typename: asString(property(marker, "typename")) ?? asString(property(marker, "typeName"))
   };
+}
+
+function serializeProjectItems(items: unknown[]) {
+  return items.map(serializeProjectItem).filter((item) => item !== null);
+}
+
+function serializeProjectItem(item: unknown) {
+  if (!isObject(item)) return null;
+  const children = projectItemChildObjects(item);
+  const typename = asString(property(item, "typename")) ?? asString(property(item, "typeName"));
+  const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
+  const treePath = asString(property(item, "treePath")) ?? asString(property(item, "path"));
+  const itemType = projectItemType(item, children, typename, mediaPath);
+  return {
+    id: projectItemId(item),
+    name: asString(property(item, "name")),
+    type: property(item, "type"),
+    itemType,
+    path: treePath ?? mediaPath,
+    mediaPath,
+    treePath,
+    parentId: projectItemId(property(item, "parent")),
+    childCount: children.length,
+    isBin: itemType === "bin",
+    isClip: itemType === "clip",
+    isSequence: itemType === "sequence",
+    canProxy: booleanValue(property(item, "canProxy")) ?? booleanValue(safeCall(item, "canProxy")),
+    hasProxy: booleanValue(property(item, "hasProxy")) ?? booleanValue(safeCall(item, "hasProxy")),
+    isOffline: booleanValue(property(item, "isOffline")) ?? booleanValue(safeCall(item, "isOffline")),
+    typename
+  };
+}
+
+function projectItemType(item: unknown, children: unknown[], typename?: string, mediaPath?: string): string | undefined {
+  const explicit = asString(property(item, "itemType")) ?? asString(property(item, "kind"));
+  if (explicit) return explicit;
+  const normalizedTypename = typename?.toLowerCase() ?? "";
+  if (normalizedTypename.includes("folder") || normalizedTypename.includes("bin")) return "bin";
+  if (booleanValue(property(item, "isBin")) === true || children.length > 0) return "bin";
+  if (booleanValue(property(item, "isSequence")) === true || normalizedTypename.includes("sequence")) return "sequence";
+  if (mediaPath || normalizedTypename.includes("clip")) return "clip";
+  const type = property(item, "type");
+  return type === undefined ? undefined : String(type);
+}
+
+function projectItemId(item: unknown) {
+  return property(item, "id") ?? property(item, "guid") ?? property(item, "nodeId") ?? property(item, "nodeID");
+}
+
+function projectItemChildObjects(item: unknown): unknown[] {
+  const direct = collectionItems(property(item, "children") ?? property(item, "items"));
+  if (direct.length > 0) return direct;
+  return collectionItems(safeCall(item, "getItems") ?? safeCall(item, "getChildren"));
+}
+
+function findProjectItem(root: unknown, idOrName: unknown): unknown {
+  if (idOrName === undefined || idOrName === null) return root;
+  return collectProjectItems(root).find((item) => projectItemMatches(item, idOrName));
+}
+
+function collectProjectItems(root: unknown): unknown[] {
+  const result: unknown[] = [];
+  const queue: unknown[] = root ? [root] : [];
+  const seen = new Set<unknown>();
+  while (queue.length > 0) {
+    const item = queue.shift();
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    result.push(item);
+    queue.push(...projectItemChildObjects(item));
+  }
+  return result;
+}
+
+function projectItemMatches(item: unknown, idOrName: unknown): boolean {
+  if (!isObject(item)) return false;
+  const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
+  const values = [
+    projectItemId(item),
+    property(item, "name"),
+    property(item, "treePath"),
+    property(item, "path"),
+    mediaPath
+  ];
+  return values.some((value) => value !== undefined && String(value) === String(idOrName));
+}
+
+function findProjectItemsMatchingMediaPath(root: unknown, matchString: string): unknown[] {
+  return collectProjectItems(root).filter((item) => {
+    const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
+    return mediaPath?.includes(matchString) || asString(property(item, "name"))?.includes(matchString);
+  });
+}
+
+function findImportedProjectItems(filePaths: string[], root: unknown): unknown[] {
+  const candidates = collectProjectItems(root);
+  return filePaths
+    .map((filePath) => {
+      const fileName = filePath.split(/[\\/]/).filter(Boolean).pop() ?? filePath;
+      return candidates.find((item) => {
+        const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
+        return mediaPath === filePath || asString(property(item, "name")) === fileName;
+      });
+    })
+    .filter((item) => item !== undefined);
+}
+
+function normalizeFilePaths(value: unknown): string[] {
+  const values = Array.isArray(value) ? value : [value];
+  return values.map((item) => asString(item)).filter((item) => item !== undefined);
+}
+
+function safeCall(receiver: unknown, method: string, ...args: unknown[]): unknown {
+  const fn = property<Callable>(receiver, method);
+  if (!fn) return undefined;
+  try {
+    return fn.apply(receiver, args);
+  } catch {
+    return undefined;
+  }
 }
 
 function collectionItems(value: unknown): unknown[] {

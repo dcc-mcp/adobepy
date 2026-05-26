@@ -17,7 +17,9 @@
       "methods": [
         {"name": "getActive", "returns": "Project | None"},
         {"name": "getSequences", "returns": "list[Sequence]"},
-        {"name": "getActiveSequence", "returns": "Sequence | None"}
+        {"name": "getActiveSequence", "returns": "Sequence | None"},
+        {"name": "getRootItem", "returns": "ProjectItem | None"},
+        {"name": "importFiles", "returns": "list[ProjectItem]", "mutates": true, "modal": true}
       ]
     },
     {
@@ -29,6 +31,15 @@
     },
     {"name": "track", "methods": [{"name": "getClips", "returns": "list[Clip]"}]},
     {"name": "clip", "methods": [{"name": "getSelected", "returns": "list[Clip]"}]},
+    {
+      "name": "projectItem",
+      "methods": [
+        {"name": "getChildren", "returns": "list[ProjectItem]"},
+        {"name": "getSelected", "returns": "list[ProjectItem]"},
+        {"name": "findByMediaPath", "returns": "list[ProjectItem]"}
+      ]
+    },
+    {"name": "bin", "methods": [{"name": "create", "returns": "ProjectItem", "mutates": true, "modal": true}]},
     {
       "name": "marker",
       "methods": [
@@ -48,9 +59,39 @@
         {"name": "path", "type": "str | None"},
         {"name": "item_count", "type": "int"},
         {"name": "active_sequence", "type": "Sequence | None", "source": "project.getActiveSequence"},
-        {"name": "sequences", "type": "list[Sequence]", "source": "project.getSequences"}
+        {"name": "sequences", "type": "list[Sequence]", "source": "project.getSequences"},
+        {"name": "root_item", "type": "ProjectItem | None", "source": "project.getRootItem"},
+        {"name": "selected_items", "type": "list[ProjectItem]", "source": "projectItem.getSelected"}
       ],
-      "methods": [{"name": "getSequence", "returns": "Sequence | None"}]
+      "methods": [
+        {"name": "getSequence", "returns": "Sequence | None"},
+        {"name": "importFiles", "returns": "list[ProjectItem]"}
+      ]
+    },
+    {
+      "name": "ProjectItemProxy",
+      "properties": [
+        {"name": "id", "type": "Any"},
+        {"name": "name", "type": "str | None"},
+        {"name": "type", "type": "Any"},
+        {"name": "item_type", "type": "str | None"},
+        {"name": "path", "type": "str | None"},
+        {"name": "media_path", "type": "str | None"},
+        {"name": "tree_path", "type": "str | None"},
+        {"name": "parent_id", "type": "Any"},
+        {"name": "children", "type": "list[ProjectItem]", "source": "projectItem.getChildren"},
+        {"name": "is_bin", "type": "bool"},
+        {"name": "is_clip", "type": "bool"},
+        {"name": "is_sequence", "type": "bool"},
+        {"name": "can_proxy", "type": "bool | None"},
+        {"name": "has_proxy", "type": "bool | None"},
+        {"name": "is_offline", "type": "bool | None"},
+        {"name": "typename", "type": "str | None"}
+      ],
+      "methods": [
+        {"name": "createBin", "returns": "ProjectItem"},
+        {"name": "findItemsMatchingMediaPath", "returns": "list[ProjectItem]"}
+      ]
     },
     {
       "name": "SequenceProxy",

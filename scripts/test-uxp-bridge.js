@@ -523,6 +523,48 @@ async function testPremiereBridge() {
     selected: false,
     typename: "TrackItem"
   };
+  const mediaItem = {
+    id: "media-1",
+    name: "shot.mov",
+    mediaPath: "C:/media/shot.mov",
+    treePath: "/Dailies/shot.mov",
+    type: 1,
+    typename: "ClipProjectItem",
+    canProxy: () => true,
+    hasProxy: () => false,
+    isOffline: () => false,
+    getMediaFilePath: () => "C:/media/shot.mov"
+  };
+  const binItem = {
+    id: "bin-1",
+    name: "Dailies",
+    treePath: "/Dailies",
+    type: 2,
+    typename: "FolderItem",
+    children: [mediaItem],
+    createBin(name) {
+      const bin = { id: `bin-${this.children.length + 1}`, name, treePath: `/Dailies/${name}`, type: 2, typename: "FolderItem", children: [] };
+      this.children.push(bin);
+      events.push({ kind: "bin.create", parent: this.id, name });
+      return bin;
+    }
+  };
+  mediaItem.parent = binItem;
+  const rootItem = {
+    id: "root",
+    name: "Project Root",
+    treePath: "/",
+    type: 2,
+    typename: "FolderItem",
+    children: [binItem],
+    createBin(name) {
+      const bin = { id: `root-bin-${this.children.length + 1}`, name, treePath: `/${name}`, type: 2, typename: "FolderItem", children: [] };
+      this.children.push(bin);
+      events.push({ kind: "bin.create", parent: this.id, name });
+      return bin;
+    }
+  };
+  binItem.parent = rootItem;
   const markers = [{ id: "marker-1", name: "Beat", comments: "cut here", start: 12, duration: 1, markerType: "comment", typename: "Marker" }];
   markers.createMarker = (start) => {
     const marker = { id: "marker-2", start, typename: "Marker" };
@@ -541,10 +583,35 @@ async function testPremiereBridge() {
     audioTracks: [{ id: "a1", name: "A1", index: 0, locked: false, muted: true, targeted: false, clips: [audioClip], typename: "AudioTrack" }],
     markers
   };
-  const project = { guid: "project-1", name: "cut.prproj", path: "C:/cut.prproj", itemCount: 3, sequences: [sequence], activeSequence: sequence };
+  const project = {
+    guid: "project-1",
+    name: "cut.prproj",
+    path: "C:/cut.prproj",
+    itemCount: 3,
+    sequences: [sequence],
+    activeSequence: sequence,
+    getRootItem() {
+      return rootItem;
+    },
+    importFiles(filePaths, suppressUI, targetBin, asNumberedStills) {
+      events.push({ kind: "project.importFiles", filePaths, suppressUI, targetBin: targetBin.id, asNumberedStills });
+      for (const filePath of filePaths) {
+        const name = filePath.split(/[\\/]/).pop();
+        const item = { id: `media-${targetBin.children.length + 1}`, name, mediaPath: filePath, treePath: `${targetBin.treePath}/${name}`, type: 1, typename: "ClipProjectItem", parent: targetBin };
+        targetBin.children.push(item);
+      }
+      return true;
+    }
+  };
   const env = await loadBundle("bridges/uxp/premiere/dist/main.js", {
     premierepro: {
       version: "25.6.0",
+      ProjectUtils: {
+        getSelection(activeProject) {
+          assert.strictEqual(activeProject, project);
+          return [mediaItem];
+        }
+      },
       Project: {
         getActiveProject() {
           return project;
@@ -554,9 +621,12 @@ async function testPremiereBridge() {
   });
   assert.strictEqual(env.sent[0].capabilities.host, "premiere");
   assert.ok(env.sent[0].capabilities.methods.project.includes("getActiveSequence"));
+  assert.ok(env.sent[0].capabilities.methods.project.includes("importFiles"));
   assert.ok(env.sent[0].capabilities.methods.sequence.includes("getVideoTracks"));
   assert.ok(env.sent[0].capabilities.methods.track.includes("getClips"));
   assert.ok(env.sent[0].capabilities.methods.clip.includes("getSelected"));
+  assert.ok(env.sent[0].capabilities.methods.projectItem.includes("getChildren"));
+  assert.ok(env.sent[0].capabilities.methods.bin.includes("create"));
   assert.ok(env.sent[0].capabilities.methods.marker.includes("create"));
   assert.strictEqual(result(await rpc(env, "premiere", "app", "getVersion")), "25.6.0");
   assert.deepStrictEqual(result(await rpc(env, "premiere", "project", "getActive")), {
@@ -579,6 +649,17 @@ async function testPremiereBridge() {
   assert.ok(events.some((event) => event.kind === "marker.create" && event.start === 42));
   delete markers.createMarker;
   assert.strictEqual(error(await rpc(env, "premiere", "marker", "create", ["seq-1", { name: "Missing" }])).code, -32004);
+  assert.strictEqual(result(await rpc(env, "premiere", "project", "getRootItem")).childCount, 1);
+  assert.strictEqual(result(await rpc(env, "premiere", "projectItem", "getChildren", ["root"]))[0].name, "Dailies");
+  assert.strictEqual(result(await rpc(env, "premiere", "projectItem", "getChildren", ["bin-1"]))[0].mediaPath, "C:/media/shot.mov");
+  assert.strictEqual(result(await rpc(env, "premiere", "projectItem", "findByMediaPath", ["root", "shot", false]))[0].name, "shot.mov");
+  assert.strictEqual(result(await rpc(env, "premiere", "projectItem", "getSelected"))[0].id, "media-1");
+  assert.strictEqual(result(await rpc(env, "premiere", "bin", "create", [{ parentId: "root", name: "B-Roll" }])).name, "B-Roll");
+  assert.ok(events.some((event) => event.kind === "bin.create" && event.parent === "root"));
+  const imported = result(await rpc(env, "premiere", "project", "importFiles", [{ filePaths: ["C:/media/new.mov"], targetBin: "bin-1", suppressUI: true, asNumberedStills: false }]));
+  assert.strictEqual(imported[0].mediaPath, "C:/media/new.mov");
+  assert.ok(events.some((event) => event.kind === "project.importFiles" && event.targetBin === "bin-1"));
+  assert.strictEqual(error(await rpc(env, "premiere", "project", "importFiles", [{ filePaths: [] }])).code, -32004);
   assert.strictEqual(result(await rpc(env, "premiere", "raw", "evalJs", ["6 * 7"])), 42);
 }
 
