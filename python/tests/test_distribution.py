@@ -10,6 +10,14 @@ from scripts.check_wheel_compat import (
     assert_compatible_wheel_name,
     parse_wheel_tags,
 )
+from scripts.check_native_abi3_config import (
+    NativeAbi3ConfigError,
+    assert_native_abi3_contract,
+    assert_pyo3_cargo_toml,
+)
+
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 class DistributionTests(unittest.TestCase):
@@ -41,6 +49,25 @@ class DistributionTests(unittest.TestCase):
                 archive.writestr("adobe/photoshop/session.pyi", "")
             with self.assertRaises(WheelCompatibilityError):
                 assert_required_package_files(incomplete)
+
+    def test_native_abi3_contract(self):
+        assert_native_abi3_contract(REPO_ROOT)
+
+    def test_native_abi3_contract_rejects_wrong_pyo3_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cargo_toml = pathlib.Path(tmp) / "Cargo.toml"
+            cargo_toml.write_text(
+                """
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["abi3-py312"] }
+""".lstrip(),
+                encoding="utf-8",
+            )
+            with self.assertRaises(NativeAbi3ConfigError):
+                assert_pyo3_cargo_toml(cargo_toml)
 
 
 if __name__ == "__main__":

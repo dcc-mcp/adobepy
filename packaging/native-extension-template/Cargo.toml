@@ -1,0 +1,15 @@
+[package]
+name = "adobepy-native-template"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/loonghao/adobepy"
+
+[lib]
+name = "adobepy_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+adobepy-protocol = { path = "../../crates/adobepy-protocol" }
+pyo3 = { version = "0.28", features = ["abi3-py38"] }

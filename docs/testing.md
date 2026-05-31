@@ -76,6 +76,14 @@ Coverage matrix report. It prints current MVP vs planned API object families
 for each Adobe host so interface expansion stays measurable.
 
 ```powershell
+npm run abi3:check
+```
+
+Native extension canary. It keeps the current wheel on the pure-Python path,
+validates the dormant PyO3 native-extension template, and fails if future
+native packaging drifts away from `abi3-py38`.
+
+```powershell
 npm run test:replay
 ```
 
@@ -143,6 +151,8 @@ the manifest, creates the archive, and writes the SHA256 file.
 - Packaging tests: use the package script as the final artifact smoke because it
   catches missing dist files, bridge templates, wheel metadata, and CLI build
   regressions.
+- Native abi3 canary: keep the current `py3-none-any` wheel honest while
+  preserving a checked `abi3-py38` build path for future PyO3 extensions.
 
 ## Next High-Value Additions
 

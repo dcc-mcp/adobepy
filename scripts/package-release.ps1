@@ -203,6 +203,7 @@ Invoke-Step "Stage distribution tree" {
 }
 
 Invoke-Step "Build Python wheel" {
+    Invoke-External "python" @("scripts\check_native_abi3_config.py")
     Invoke-External "python" @("-m", "pip", "wheel", "--no-deps", "--no-build-isolation", "--wheel-dir", (Join-Path $stageRoot "wheels"), ".")
     Invoke-External "python" @("scripts\check_wheel_compat.py", (Join-Path $stageRoot "wheels"))
     Remove-TransientBuildArtifacts $Root

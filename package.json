@@ -13,7 +13,7 @@
     "uxp:build:indesign": "node scripts/build-uxp.js indesign",
     "uxp:build:premiere": "node scripts/build-uxp.js premiere",
     "uxpdt": "node scripts/uxpdt.js",
-    "test:quick": "npm run bridge:check && npm run protocol:check && npm run capabilities:check && npm run architecture:check && npm run stubs:check && npm run api:sources:validate && npm run api:coverage && npm run ir:validate && npm run test:coverage && npm run test:rust",
+    "test:quick": "npm run bridge:check && npm run protocol:check && npm run capabilities:check && npm run architecture:check && npm run stubs:check && npm run api:sources:validate && npm run api:coverage && npm run abi3:check && npm run ir:validate && npm run test:coverage && npm run test:rust",
     "test:bridges": "npm run test:cep && npm run test:uxp-bridge && npm run test:uxpdt",
     "test:cep": "npm run cep:build && node scripts/test-cep.js",
     "test:uxp-bridge": "npm run uxp:build && node scripts/test-uxp-bridge.js",
@@ -24,9 +24,10 @@
     "stubs:write": "python scripts/check_generated_stubs.py --write",
     "api:sources:validate": "python scripts/validate_api_sources.py",
     "api:coverage": "python scripts/report_api_coverage.py",
+    "abi3:check": "python scripts/check_native_abi3_config.py",
     "capabilities:check": "node scripts/check-bridge-capabilities.js",
     "smoke:photoshop:live": "python scripts/live_photoshop_smoke.py",
-    "lint:python": "python -m compileall -q python generators scripts && npm run protocol:check && npm run architecture:check && npm run stubs:check && npm run api:sources:validate",
+    "lint:python": "python -m compileall -q python generators scripts && npm run protocol:check && npm run architecture:check && npm run stubs:check && npm run api:sources:validate && npm run abi3:check",
     "lint:typescript": "npm run bridge:check",
     "lint:rust": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings",
     "lint": "npm run lint:python && npm run lint:typescript && npm run lint:rust",
@@ -37,7 +38,7 @@
     "test:python": "python scripts/run_python_tests.py",
     "test:coverage": "python -m coverage run scripts/run_python_tests.py && python -m coverage report --fail-under=90",
     "test:rust": "cargo test --workspace",
-    "test:all": "npm run bridge:check && npm run test:bridges && npm run protocol:check && npm run capabilities:check && npm run architecture:check && npm run stubs:check && npm run api:sources:validate && npm run api:coverage && npm run ir:validate && npm run test:coverage && npm run test:rust"
+    "test:all": "npm run bridge:check && npm run test:bridges && npm run protocol:check && npm run capabilities:check && npm run architecture:check && npm run stubs:check && npm run api:sources:validate && npm run api:coverage && npm run abi3:check && npm run ir:validate && npm run test:coverage && npm run test:rust"
   },
   "devDependencies": {
     "esbuild": "^0.28.0",

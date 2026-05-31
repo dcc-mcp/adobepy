@@ -90,6 +90,7 @@ jobs:
         run: |
           python -m build
           python -m twine check dist/*
+          python scripts/check_native_abi3_config.py
           python scripts/check_wheel_compat.py dist
           python scripts/smoke_wheel_install.py dist
       - name: Build package

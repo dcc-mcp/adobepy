@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "adobepy-native-template"
+version = "0.0.0"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "adobe._native"
+python-source = "python"
+manifest-path = "Cargo.toml"

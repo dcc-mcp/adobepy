@@ -4,6 +4,7 @@ members = [
     "crates/adobepy-cli",
     "crates/adobepy-protocol",
 ]
+exclude = ["packaging/native-extension-template"]
 resolver = "2"
 
 [workspace.package]

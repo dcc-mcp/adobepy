@@ -14,6 +14,30 @@ or native `cp38-abi3-*` wheels. Native build backends should enable the
 equivalent of PyO3's `abi3-py38` feature so one wheel covers Python 3.8 and
 newer.
 
+## Native Extension Decision Rule
+
+Stay pure Python for facade expansion, host API wrappers, bridge protocol
+envelopes, alias generation, replay fixtures, and compatibility glue. Add a
+native Python extension only when broker/protocol acceleration or a shared Rust
+contract has a measurable user-facing benefit that cannot be achieved by the
+current CLI/broker process boundary.
+
+The native extension blueprint lives in
+`packaging/native-extension-template/`. It is intentionally not part of the
+current published package. If a future release adopts it, keep the PyO3 feature
+floor at `abi3-py38`, use a native build backend such as maturin, and publish
+`cp38-abi3-*` wheels per platform rather than per Python minor version.
+
+The canary for this architecture is:
+
+```powershell
+npm run abi3:check
+```
+
+It checks that the current root package is still pure Python, the future native
+template is configured for PyO3 `abi3-py38`, and the wheel tag validator still
+rejects CPython-minor native tags such as `cp312-cp312`.
+
 PyPI publishing uses trusted publishing. The PyPI publisher entry must point to
 repository `loonghao/adobepy`, workflow `.github/workflows/release.yml`, and
 environment `pypi`.
@@ -31,6 +55,7 @@ publish step:
 ```powershell
 python -m build
 python -m twine check dist/*
+python scripts/check_native_abi3_config.py
 python scripts/check_wheel_compat.py dist
 python scripts/smoke_wheel_install.py dist
 ```
