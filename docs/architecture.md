@@ -20,7 +20,29 @@ The stable adapter-facing wire contract is documented in
 | `bridges/uxp/core` | Generic UXP bridge transport and protocol handling | Host-specific UXP module names or DOM dispatch |
 | `bridges/cep/core` | Generic CEP/WebSocket transport and ExtendScript dispatch wrapper | After Effects or Illustrator business logic |
 | `bridges/*/<host>/src/host.ts` | Host adapter, host capabilities, DOM serialization | Broker routing, Python naming conventions |
-| `generators/ir` | Host capability shape and facade generation input | Runtime bridge state |
+| `generators/ir` | Host capability shape, facade generation input, aliases, and source mappings | Runtime bridge state |
+| `python/adobe/<host>/_facade_contract.py` | Generated runtime contract manifest from IR | Hand-authored facade behavior |
+
+## Facade Generation
+
+The host IR is the contract source for generated stubs, generated runtime
+contract manifests, bridge capability validation, and runtime facade drift
+checks.
+
+Alias rules are deterministic:
+
+- Method names keep the Adobe JavaScript shape in IR. The generator emits the
+  Pythonic snake_case name plus the original JS-shaped name when they differ,
+  for example `batchPlay` -> `batch_play` and `batchPlay`.
+- Property names are canonical snake_case in IR. The generator emits the
+  snake_case property plus the JS-shaped camelCase alias, for example
+  `active_document` -> `active_document` and `activeDocument`.
+- Facade methods may declare `source: "namespace.method"` when they are owned by
+  a broker method. Source references are validated against the same namespace
+  method list that drives bridge capabilities.
+- Mutability and modal metadata live on namespace methods, then flow into the
+  generated runtime contract for any property or facade method that references
+  that source.
 
 ## Method Addition Flow
 
@@ -29,15 +51,21 @@ The stable adapter-facing wire contract is documented in
    `mutatesState`, modal writes should also set
    `requiresModalWhenMutating`, and raw JavaScript/ExtendScript escape hatches
    must live under the `raw` namespace with `"raw": true`.
-2. Add the official API source or note in
+2. Add or update proxy properties/methods in the same IR file. Use Pythonic
+   property names, JS-shaped method names, and `source: "namespace.method"` for
+   facade methods that directly call a broker method.
+3. Regenerate contract artifacts with `npm run facades:write` and
+   `npm run stubs:write`.
+4. Add the official API source or note in
    `generators/api_sources/adobe_api_sources.json` if the method comes from a
    new documentation surface.
-3. Implement the host bridge dispatch in the host adapter only.
-4. Add the Python facade member with both JavaScript-shaped and Pythonic names
-   when the Adobe API uses camelCase.
-5. Add a Python facade test or replay fixture that proves both aliases call the
+5. Implement the host bridge dispatch in the host adapter only.
+6. Add the Python facade behavior only for methods that need host-specific
+   payload shaping; the generated contract gates ensure the public names and
+   aliases match IR.
+7. Add a Python facade test or replay fixture that proves both aliases call the
    same broker method.
-6. Run `npm run test:quick`; use `npm run test:all` before publishing.
+8. Run `npm run test:quick`; use `npm run test:all` before publishing.
 
 ## Review Checklist
 
@@ -54,6 +82,7 @@ The stable adapter-facing wire contract is documented in
 - Every camelCase facade member has a snake_case Pythonic sibling.
 - Every supported host has IR, API source metadata, Python facade package, and
   `py.typed`.
+- Generated `_facade_contract.py` manifests match IR and runtime classes.
 - Runtime facade `invoke(namespace, method)` pairs are declared in the host IR,
   and bridge hello capabilities are checked against the same IR.
 
@@ -61,8 +90,11 @@ The stable adapter-facing wire contract is documented in
 
 ```powershell
 npm run architecture:check
+npm run facades:check
 ```
 
 The gate checks host/package parity, `py.typed` markers, import direction,
 camelCase-to-snake_case alias pairs, runtime facade invoke declarations, and
-bridge-core host neutrality. It is part of `npm run test:quick`.
+bridge-core host neutrality. The generated facade contract gate checks committed
+runtime contract manifests and runtime class members against IR. Both are part
+of `npm run test:quick`.

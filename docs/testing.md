@@ -62,6 +62,15 @@ runtime facade implementation. Use `npm run stubs:write` after intentionally
 changing the IR facade surface.
 
 ```powershell
+npm run facades:check
+```
+
+Generated runtime contract gate. It checks committed `_facade_contract.py`
+manifests against the IR generator and verifies every generated public alias is
+implemented by the runtime facade classes. Use `npm run facades:write` after
+intentionally changing the IR facade surface.
+
+```powershell
 npm run api:sources:validate
 ```
 
@@ -123,6 +132,8 @@ the manifest, creates the archive, and writes the SHA256 file.
   with the IR that drives Python facade and stub generation.
 - Stub drift tests: keep generated `.pyi` files, runtime facade classes, and
   Pythonic alias names aligned as API coverage expands.
+- Runtime facade contract tests: keep generated `_facade_contract.py` manifests
+  aligned with IR, alias generation, source mappings, and runtime class members.
 - Lint/quality gates: compile Python 3.8-compatible sources, type-check bridge
   TypeScript, and run Rust format/clippy checks in CI.
 - Python facade tests: assert JS-shaped aliases and Pythonic aliases call the

@@ -15,16 +15,21 @@ ABI3_PY38_TAG = ("cp38", "abi3")
 REQUIRED_PACKAGE_FILES = frozenset(
     {
         "adobe/after_effects/py.typed",
+        "adobe/after_effects/_facade_contract.py",
         "adobe/after_effects/session.pyi",
         "adobe/core/py.typed",
         "adobe/dcc_mcp/py.typed",
         "adobe/illustrator/py.typed",
+        "adobe/illustrator/_facade_contract.py",
         "adobe/illustrator/session.pyi",
         "adobe/indesign/py.typed",
+        "adobe/indesign/_facade_contract.py",
         "adobe/indesign/session.pyi",
         "adobe/photoshop/py.typed",
+        "adobe/photoshop/_facade_contract.py",
         "adobe/photoshop/session.pyi",
         "adobe/premiere/py.typed",
+        "adobe/premiere/_facade_contract.py",
         "adobe/premiere/session.pyi",
         "adobe/raw/py.typed",
     }

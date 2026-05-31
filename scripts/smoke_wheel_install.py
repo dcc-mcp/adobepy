@@ -18,6 +18,7 @@ from adobe.indesign import InDesign
 from adobe.premiere import Premiere
 from adobe.after_effects import AfterEffects
 from adobe.illustrator import ExportResultProxy, Illustrator, SwatchProxy, TextFrameProxy
+from adobe.photoshop._facade_contract import FACADE_CONTRACT as PHOTOSHOP_FACADE_CONTRACT
 from adobe.raw import RawSession
 from adobe.dcc_mcp import adobe_success
 
@@ -29,6 +30,7 @@ assert Illustrator.__name__ == "Illustrator"
 assert TextFrameProxy.__name__ == "TextFrameProxy"
 assert SwatchProxy.__name__ == "SwatchProxy"
 assert ExportResultProxy.__name__ == "ExportResultProxy"
+assert PHOTOSHOP_FACADE_CONTRACT["host"] == "photoshop"
 assert RawSession.__name__ == "RawSession"
 assert adobe_success("ok")["success"] is True
 print("adobepy wheel import smoke passed")

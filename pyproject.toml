@@ -50,6 +50,7 @@ namespaces = false
 [tool.coverage.run]
 branch = true
 source = ["python/adobe", "generators"]
+omit = ["python/adobe/*/_facade_contract.py"]
 
 [tool.coverage.report]
 fail_under = 90

@@ -9,9 +9,11 @@ from generators.ir_to_python import (
     IrValidationError,
     capabilities_from_ir,
     expand_paths,
+    facade_manifest_from_ir,
     load_ir,
     main,
     pascal_case,
+    render_facade_contract,
     render_pyi,
     snake_case,
 )
@@ -30,6 +32,9 @@ class GeneratorTests(unittest.TestCase):
         after_effects = next(contract for contract in contracts if contract.host == "after-effects")
         self.assertIn("evalExtendScript", capabilities_from_ir(after_effects)["methods"]["raw"])
         self.assertIn("DocumentProxy", {proxy.name for proxy in photoshop.proxies})
+        manifest = facade_manifest_from_ir(photoshop)
+        self.assertEqual(manifest["classes"]["Photoshop"]["properties"]["activeDocument"]["source"], "document.getActive")
+        self.assertIn("batch_play", manifest["classes"]["Photoshop"]["methods"])
 
     def test_render_and_write_cli(self):
         contract = load_ir(ROOT / "generators" / "ir" / "photoshop-mvp.json")
@@ -40,6 +45,9 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn("class DocumentProxy:", stub)
         self.assertIn("def batchPlay(self, descriptors: list[dict[str, Any]]", stub)
         self.assertIn("def batch_play(self, descriptors: list[dict[str, Any]]", stub)
+        facade_contract = render_facade_contract(contract)
+        self.assertIn("FACADE_CONTRACT", facade_contract)
+        self.assertIn("'batch_play'", facade_contract)
 
         output = StringIO()
         with redirect_stdout(output):
@@ -48,6 +56,8 @@ class GeneratorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(main(["pyi", str(ROOT / "generators" / "ir" / "premiere-mvp.json"), "--out-dir", tmp]), 0)
             self.assertTrue((pathlib.Path(tmp) / "premiere" / "session.pyi").exists())
+            self.assertEqual(main(["facade-contract", str(ROOT / "generators" / "ir" / "premiere-mvp.json"), "--out-dir", tmp]), 0)
+            self.assertTrue((pathlib.Path(tmp) / "premiere" / "_facade_contract.py").exists())
 
     def test_validation_errors_and_names(self):
         with self.assertRaisesRegex(IrValidationError, "at least one namespace"):
@@ -60,6 +70,8 @@ class GeneratorTests(unittest.TestCase):
             HostIr.from_mapping({"host": "photoshop", "version": "0.1.0", "namespaces": [{"name": "app", "methods": [{"name": "x", "returns": "Any"}], "properties": [{"name": "p", "type": "Document", "source": "x"}]}]})
         with self.assertRaisesRegex(IrValidationError, "does not reference"):
             HostIr.from_mapping({"host": "photoshop", "version": "0.1.0", "namespaces": [{"name": "app", "properties": [{"name": "p", "type": "Document", "source": "app.x"}]}]})
+        with self.assertRaisesRegex(IrValidationError, "facade method DocumentProxy.open source does not reference"):
+            HostIr.from_mapping({"host": "photoshop", "version": "0.1.0", "namespaces": [{"name": "document", "methods": [{"name": "getActive", "returns": "Document | None"}]}], "proxies": [{"name": "DocumentProxy", "methods": [{"name": "open", "returns": "Document", "source": "document.open"}]}]})
         with self.assertRaisesRegex(IrValidationError, "invalid proxy name"):
             HostIr.from_mapping({"host": "photoshop", "version": "0.1.0", "namespaces": [{"name": "app"}], "proxies": [{"name": "not-valid"}]})
         with self.assertRaisesRegex(IrValidationError, "duplicate photoshop: proxy DocumentProxy"):

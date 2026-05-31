@@ -5,6 +5,7 @@ import glob
 import json
 import keyword
 import pathlib
+import pprint
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -81,6 +82,7 @@ class FacadePropertyIr:
 class FacadeMethodIr:
     name: str
     returns: str
+    source: str | None = None
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "FacadeMethodIr":
@@ -89,6 +91,7 @@ class FacadeMethodIr:
         return cls(
             name=name,
             returns=required_string(payload, "returns"),
+            source=optional_string(payload, "source"),
         )
 
 
@@ -161,11 +164,11 @@ class HostIr:
         method_index = {(namespace.name, method.name) for namespace in namespaces for method in namespace.methods}
         for namespace in namespaces:
             for prop in namespace.properties:
-                parts = prop.source.split(".")
-                if len(parts) != 2:
-                    raise IrValidationError(f"property {prop.name} source must be namespace.method")
-                if (parts[0], parts[1]) not in method_index:
-                    raise IrValidationError(f"property {prop.name} does not reference a declared method")
+                ensure_source_reference(prop.source, method_index, f"property {prop.name}")
+        for proxy in proxies:
+            for method in proxy.methods:
+                if method.source:
+                    ensure_source_reference(method.source, method_index, f"facade method {proxy.name}.{method.name}")
         return cls(host=host, version=version, namespaces=namespaces, proxies=proxies)
 
     def namespace(self, name: str) -> NamespaceIr | None:
@@ -189,6 +192,15 @@ def optional_bool(payload: dict[str, Any], name: str, *, default: bool) -> bool:
     value = payload.get(name, default)
     if not isinstance(value, bool):
         raise IrValidationError(f"optional boolean field must be bool: {name}")
+    return value
+
+
+def optional_string(payload: dict[str, Any], name: str) -> str | None:
+    value = payload.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise IrValidationError(f"optional string field must be non-empty string: {name}")
     return value
 
 
@@ -241,6 +253,14 @@ def ensure_unique_public_names(items: tuple[Any, ...], context: str) -> None:
                     f"duplicate generated public member {context}.{public_name} from {prior} and {owner}"
                 )
             seen[public_name] = owner
+
+
+def ensure_source_reference(source: str, method_index: set[tuple[str, str]], context: str) -> None:
+    parts = source.split(".")
+    if len(parts) != 2:
+        raise IrValidationError(f"{context} source must be namespace.method")
+    if (parts[0], parts[1]) not in method_index:
+        raise IrValidationError(f"{context} source does not reference a declared method")
 
 
 def load_ir(path: pathlib.Path | str) -> HostIr:
@@ -319,6 +339,84 @@ def app_method_return(app: NamespaceIr | None, method_name: str) -> str | None:
     return method.returns if method else None
 
 
+def method_metadata(contract: HostIr, source: str | None) -> dict[str, Any]:
+    if not source:
+        return {}
+    namespace, method_name = source.split(".")
+    method = contract.method(namespace, method_name)
+    if not method:
+        return {}
+    return {
+        "source": source,
+        "mutatesState": method.mutates_state,
+        "requiresModalWhenMutating": method.requires_modal_when_mutating,
+        "raw": method.raw,
+    }
+
+
+def facade_manifest_from_ir(contract: HostIr) -> dict[str, Any]:
+    class_name = pascal_case(contract.host)
+    app_class_name = f"{class_name}App"
+    classes: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+
+    def class_payload(name: str) -> dict[str, dict[str, dict[str, Any]]]:
+        return classes.setdefault(name, {"properties": {}, "methods": {}})
+
+    def add_property(class_key: str, name: str, type_name: str, *, source: str | None = None) -> None:
+        for public_name in public_names_for_item(FacadePropertyIr(name=name, type=type_name)):
+            payload: dict[str, Any] = {"canonical": name, "type": py_type(type_name)}
+            payload.update(method_metadata(contract, source))
+            class_payload(class_key)["properties"][public_name] = payload
+
+    def add_method(class_key: str, method: FacadeMethodIr) -> None:
+        for public_name in public_names_for_item(method):
+            payload: dict[str, Any] = {"canonical": method.name, "returns": py_type(method.returns)}
+            payload.update(method_metadata(contract, method.source))
+            class_payload(class_key)["methods"][public_name] = payload
+
+    app = contract.namespace("app")
+    if app and app_has_get_version(app):
+        add_property(class_name, "version", "str", source="app.getVersion")
+        add_property(app_class_name, "version", "str", source="app.getVersion")
+    app_property_names = {prop.name for prop in app.properties} if app else set()
+    documents_type = app_method_return(app, "getDocuments")
+    if documents_type and "documents" not in app_property_names:
+        add_property(class_name, "documents", documents_type, source="app.getDocuments")
+        add_property(app_class_name, "documents", documents_type, source="app.getDocuments")
+    if app:
+        for prop in app.properties:
+            add_property(class_name, prop.name, prop.type, source=prop.source)
+            add_property(app_class_name, prop.name, prop.type, source=prop.source)
+    if contract.method("action", "batchPlay"):
+        action_method = FacadeMethodIr(name="batchPlay", returns="Any", source="action.batchPlay")
+        add_method(class_name, action_method)
+        add_method(f"{class_name}Action", action_method)
+
+    for proxy in contract.proxies:
+        class_payload(proxy.name)
+        for prop in proxy.properties:
+            add_property(proxy.name, prop.name, prop.type)
+        for method in proxy.methods:
+            add_method(proxy.name, method)
+
+    return {
+        "host": contract.host,
+        "version": contract.version,
+        "capabilities": capabilities_from_ir(contract),
+        "classes": dict(sorted(classes.items())),
+    }
+
+
+def render_facade_contract(contract: HostIr) -> str:
+    body = pprint.pformat(facade_manifest_from_ir(contract), sort_dicts=True, width=120)
+    return (
+        "# Generated from generators/ir by generators/ir_to_python.py.\n"
+        "# Do not edit by hand; run `npm run facades:write`.\n"
+        "from __future__ import annotations\n\n"
+        f"FACADE_CONTRACT = {body}\n"
+    )
+
+
 def render_pyi(contract: HostIr) -> str:
     class_name = pascal_case(contract.host)
     session_name = f"{class_name}Session"
@@ -386,6 +484,14 @@ def write_pyi(contract: HostIr, out_dir: pathlib.Path) -> pathlib.Path:
     return output
 
 
+def write_facade_contract(contract: HostIr, out_dir: pathlib.Path) -> pathlib.Path:
+    target_dir = out_dir / snake_case(contract.host)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    output = target_dir / "_facade_contract.py"
+    output.write_text(render_facade_contract(contract), encoding="utf-8")
+    return output
+
+
 def expand_paths(patterns: list[str]) -> list[pathlib.Path]:
     paths: list[pathlib.Path] = []
     for pattern in patterns:
@@ -402,6 +508,9 @@ def main(argv: list[str] | None = None) -> int:
     pyi = sub.add_parser("pyi")
     pyi.add_argument("paths", nargs="+")
     pyi.add_argument("--out-dir", type=pathlib.Path, required=True)
+    manifest = sub.add_parser("facade-contract")
+    manifest.add_argument("paths", nargs="+")
+    manifest.add_argument("--out-dir", type=pathlib.Path, required=True)
     args = parser.parse_args(argv)
 
     paths = expand_paths(args.paths)
@@ -416,6 +525,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "pyi":
         for contract in contracts:
             print(write_pyi(contract, args.out_dir))
+        return 0
+    if args.command == "facade-contract":
+        for contract in contracts:
+            print(write_facade_contract(contract, args.out_dir))
         return 0
     return 1  # pragma: no cover
 
