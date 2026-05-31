@@ -30,7 +30,7 @@ class CapturingClient:
             return {"id": args[0], "name": "demo", "width": 100, "height": 50}
         if namespace == "document" and method in {"getLayers", "getActiveLayers"}:
             return [{"id": 11, "name": "Layer 1", "kind": "pixel", "opacity": 80, "visible": True, "isSmartObject": False}]
-        if namespace == "layer":
+        if host == "photoshop" and namespace == "layer":
             if method == "getChildren":
                 return [{"id": 12, "name": "Child", "kind": "pixel"}]
             return {"id": 11, "name": "Layer 1", "kind": "text", "isSmartObject": False}
@@ -423,6 +423,99 @@ class CapturingClient:
                 return {"id": args[0], "index": 1, "name": "Main Comp", "typeName": "Composition", "itemType": "composition", "typename": "CompItem"}
             if method == "getByName":
                 return [{"id": 1, "index": 1, "name": args[0], "typeName": "Composition", "itemType": "composition", "typename": "CompItem"}]
+        if host == "after-effects" and namespace == "layer":
+            text_layer = {
+                "id": 11,
+                "index": 1,
+                "name": "Title",
+                "typeName": "TextLayer",
+                "layerType": "text",
+                "compId": 1,
+                "sourceId": None,
+                "sourceName": None,
+                "selected": True,
+                "enabled": True,
+                "solo": False,
+                "locked": False,
+                "shy": False,
+                "isText": True,
+                "startTime": 0,
+                "inPoint": 0,
+                "outPoint": 12.5,
+                "stretch": 100,
+                "width": 1920,
+                "height": 1080,
+                "hasVideo": True,
+                "hasAudio": False,
+                "typename": "TextLayer",
+            }
+            av_layer = {
+                **text_layer,
+                "id": 12,
+                "index": 2,
+                "name": "Plate",
+                "typeName": "AVLayer",
+                "layerType": "av",
+                "sourceId": 2,
+                "sourceName": "plate.mov",
+                "selected": False,
+                "isText": False,
+                "typename": "Layer",
+            }
+            if method == "getLayers":
+                return [text_layer, av_layer]
+            if method == "getSelected":
+                return [text_layer]
+            if method == "getById":
+                return text_layer if args[1] in {11, "11", "Title"} else None
+        if host == "after-effects" and namespace == "mask":
+            if method == "getMasks":
+                return [
+                    {
+                        "id": "mask-1",
+                        "index": 1,
+                        "name": "Mask 1",
+                        "maskMode": "add",
+                        "inverted": False,
+                        "locked": False,
+                        "rotoBezier": True,
+                        "opacity": 100,
+                        "feather": [2, 2],
+                        "expansion": 0,
+                        "typename": "MaskPropertyGroup",
+                    }
+                ]
+        if host == "after-effects" and namespace == "effect":
+            effect = {
+                "id": "fx-1",
+                "index": 1,
+                "name": "Gaussian Blur",
+                "matchName": "ADBE Gaussian Blur 2",
+                "enabled": True,
+                "active": True,
+                "selected": False,
+                "propertyCount": 2,
+                "typename": "EffectPropertyGroup",
+            }
+            if method == "getEffects":
+                return [effect]
+            if method == "getByName":
+                return effect if args[2] in {"Gaussian Blur", "ADBE Gaussian Blur 2"} else None
+        if host == "after-effects" and namespace == "text":
+            source_text = {
+                "text": "Hello",
+                "font": "ArialMT",
+                "fontSize": 48,
+                "fillColor": [1, 1, 1],
+                "strokeColor": [0, 0, 0],
+                "tracking": 10,
+                "justification": "center",
+                "typename": "TextDocument",
+            }
+            if method == "getSourceText":
+                return source_text if args[1] in {11, "11", "Title"} else None
+            if method == "setSourceText":
+                return {**source_text, **args[2]}
         if host == "premiere" and namespace == "encoder":
             if method == "getManager":
                 return {"isAMEInstalled": True, "typename": "EncoderManager"}
@@ -755,7 +848,8 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(premiere.export.exportFrame(sequence, "C:/out/frame2.png", time=43).outputPath, "C:/out/frame2.png")
 
     def test_legacy_cep_facades(self):
-        ae = AfterEffects(client=CapturingClient())
+        ae_client = CapturingClient()
+        ae = AfterEffects(client=ae_client)
         self.assertEqual(ae.version, "24.4")
         self.assertEqual(ae.activeProject.itemCount, 3)
         self.assertEqual(ae.project.path, "C:/cut")
@@ -877,6 +971,85 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(ae.project.getItemById(1).name, "Main Comp")
         self.assertEqual(ae.project.get_items_by_name("Main Comp")[0].id, 1)
         self.assertEqual(ae.project.getItemsByName("Main Comp")[0].typeName, "Composition")
+        self.assertEqual(comp.layers[0].name, "Title")
+        self.assertEqual(comp.selected_layers[0].name, "Title")
+        self.assertEqual(comp.selectedLayers[0].id, 11)
+        self.assertEqual(comp.get_layer_by_id(11).typename, "TextLayer")
+        self.assertEqual(comp.getLayerById("Title").layerType, "text")
+        layer = comp.layers[0]
+        self.assertEqual(layer.id, 11)
+        self.assertEqual(layer.index, 1)
+        self.assertEqual(layer.type_name, "TextLayer")
+        self.assertEqual(layer.typeName, "TextLayer")
+        self.assertEqual(layer.layer_type, "text")
+        self.assertEqual(layer.comp_id, 1)
+        self.assertEqual(layer.compId, 1)
+        self.assertIsNone(layer.source_id)
+        self.assertIsNone(layer.sourceId)
+        self.assertIsNone(layer.source_name)
+        self.assertIsNone(layer.sourceName)
+        self.assertTrue(layer.selected)
+        self.assertTrue(layer.enabled)
+        self.assertFalse(layer.solo)
+        self.assertFalse(layer.locked)
+        self.assertFalse(layer.shy)
+        self.assertTrue(layer.is_text)
+        self.assertTrue(layer.isText)
+        self.assertEqual(layer.start_time, 0)
+        self.assertEqual(layer.startTime, 0)
+        self.assertEqual(layer.in_point, 0)
+        self.assertEqual(layer.inPoint, 0)
+        self.assertEqual(layer.out_point, 12.5)
+        self.assertEqual(layer.outPoint, 12.5)
+        self.assertEqual(layer.stretch, 100)
+        self.assertEqual(layer.width, 1920)
+        self.assertEqual(layer.height, 1080)
+        self.assertTrue(layer.has_video)
+        self.assertTrue(layer.hasVideo)
+        self.assertFalse(layer.has_audio)
+        self.assertFalse(layer.hasAudio)
+        self.assertEqual(layer.effects[0].name, "Gaussian Blur")
+        self.assertEqual(layer.masks[0].name, "Mask 1")
+        self.assertEqual(layer.source_text.text, "Hello")
+        self.assertEqual(layer.sourceText.fontSize, 48)
+        effect = layer.get_effect("Gaussian Blur")
+        self.assertEqual(effect.match_name, "ADBE Gaussian Blur 2")
+        self.assertEqual(effect.matchName, "ADBE Gaussian Blur 2")
+        self.assertTrue(effect.enabled)
+        self.assertTrue(effect.active)
+        self.assertFalse(effect.selected)
+        self.assertEqual(effect.property_count, 2)
+        self.assertEqual(effect.propertyCount, 2)
+        self.assertEqual(effect.typename, "EffectPropertyGroup")
+        self.assertEqual(layer.getEffect("ADBE Gaussian Blur 2").id, "fx-1")
+        mask = layer.masks[0]
+        self.assertEqual(mask.id, "mask-1")
+        self.assertEqual(mask.index, 1)
+        self.assertEqual(mask.mask_mode, "add")
+        self.assertEqual(mask.maskMode, "add")
+        self.assertFalse(mask.inverted)
+        self.assertFalse(mask.locked)
+        self.assertTrue(mask.roto_bezier)
+        self.assertTrue(mask.rotoBezier)
+        self.assertEqual(mask.opacity, 100)
+        self.assertEqual(mask.feather, [2, 2])
+        self.assertEqual(mask.expansion, 0)
+        self.assertEqual(mask.typename, "MaskPropertyGroup")
+        source_text = layer.source_text
+        self.assertEqual(source_text.text, "Hello")
+        self.assertEqual(source_text.font, "ArialMT")
+        self.assertEqual(source_text.font_size, 48)
+        self.assertEqual(source_text.fontSize, 48)
+        self.assertEqual(source_text.fill_color, [1, 1, 1])
+        self.assertEqual(source_text.fillColor, [1, 1, 1])
+        self.assertEqual(source_text.stroke_color, [0, 0, 0])
+        self.assertEqual(source_text.strokeColor, [0, 0, 0])
+        self.assertEqual(source_text.tracking, 10)
+        self.assertEqual(source_text.justification, "center")
+        self.assertEqual(source_text.typename, "TextDocument")
+        self.assertEqual(layer.set_source_text("World", fontSize=36, command_name="Set Text").text, "World")
+        self.assertEqual(ae_client.calls[-1]["options"]["commandName"], "Set Text")
+        self.assertEqual(layer.setSourceText("Again", commandName="Set Text 2").fontSize, 48)
 
         illustrator = Illustrator(client=CapturingClient())
         self.assertEqual(illustrator.version, "28.2")

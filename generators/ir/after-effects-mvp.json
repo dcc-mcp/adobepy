@@ -30,6 +30,32 @@
         {"name": "getByName", "returns": "list[ProjectItem]"}
       ]
     },
+    {
+      "name": "layer",
+      "methods": [
+        {"name": "getLayers", "returns": "list[Layer]"},
+        {"name": "getSelected", "returns": "list[Layer]"},
+        {"name": "getById", "returns": "Layer | None"}
+      ]
+    },
+    {
+      "name": "mask",
+      "methods": [{"name": "getMasks", "returns": "list[Mask]"}]
+    },
+    {
+      "name": "effect",
+      "methods": [
+        {"name": "getEffects", "returns": "list[Effect]"},
+        {"name": "getByName", "returns": "Effect | None"}
+      ]
+    },
+    {
+      "name": "text",
+      "methods": [
+        {"name": "getSourceText", "returns": "SourceText | None"},
+        {"name": "setSourceText", "returns": "SourceText", "mutates": true, "modal": true}
+      ]
+    },
     {"name": "raw", "methods": [{"name": "evalExtendScript", "returns": "Any", "raw": true}]}
   ],
   "proxies": [
@@ -93,8 +119,11 @@
         {"name": "num_layers", "type": "int | None"},
         {"name": "work_area_start", "type": "float | None"},
         {"name": "work_area_duration", "type": "float | None"},
+        {"name": "layers", "type": "list[Layer]", "source": "layer.getLayers"},
+        {"name": "selected_layers", "type": "list[Layer]", "source": "layer.getSelected"},
         {"name": "typename", "type": "str | None"}
-      ]
+      ],
+      "methods": [{"name": "getLayerById", "returns": "Layer | None"}]
     },
     {
       "name": "FootageItemProxy",
@@ -132,6 +161,84 @@
         {"name": "selected", "type": "bool | None"},
         {"name": "is_active", "type": "bool | None"},
         {"name": "item_count", "type": "int | None"},
+        {"name": "typename", "type": "str | None"}
+      ]
+    },
+    {
+      "name": "LayerProxy",
+      "properties": [
+        {"name": "id", "type": "Any"},
+        {"name": "index", "type": "int | None"},
+        {"name": "name", "type": "str | None"},
+        {"name": "type_name", "type": "str | None"},
+        {"name": "layer_type", "type": "str | None"},
+        {"name": "comp_id", "type": "Any"},
+        {"name": "source_id", "type": "Any"},
+        {"name": "source_name", "type": "str | None"},
+        {"name": "selected", "type": "bool | None"},
+        {"name": "enabled", "type": "bool | None"},
+        {"name": "solo", "type": "bool | None"},
+        {"name": "locked", "type": "bool | None"},
+        {"name": "shy", "type": "bool | None"},
+        {"name": "is_text", "type": "bool | None"},
+        {"name": "start_time", "type": "float | None"},
+        {"name": "in_point", "type": "float | None"},
+        {"name": "out_point", "type": "float | None"},
+        {"name": "stretch", "type": "float | None"},
+        {"name": "width", "type": "int | None"},
+        {"name": "height", "type": "int | None"},
+        {"name": "has_video", "type": "bool | None"},
+        {"name": "has_audio", "type": "bool | None"},
+        {"name": "effects", "type": "list[Effect]", "source": "effect.getEffects"},
+        {"name": "masks", "type": "list[Mask]", "source": "mask.getMasks"},
+        {"name": "source_text", "type": "SourceText | None", "source": "text.getSourceText"},
+        {"name": "typename", "type": "str | None"}
+      ],
+      "methods": [
+        {"name": "getEffect", "returns": "Effect | None"},
+        {"name": "setSourceText", "returns": "SourceText"}
+      ]
+    },
+    {
+      "name": "MaskProxy",
+      "properties": [
+        {"name": "id", "type": "Any"},
+        {"name": "index", "type": "int | None"},
+        {"name": "name", "type": "str | None"},
+        {"name": "mask_mode", "type": "str | None"},
+        {"name": "inverted", "type": "bool | None"},
+        {"name": "locked", "type": "bool | None"},
+        {"name": "roto_bezier", "type": "bool | None"},
+        {"name": "opacity", "type": "Any"},
+        {"name": "feather", "type": "Any"},
+        {"name": "expansion", "type": "Any"},
+        {"name": "typename", "type": "str | None"}
+      ]
+    },
+    {
+      "name": "EffectProxy",
+      "properties": [
+        {"name": "id", "type": "Any"},
+        {"name": "index", "type": "int | None"},
+        {"name": "name", "type": "str | None"},
+        {"name": "match_name", "type": "str | None"},
+        {"name": "enabled", "type": "bool | None"},
+        {"name": "active", "type": "bool | None"},
+        {"name": "selected", "type": "bool | None"},
+        {"name": "property_count", "type": "int | None"},
+        {"name": "typename", "type": "str | None"}
+      ]
+    },
+    {
+      "name": "SourceTextProxy",
+      "properties": [
+        {"name": "text", "type": "str | None"},
+        {"name": "font", "type": "str | None"},
+        {"name": "font_size", "type": "float | None"},
+        {"name": "fill_color", "type": "Any"},
+        {"name": "stroke_color", "type": "Any"},
+        {"name": "tracking", "type": "Any"},
+        {"name": "justification", "type": "str | None"},
         {"name": "typename", "type": "str | None"}
       ]
     }

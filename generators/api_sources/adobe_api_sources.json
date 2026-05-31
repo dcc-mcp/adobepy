@@ -253,7 +253,7 @@
       "runtimeModule": "extendscript",
       "entryPoint": "app",
       "ir": "generators/ir/after-effects-mvp.json",
-      "trackedBy": [5, 8, 18],
+      "trackedBy": [5, 8, 18, 19],
       "officialDocs": [
         {
           "name": "After Effects scripts",
@@ -278,6 +278,26 @@
         {
           "name": "After Effects FolderItem object",
           "url": "https://ae-scripting.docsforadobe.dev/item/folderitem/"
+        },
+        {
+          "name": "After Effects Layer object",
+          "url": "https://ae-scripting.docsforadobe.dev/layer/layer/"
+        },
+        {
+          "name": "After Effects AVLayer object",
+          "url": "https://ae-scripting.docsforadobe.dev/layer/avlayer/"
+        },
+        {
+          "name": "After Effects TextLayer object",
+          "url": "https://ae-scripting.docsforadobe.dev/layer/textlayer/"
+        },
+        {
+          "name": "After Effects Property object",
+          "url": "https://ae-scripting.docsforadobe.dev/property/property/"
+        },
+        {
+          "name": "After Effects TextDocument object",
+          "url": "https://ae-scripting.docsforadobe.dev/text/textdocument/"
         }
       ],
       "secondaryRefs": [
@@ -320,11 +340,11 @@
         },
         {
           "name": "Layers, masks, effects, and text",
-          "level": "planned",
-          "trackedBy": 8,
-          "docRefs": ["After Effects Scripting Guide mirror"],
-          "irNamespaces": [],
-          "facadeObjects": []
+          "level": "mvp",
+          "trackedBy": 19,
+          "docRefs": ["After Effects Layer object", "After Effects AVLayer object", "After Effects TextLayer object", "After Effects Property object", "After Effects TextDocument object"],
+          "irNamespaces": ["layer", "mask", "effect", "text"],
+          "facadeObjects": ["LayerProxy", "MaskProxy", "EffectProxy", "SourceTextProxy"]
         },
         {
           "name": "Render queue and output modules",

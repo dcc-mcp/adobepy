@@ -110,6 +110,100 @@ function testExtendScriptDispatchers() {
     workAreaDuration: 10,
     selected: true,
   };
+  const aeTextDocument = {
+    text: "Hello",
+    font: "ArialMT",
+    fontSize: 48,
+    fillColor: [1, 1, 1],
+    strokeColor: [0, 0, 0],
+    tracking: 10,
+    justification: "center",
+  };
+  const aeTextProperty = {
+    value: aeTextDocument,
+    setValue(value) {
+      this.value = value;
+    },
+  };
+  const aeTextGroup = {
+    property(name) {
+      return name === "ADBE Text Document" ? aeTextProperty : null;
+    },
+  };
+  const aeMask = {
+    id: "mask-1",
+    name: "Mask 1",
+    maskMode: "add",
+    inverted: false,
+    locked: false,
+    rotoBezier: true,
+    property(name) {
+      return {
+        "ADBE Mask Opacity": { value: 100 },
+        "ADBE Mask Feather": { value: [2, 2] },
+        "ADBE Mask Expansion": { value: 0 },
+      }[name] || null;
+    },
+  };
+  const aeMaskGroup = {
+    numProperties: 1,
+    property(index) {
+      return index === 1 ? aeMask : null;
+    },
+  };
+  const aeEffect = {
+    id: "fx-1",
+    name: "Gaussian Blur",
+    matchName: "ADBE Gaussian Blur 2",
+    enabled: true,
+    active: true,
+    selected: false,
+    numProperties: 2,
+  };
+  const aeEffectGroup = {
+    numProperties: 1,
+    property(index) {
+      return index === 1 ? aeEffect : null;
+    },
+  };
+  const aeTextLayer = {
+    id: 11,
+    index: 1,
+    name: "Title",
+    typeName: "TextLayer",
+    selected: true,
+    enabled: true,
+    solo: false,
+    locked: false,
+    shy: false,
+    startTime: 0,
+    inPoint: 0,
+    outPoint: 12.5,
+    stretch: 100,
+    width: 1920,
+    height: 1080,
+    hasVideo: true,
+    hasAudio: false,
+    property(name) {
+      return {
+        "ADBE Text Properties": aeTextGroup,
+        "ADBE Mask Parade": aeMaskGroup,
+        "ADBE Effect Parade": aeEffectGroup,
+      }[name] || null;
+    },
+  };
+  const aePlateLayer = {
+    ...aeTextLayer,
+    id: 12,
+    index: 2,
+    name: "Plate",
+    typeName: "AVLayer",
+    selected: false,
+    source: { id: 2, name: "plate.mov" },
+    property(name) {
+      return name === "ADBE Effect Parade" ? aeEffectGroup : null;
+    },
+  };
   const aeFootage = {
     id: 2,
     name: "plate.mov",
@@ -125,6 +219,10 @@ function testExtendScriptDispatchers() {
     selected: false,
   };
   const aeItems = [aeComp, aeFootage, aeFolder];
+  const aeLayers = [aeTextLayer, aePlateLayer];
+  aeComp.numLayers = aeLayers.length;
+  aeComp.selectedLayers = [aeTextLayer];
+  aeComp.layer = (index) => aeLayers[index - 1];
   const aeProject = {
     file: { name: "demo.aep", fsName: "C:/demo.aep" },
     numItems: aeItems.length,
@@ -139,13 +237,23 @@ function testExtendScriptDispatchers() {
   assert.deepStrictEqual(dispatch(ae, "ae_app", "app", "getVersion").result, "24.4.1");
   assert.deepStrictEqual(dispatch(ae, "ae_project", "project", "getActive").result, { name: "demo.aep", path: "C:/demo.aep", itemCount: 3 });
   assert.strictEqual(dispatch(ae, "ae_items", "project", "getItems").result[0].itemType, "composition");
-  assert.strictEqual(dispatch(ae, "ae_comps", "project", "getCompositions").result[0].numLayers, 3);
+  assert.strictEqual(dispatch(ae, "ae_comps", "project", "getCompositions").result[0].numLayers, 2);
   assert.strictEqual(dispatch(ae, "ae_footage", "project", "getFootageItems").result[0].filePath, "C:/plates/plate.mov");
   assert.strictEqual(dispatch(ae, "ae_folders", "project", "getFolders").result[0].itemCount, 1);
   assert.strictEqual(dispatch(ae, "ae_active_item", "project", "getActiveItem").result.isActive, true);
   assert.strictEqual(dispatch(ae, "ae_selected", "project", "getSelectedItems").result[0].name, "Main Comp");
   assert.strictEqual(dispatch(ae, "ae_by_id", "item", "getById", [2]).result.name, "plate.mov");
   assert.strictEqual(dispatch(ae, "ae_by_name", "item", "getByName", ["Main Comp"]).result[0].id, 1);
+  assert.strictEqual(dispatch(ae, "ae_layers", "layer", "getLayers", [1]).result[0].layerType, "text");
+  assert.strictEqual(dispatch(ae, "ae_selected_layers", "layer", "getSelected", [1]).result[0].name, "Title");
+  assert.strictEqual(dispatch(ae, "ae_layer_by_id", "layer", "getById", [1, 11]).result.name, "Title");
+  assert.strictEqual(dispatch(ae, "ae_masks", "mask", "getMasks", [1, 11]).result[0].maskMode, "add");
+  assert.strictEqual(dispatch(ae, "ae_effects", "effect", "getEffects", [1, 11]).result[0].matchName, "ADBE Gaussian Blur 2");
+  assert.strictEqual(dispatch(ae, "ae_effect_by_name", "effect", "getByName", [1, 11, "Gaussian Blur"]).result.id, "fx-1");
+  assert.strictEqual(dispatch(ae, "ae_source_text", "text", "getSourceText", [1, 11]).result.text, "Hello");
+  assert.strictEqual(dispatch(ae, "ae_set_text", "text", "setSourceText", [1, 11, { text: "World", fontSize: 36 }]).result.text, "World");
+  assert.strictEqual(aeTextProperty.value.fontSize, 36);
+  assert.strictEqual(dispatch(ae, "ae_missing_text", "text", "setSourceText", [1, 12, { text: "Nope" }]).error.code, -32004);
   assert.strictEqual(dispatch(ae, "ae_raw", "raw", "evalExtendScript", ["app.version"]).result, "24.4.1");
   assert.strictEqual(dispatch(ae, "ae_missing", "layer", "getActive").error.code, -32601);
 

@@ -65,6 +65,17 @@ for footage in app.project.footage_items:
 
 active = app.active_item
 selected = app.selected_items
+
+comp = app.project.compositions[0]
+for layer in comp.layers:
+    print(layer.index, layer.name, layer.enabled)
+    for effect in layer.effects:
+        print(effect.name, effect.match_name)
+    for mask in layer.masks:
+        print(mask.name, mask.mask_mode)
+
+text = comp.get_layer_by_id(11).source_text
+comp.selected_layers[0].set_source_text("Updated title")
 ```
 
 Use `adobe.raw.RawSession("after-effects").eval_extendscript(...)` for APIs

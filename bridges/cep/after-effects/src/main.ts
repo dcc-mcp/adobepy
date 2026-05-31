@@ -9,12 +9,16 @@ startCepBridge({
     host: "after-effects",
     bridgeKind: "cep",
     bridgeVersion: "0.1.0",
-    namespaces: ["app", "project", "item", "raw"],
-    features: ["extendscript", "projectInfo", "projectItems", "compositions", "footageItems"],
+    namespaces: ["app", "project", "item", "layer", "mask", "effect", "text", "raw"],
+    features: ["extendscript", "projectInfo", "projectItems", "compositions", "footageItems", "layers", "masks", "effects", "text"],
     methods: {
       app: ["getVersion"],
       project: ["getActive", "getItems", "getCompositions", "getFootageItems", "getFolders", "getActiveItem", "getSelectedItems"],
       item: ["getById", "getByName"],
+      layer: ["getLayers", "getSelected", "getById"],
+      mask: ["getMasks"],
+      effect: ["getEffects", "getByName"],
+      text: ["getSourceText", "setSourceText"],
       raw: ["evalExtendScript"]
     }
   }
