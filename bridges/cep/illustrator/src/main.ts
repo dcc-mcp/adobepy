@@ -9,14 +9,18 @@ startCepBridge({
     host: "illustrator",
     bridgeKind: "cep",
     bridgeVersion: "0.1.0",
-    namespaces: ["app", "document", "artboard", "layer", "pageItem", "raw"],
-    features: ["extendscript", "document", "artboards", "layers", "pageItems", "selection"],
+    namespaces: ["app", "document", "artboard", "layer", "pageItem", "pathItem", "compoundPath", "placedItem", "rasterItem", "raw"],
+    features: ["extendscript", "document", "artboards", "layers", "pageItems", "selection", "pathItems", "compoundPathItems", "placedItems", "rasterItems"],
     methods: {
       app: ["getVersion"],
       document: ["getActive"],
       artboard: ["getArtboards", "getActive", "getActiveIndex"],
       layer: ["getLayers", "getByName", "getChildren"],
       pageItem: ["getPageItems", "getSelected", "getByName", "getLayerItems"],
+      pathItem: ["getPathItems", "getSelected", "getByName", "getLayerItems"],
+      compoundPath: ["getCompoundPathItems", "getSelected", "getByName", "getLayerItems", "getPathItems"],
+      placedItem: ["getPlacedItems", "getSelected", "getByName", "getLayerItems"],
+      rasterItem: ["getRasterItems", "getSelected", "getByName", "getLayerItems"],
       raw: ["evalExtendScript"]
     }
   }

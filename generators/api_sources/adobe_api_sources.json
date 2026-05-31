@@ -382,7 +382,7 @@
       "runtimeModule": "extendscript",
       "entryPoint": "app",
       "ir": "generators/ir/illustrator-mvp.json",
-      "trackedBy": [5, 8, 21],
+      "trackedBy": [5, 8, 21, 22],
       "officialDocs": [
         {
           "name": "Illustrator JavaScript Scripting Reference",
@@ -423,6 +423,38 @@
           "url": "https://ai-scripting.docsforadobe.dev/jsobjref/PageItem/"
         },
         {
+          "name": "Illustrator PathItems object",
+          "url": "https://ai-scripting.docsforadobe.dev/jsobjref/PathItems/"
+        },
+        {
+          "name": "Illustrator PathItem object",
+          "url": "https://ai-scripting.docsforadobe.dev/jsobjref/PathItem/"
+        },
+        {
+          "name": "Illustrator CompoundPathItems object",
+          "url": "https://ai-scripting.docsforadobe.dev/jsobjref/CompoundPathItems/"
+        },
+        {
+          "name": "Illustrator CompoundPathItem object",
+          "url": "https://ai-scripting.docsforadobe.dev/jsobjref/CompoundPathItem/"
+        },
+        {
+          "name": "Illustrator PlacedItems object",
+          "url": "https://ai-scripting.docsforadobe.dev/jsobjref/PlacedItems/"
+        },
+        {
+          "name": "Illustrator PlacedItem object",
+          "url": "https://ai-scripting.docsforadobe.dev/jsobjref/PlacedItem/"
+        },
+        {
+          "name": "Illustrator RasterItems object",
+          "url": "https://ai-scripting.docsforadobe.dev/jsobjref/RasterItems/"
+        },
+        {
+          "name": "Illustrator RasterItem object",
+          "url": "https://ai-scripting.docsforadobe.dev/jsobjref/RasterItem/"
+        },
+        {
           "name": "Adobe ExtendScript guide mirror",
           "url": "https://extendscript.docsforadobe.dev/"
         }
@@ -457,11 +489,11 @@
         },
         {
           "name": "Path items, compound paths, and placed/raster items",
-          "level": "planned",
-          "trackedBy": 8,
-          "docRefs": ["Illustrator Scripting Guide mirror"],
-          "irNamespaces": [],
-          "facadeObjects": []
+          "level": "mvp",
+          "trackedBy": 22,
+          "docRefs": ["Illustrator Document object", "Illustrator PathItems object", "Illustrator PathItem object", "Illustrator CompoundPathItems object", "Illustrator CompoundPathItem object", "Illustrator PlacedItems object", "Illustrator PlacedItem object", "Illustrator RasterItems object", "Illustrator RasterItem object"],
+          "irNamespaces": ["pathItem", "compoundPath", "placedItem", "rasterItem"],
+          "facadeObjects": ["PathItemProxy", "CompoundPathItemProxy", "PlacedItemProxy", "RasterItemProxy"]
         },
         {
           "name": "Text frames, stories, swatches, colors, and export workflows",

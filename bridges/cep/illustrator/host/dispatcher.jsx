@@ -37,6 +37,57 @@ function adobepyDispatch(payload) {
     if (request.namespace === "pageItem" && request.method === "getLayerItems") {
       return adobepyResult(request.id, adobepyIllustratorLayerPageItems(adobepyIllustratorActiveDocument(), (request.args || [])[0]));
     }
+    if (request.namespace === "pathItem" && request.method === "getPathItems") {
+      return adobepyResult(request.id, adobepyIllustratorPathItems(adobepyIllustratorActiveDocument()));
+    }
+    if (request.namespace === "pathItem" && request.method === "getSelected") {
+      return adobepyResult(request.id, adobepyIllustratorSelectedPathItems(adobepyIllustratorActiveDocument()));
+    }
+    if (request.namespace === "pathItem" && request.method === "getByName") {
+      return adobepyResult(request.id, adobepyIllustratorPathItemByName(adobepyIllustratorActiveDocument(), String((request.args || [])[0] || "")));
+    }
+    if (request.namespace === "pathItem" && request.method === "getLayerItems") {
+      return adobepyResult(request.id, adobepyIllustratorLayerPathItems(adobepyIllustratorActiveDocument(), (request.args || [])[0]));
+    }
+    if (request.namespace === "compoundPath" && request.method === "getCompoundPathItems") {
+      return adobepyResult(request.id, adobepyIllustratorCompoundPathItems(adobepyIllustratorActiveDocument()));
+    }
+    if (request.namespace === "compoundPath" && request.method === "getSelected") {
+      return adobepyResult(request.id, adobepyIllustratorSelectedCompoundPathItems(adobepyIllustratorActiveDocument()));
+    }
+    if (request.namespace === "compoundPath" && request.method === "getByName") {
+      return adobepyResult(request.id, adobepyIllustratorCompoundPathItemByName(adobepyIllustratorActiveDocument(), String((request.args || [])[0] || "")));
+    }
+    if (request.namespace === "compoundPath" && request.method === "getLayerItems") {
+      return adobepyResult(request.id, adobepyIllustratorLayerCompoundPathItems(adobepyIllustratorActiveDocument(), (request.args || [])[0]));
+    }
+    if (request.namespace === "compoundPath" && request.method === "getPathItems") {
+      return adobepyResult(request.id, adobepyIllustratorCompoundPathPathItems(adobepyIllustratorActiveDocument(), (request.args || [])[0]));
+    }
+    if (request.namespace === "placedItem" && request.method === "getPlacedItems") {
+      return adobepyResult(request.id, adobepyIllustratorPlacedItems(adobepyIllustratorActiveDocument()));
+    }
+    if (request.namespace === "placedItem" && request.method === "getSelected") {
+      return adobepyResult(request.id, adobepyIllustratorSelectedPlacedItems(adobepyIllustratorActiveDocument()));
+    }
+    if (request.namespace === "placedItem" && request.method === "getByName") {
+      return adobepyResult(request.id, adobepyIllustratorPlacedItemByName(adobepyIllustratorActiveDocument(), String((request.args || [])[0] || "")));
+    }
+    if (request.namespace === "placedItem" && request.method === "getLayerItems") {
+      return adobepyResult(request.id, adobepyIllustratorLayerPlacedItems(adobepyIllustratorActiveDocument(), (request.args || [])[0]));
+    }
+    if (request.namespace === "rasterItem" && request.method === "getRasterItems") {
+      return adobepyResult(request.id, adobepyIllustratorRasterItems(adobepyIllustratorActiveDocument()));
+    }
+    if (request.namespace === "rasterItem" && request.method === "getSelected") {
+      return adobepyResult(request.id, adobepyIllustratorSelectedRasterItems(adobepyIllustratorActiveDocument()));
+    }
+    if (request.namespace === "rasterItem" && request.method === "getByName") {
+      return adobepyResult(request.id, adobepyIllustratorRasterItemByName(adobepyIllustratorActiveDocument(), String((request.args || [])[0] || "")));
+    }
+    if (request.namespace === "rasterItem" && request.method === "getLayerItems") {
+      return adobepyResult(request.id, adobepyIllustratorLayerRasterItems(adobepyIllustratorActiveDocument(), (request.args || [])[0]));
+    }
     if (request.namespace === "raw" && request.method === "evalExtendScript") {
       return adobepyResult(request.id, eval((request.args || [])[0]));
     }
@@ -66,6 +117,10 @@ function adobepyIllustratorDocument() {
     artboardCount: adobepyCollectionLength(document.artboards),
     layerCount: adobepyCollectionLength(document.layers),
     pageItemCount: adobepyCollectionLength(document.pageItems),
+    pathItemCount: adobepyCollectionLength(document.pathItems),
+    compoundPathItemCount: adobepyCollectionLength(document.compoundPathItems),
+    placedItemCount: adobepyCollectionLength(document.placedItems),
+    rasterItemCount: adobepyCollectionLength(document.rasterItems),
     selectionCount: adobepyIllustratorSelectedPageItems(document).length,
     typename: "Document"
   };
@@ -242,6 +297,227 @@ function adobepyIllustratorPageItem(item, index) {
   };
 }
 
+function adobepyIllustratorPathItems(document) {
+  return adobepyIllustratorPathItemCollection(document ? document.pathItems : null);
+}
+
+function adobepyIllustratorSelectedPathItems(document) {
+  return adobepyIllustratorPathItemCollection(adobepyIllustratorFilteredSelection(document, ["PathItem"]));
+}
+
+function adobepyIllustratorLayerPathItems(document, layerKey) {
+  var layer = adobepyIllustratorFindLayer(document, layerKey);
+  return adobepyIllustratorPathItemCollection(layer ? layer.pathItems : null);
+}
+
+function adobepyIllustratorPathItemByName(document, name) {
+  return adobepyIllustratorFindSerializedByName(adobepyIllustratorPathItems(document), name);
+}
+
+function adobepyIllustratorPathItemCollection(items) {
+  var result = [];
+  var count = adobepyCollectionLength(items);
+  for (var index = 0; index < count; index += 1) {
+    var item = adobepyCollectionItem(items, index);
+    if (item) result.push(adobepyIllustratorPathItem(item, index));
+  }
+  return result;
+}
+
+function adobepyIllustratorPathItem(item, index) {
+  var payload = adobepyIllustratorPageItem(item, index);
+  if (!payload) return null;
+  payload.area = adobepyNumberOrNull(adobepySafeValue(item, "area"));
+  payload.closed = adobepyBooleanOrNull(adobepySafeValue(item, "closed"));
+  payload.clipping = adobepyBooleanOrNull(adobepySafeValue(item, "clipping"));
+  payload.evenodd = adobepyBooleanOrNull(adobepySafeValue(item, "evenodd"));
+  payload.filled = adobepyBooleanOrNull(adobepySafeValue(item, "filled"));
+  payload.fillColor = adobepyIllustratorColor(adobepySafeValue(item, "fillColor"));
+  payload.fillOverprint = adobepyBooleanOrNull(adobepySafeValue(item, "fillOverprint"));
+  payload.stroked = adobepyBooleanOrNull(adobepySafeValue(item, "stroked"));
+  payload.strokeColor = adobepyIllustratorColor(adobepySafeValue(item, "strokeColor"));
+  payload.strokeWidth = adobepyNumberOrNull(adobepySafeValue(item, "strokeWidth"));
+  payload.strokeCap = adobepySerializableValue(adobepySafeValue(item, "strokeCap"));
+  payload.strokeJoin = adobepySerializableValue(adobepySafeValue(item, "strokeJoin"));
+  payload.strokeDashes = adobepyArrayValue(adobepySafeValue(item, "strokeDashes"));
+  payload.strokeDashOffset = adobepyNumberOrNull(adobepySafeValue(item, "strokeDashOffset"));
+  payload.strokeMiterLimit = adobepyNumberOrNull(adobepySafeValue(item, "strokeMiterLimit"));
+  payload.strokeOverprint = adobepyBooleanOrNull(adobepySafeValue(item, "strokeOverprint"));
+  payload.guides = adobepyBooleanOrNull(adobepySafeValue(item, "guides"));
+  payload.length = adobepyNumberOrNull(adobepySafeValue(item, "length"));
+  payload.pathPointCount = adobepyCollectionLength(adobepySafeValue(item, "pathPoints"));
+  payload.selectedPathPointCount = adobepyCollectionLength(adobepySafeValue(item, "selectedPathPoints"));
+  payload.pixelAligned = adobepyBooleanOrNull(adobepySafeValue(item, "pixelAligned"));
+  payload.polarity = adobepySerializableValue(adobepySafeValue(item, "polarity"));
+  payload.typename = "PathItem";
+  return payload;
+}
+
+function adobepyIllustratorCompoundPathItems(document) {
+  return adobepyIllustratorCompoundPathItemCollection(document ? document.compoundPathItems : null);
+}
+
+function adobepyIllustratorSelectedCompoundPathItems(document) {
+  return adobepyIllustratorCompoundPathItemCollection(adobepyIllustratorFilteredSelection(document, ["CompoundPathItem"]));
+}
+
+function adobepyIllustratorLayerCompoundPathItems(document, layerKey) {
+  var layer = adobepyIllustratorFindLayer(document, layerKey);
+  return adobepyIllustratorCompoundPathItemCollection(layer ? layer.compoundPathItems : null);
+}
+
+function adobepyIllustratorCompoundPathItemByName(document, name) {
+  return adobepyIllustratorFindSerializedByName(adobepyIllustratorCompoundPathItems(document), name);
+}
+
+function adobepyIllustratorCompoundPathPathItems(document, compoundKey) {
+  var item = adobepyIllustratorFindCompoundPathItem(document, compoundKey);
+  return adobepyIllustratorPathItemCollection(item ? item.pathItems : null);
+}
+
+function adobepyIllustratorCompoundPathItemCollection(items) {
+  var result = [];
+  var count = adobepyCollectionLength(items);
+  for (var index = 0; index < count; index += 1) {
+    var item = adobepyCollectionItem(items, index);
+    if (item) result.push(adobepyIllustratorCompoundPathItem(item, index));
+  }
+  return result;
+}
+
+function adobepyIllustratorCompoundPathItem(item, index) {
+  var payload = adobepyIllustratorPageItem(item, index);
+  if (!payload) return null;
+  payload.pathItemCount = adobepyCollectionLength(adobepySafeValue(item, "pathItems"));
+  payload.typename = "CompoundPathItem";
+  return payload;
+}
+
+function adobepyIllustratorFindCompoundPathItem(document, key) {
+  var items = document ? document.compoundPathItems : null;
+  var count = adobepyCollectionLength(items);
+  for (var index = 0; index < count; index += 1) {
+    var item = adobepyCollectionItem(items, index);
+    if (adobepyIllustratorMatchesItemKey(item, key, index)) return item;
+  }
+  return null;
+}
+
+function adobepyIllustratorPlacedItems(document) {
+  return adobepyIllustratorPlacedItemCollection(document ? document.placedItems : null);
+}
+
+function adobepyIllustratorSelectedPlacedItems(document) {
+  return adobepyIllustratorPlacedItemCollection(adobepyIllustratorFilteredSelection(document, ["PlacedItem"]));
+}
+
+function adobepyIllustratorLayerPlacedItems(document, layerKey) {
+  var layer = adobepyIllustratorFindLayer(document, layerKey);
+  return adobepyIllustratorPlacedItemCollection(layer ? layer.placedItems : null);
+}
+
+function adobepyIllustratorPlacedItemByName(document, name) {
+  return adobepyIllustratorFindSerializedByName(adobepyIllustratorPlacedItems(document), name);
+}
+
+function adobepyIllustratorPlacedItemCollection(items) {
+  var result = [];
+  var count = adobepyCollectionLength(items);
+  for (var index = 0; index < count; index += 1) {
+    var item = adobepyCollectionItem(items, index);
+    if (item) result.push(adobepyIllustratorPlacedItem(item, index));
+  }
+  return result;
+}
+
+function adobepyIllustratorPlacedItem(item, index) {
+  var payload = adobepyIllustratorPageItem(item, index);
+  if (!payload) return null;
+  var file = adobepyIllustratorFile(adobepySafeValue(item, "file"));
+  payload.filePath = file.path;
+  payload.fileName = file.name;
+  payload.boundingBox = adobepyArrayValue(adobepySafeValue(item, "boundingBox"));
+  payload.matrix = adobepyIllustratorMatrix(adobepySafeValue(item, "matrix"));
+  payload.typename = "PlacedItem";
+  return payload;
+}
+
+function adobepyIllustratorRasterItems(document) {
+  return adobepyIllustratorRasterItemCollection(document ? document.rasterItems : null);
+}
+
+function adobepyIllustratorSelectedRasterItems(document) {
+  return adobepyIllustratorRasterItemCollection(adobepyIllustratorFilteredSelection(document, ["RasterItem"]));
+}
+
+function adobepyIllustratorLayerRasterItems(document, layerKey) {
+  var layer = adobepyIllustratorFindLayer(document, layerKey);
+  return adobepyIllustratorRasterItemCollection(layer ? layer.rasterItems : null);
+}
+
+function adobepyIllustratorRasterItemByName(document, name) {
+  return adobepyIllustratorFindSerializedByName(adobepyIllustratorRasterItems(document), name);
+}
+
+function adobepyIllustratorRasterItemCollection(items) {
+  var result = [];
+  var count = adobepyCollectionLength(items);
+  for (var index = 0; index < count; index += 1) {
+    var item = adobepyCollectionItem(items, index);
+    if (item) result.push(adobepyIllustratorRasterItem(item, index));
+  }
+  return result;
+}
+
+function adobepyIllustratorRasterItem(item, index) {
+  var payload = adobepyIllustratorPageItem(item, index);
+  if (!payload) return null;
+  var file = adobepyIllustratorFile(adobepySafeValue(item, "file"));
+  payload.filePath = file.path;
+  payload.fileName = file.name;
+  payload.boundingBox = adobepyArrayValue(adobepySafeValue(item, "boundingBox"));
+  payload.matrix = adobepyIllustratorMatrix(adobepySafeValue(item, "matrix"));
+  payload.embedded = adobepyBooleanOrNull(adobepySafeValue(item, "embedded"));
+  payload.bitsPerChannel = adobepyNumberOrNull(adobepySafeValue(item, "bitsPerChannel"));
+  payload.channels = adobepyNumberOrNull(adobepySafeValue(item, "channels"));
+  payload.colorants = adobepyArrayValue(adobepySafeValue(item, "colorants"));
+  payload.colorizedGrayscale = adobepyBooleanOrNull(adobepySafeValue(item, "colorizedGrayscale"));
+  payload.imageColorSpace = adobepySerializableValue(adobepySafeValue(item, "imageColorSpace"));
+  payload.overprint = adobepyBooleanOrNull(adobepySafeValue(item, "overprint"));
+  payload.typename = "RasterItem";
+  return payload;
+}
+
+function adobepyIllustratorFilteredSelection(document, typenames) {
+  var result = [];
+  var items = document ? document.selection : null;
+  var count = adobepyCollectionLength(items);
+  for (var index = 0; index < count; index += 1) {
+    var item = adobepyCollectionItem(items, index);
+    var typename = adobepyStringOrNull(adobepySafeValue(item, "typename"));
+    for (var typeIndex = 0; typeIndex < typenames.length; typeIndex += 1) {
+      if (typename === typenames[typeIndex]) result.push(item);
+    }
+  }
+  return result;
+}
+
+function adobepyIllustratorFindSerializedByName(items, name) {
+  for (var index = 0; index < items.length; index += 1) {
+    if (items[index].name === name) return items[index];
+  }
+  return null;
+}
+
+function adobepyIllustratorMatchesItemKey(item, key, index) {
+  if (!item) return false;
+  var values = [adobepySafeValue(item, "uuid"), adobepySafeValue(item, "id"), adobepySafeValue(item, "name"), index];
+  for (var valueIndex = 0; valueIndex < values.length; valueIndex += 1) {
+    if (String(values[valueIndex]) === String(key)) return true;
+  }
+  return false;
+}
+
 function adobepyCollectionLength(value) {
   if (!value) return 0;
   var length = adobepyNumberOrNull(adobepySafeValue(value, "length"));
@@ -281,6 +557,55 @@ function adobepyArrayValue(value) {
   if (length === null) return value;
   for (var index = 0; index < length; index += 1) result.push(value[index]);
   return result;
+}
+
+function adobepySerializableValue(value) {
+  if (typeof value === "undefined" || value === null) return null;
+  if (typeof value !== "object") return value;
+  var typename = adobepyStringOrNull(adobepySafeValue(value, "typename"));
+  if (typename) return typename;
+  try {
+    return String(value);
+  } catch (_) {
+    return null;
+  }
+}
+
+function adobepyIllustratorColor(value) {
+  if (typeof value === "undefined" || value === null) return null;
+  if (typeof value !== "object") return value;
+  var output = {};
+  var keys = ["typename", "red", "green", "blue", "cyan", "magenta", "yellow", "black", "gray", "tint", "spot", "pattern", "gradient"];
+  for (var index = 0; index < keys.length; index += 1) {
+    var key = keys[index];
+    var item = adobepySafeValue(value, key);
+    if (typeof item === "undefined" || typeof item === "function") continue;
+    output[key] = adobepySerializableValue(item);
+  }
+  return output;
+}
+
+function adobepyIllustratorFile(file) {
+  if (!file) return { path: null, name: null };
+  return {
+    path: adobepyStringOrNull(adobepySafeValue(file, "fsName") || adobepySafeValue(file, "fullName") || file),
+    name: adobepyStringOrNull(adobepySafeValue(file, "displayName") || adobepySafeValue(file, "name"))
+  };
+}
+
+function adobepyIllustratorMatrix(matrix) {
+  if (!matrix) return null;
+  var output = {};
+  var keys = ["mValueA", "mValueB", "mValueC", "mValueD", "mValueTX", "mValueTY"];
+  var hasValues = false;
+  for (var index = 0; index < keys.length; index += 1) {
+    var key = keys[index];
+    var value = adobepySafeValue(matrix, key);
+    if (typeof value === "undefined" || typeof value === "function") continue;
+    output[key] = value;
+    hasValues = true;
+  }
+  return hasValues ? output : adobepySerializableValue(matrix);
 }
 
 function adobepyNumberOrNull(value) {

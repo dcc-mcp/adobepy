@@ -26,7 +26,19 @@ class CapturingClient:
             if host == "indesign":
                 payload.update({"pageCount": 2, "spreadCount": 1, "typename": "Document"})
             if host == "illustrator":
-                payload.update({"artboardCount": 2, "layerCount": 1, "pageItemCount": 2, "selectionCount": 1, "typename": "Document"})
+                payload.update(
+                    {
+                        "artboardCount": 2,
+                        "layerCount": 1,
+                        "pageItemCount": 4,
+                        "pathItemCount": 1,
+                        "compoundPathItemCount": 1,
+                        "placedItemCount": 1,
+                        "rasterItemCount": 1,
+                        "selectionCount": 3,
+                        "typename": "Document",
+                    }
+                )
             return payload
         if namespace == "document" and method == "getById":
             return {"id": args[0], "name": "demo", "width": 100, "height": 50}
@@ -338,15 +350,220 @@ class CapturingClient:
                 "url": "https://example.com",
                 "typename": "PathItem",
             }
-            second = {**item, "id": "item-2", "index": 1, "name": "Placed", "itemType": "PlacedItem", "selected": False, "typename": "PlacedItem"}
+            compound = {**item, "id": "compound-1", "index": 1, "name": "Compound Logo", "itemType": "CompoundPathItem", "selected": True, "typename": "CompoundPathItem"}
+            placed = {**item, "id": "placed-1", "index": 2, "name": "Placed", "itemType": "PlacedItem", "selected": False, "typename": "PlacedItem"}
+            raster = {**item, "id": "raster-1", "index": 3, "name": "Raster", "itemType": "RasterItem", "selected": True, "typename": "RasterItem"}
             if method == "getPageItems":
-                return [item, second]
+                return [item, compound, placed, raster]
             if method == "getSelected":
-                return [item]
+                return [item, compound, raster]
             if method == "getByName":
                 return item if args[0] == "Logo" else None
             if method == "getLayerItems":
                 return [item] if args[0] in {"layer-1", "Artwork", 0} else []
+        if host == "illustrator" and namespace == "pathItem":
+            path = {
+                "id": "path-1",
+                "index": 0,
+                "name": "Logo Path",
+                "itemType": "PathItem",
+                "hidden": False,
+                "locked": False,
+                "selected": True,
+                "editable": True,
+                "sliced": False,
+                "position": [10, 490],
+                "geometricBounds": [10, 490, 110, 390],
+                "visibleBounds": [8, 492, 112, 388],
+                "controlBounds": [5, 495, 115, 385],
+                "width": 100,
+                "height": 100,
+                "opacity": 100,
+                "parentName": "Artwork",
+                "parentTypename": "Layer",
+                "layerName": "Artwork",
+                "note": "brand",
+                "url": "https://example.com",
+                "area": 1024.5,
+                "closed": True,
+                "clipping": False,
+                "evenodd": True,
+                "filled": True,
+                "fillColor": {"typename": "RGBColor", "red": 255, "green": 0, "blue": 0},
+                "fillOverprint": False,
+                "stroked": True,
+                "strokeColor": {"typename": "CMYKColor", "cyan": 0, "magenta": 0, "yellow": 0, "black": 100},
+                "strokeWidth": 2,
+                "strokeCap": "RoundEndCap",
+                "strokeJoin": "RoundEndJoin",
+                "strokeDashes": [4, 2],
+                "strokeDashOffset": 1,
+                "strokeMiterLimit": 10,
+                "strokeOverprint": False,
+                "guides": False,
+                "length": 128.5,
+                "pathPointCount": 4,
+                "selectedPathPointCount": 2,
+                "pixelAligned": True,
+                "polarity": "Positive",
+                "typename": "PathItem",
+            }
+            if method == "getPathItems":
+                return [path]
+            if method == "getSelected":
+                return [path]
+            if method == "getByName":
+                return path if args[0] == "Logo Path" else None
+            if method == "getLayerItems":
+                return [path] if args[0] in {"layer-1", "Artwork", 0} else []
+        if host == "illustrator" and namespace == "compoundPath":
+            compound = {
+                "id": "compound-1",
+                "index": 0,
+                "name": "Compound Logo",
+                "itemType": "CompoundPathItem",
+                "hidden": False,
+                "locked": False,
+                "selected": True,
+                "editable": True,
+                "sliced": False,
+                "position": [10, 490],
+                "geometricBounds": [10, 490, 110, 390],
+                "visibleBounds": [8, 492, 112, 388],
+                "controlBounds": [5, 495, 115, 385],
+                "width": 100,
+                "height": 100,
+                "opacity": 100,
+                "parentName": "Artwork",
+                "parentTypename": "Layer",
+                "layerName": "Artwork",
+                "note": "compound",
+                "url": "https://example.com/compound",
+                "pathItemCount": 1,
+                "typename": "CompoundPathItem",
+            }
+            child_path = {
+                "id": "path-2",
+                "index": 0,
+                "name": "Compound Child",
+                "itemType": "PathItem",
+                "hidden": False,
+                "locked": False,
+                "selected": False,
+                "editable": True,
+                "sliced": False,
+                "position": [20, 480],
+                "geometricBounds": [20, 480, 100, 400],
+                "visibleBounds": [18, 482, 102, 398],
+                "controlBounds": [15, 485, 105, 395],
+                "width": 80,
+                "height": 80,
+                "opacity": 100,
+                "parentName": "Compound Logo",
+                "parentTypename": "CompoundPathItem",
+                "layerName": "Artwork",
+                "area": 512,
+                "closed": True,
+                "clipping": False,
+                "evenodd": False,
+                "filled": True,
+                "fillColor": {"typename": "GrayColor", "gray": 50},
+                "stroked": False,
+                "pathPointCount": 3,
+                "selectedPathPointCount": 0,
+                "typename": "PathItem",
+            }
+            if method == "getCompoundPathItems":
+                return [compound]
+            if method == "getSelected":
+                return [compound]
+            if method == "getByName":
+                return compound if args[0] == "Compound Logo" else None
+            if method == "getLayerItems":
+                return [compound] if args[0] in {"layer-1", "Artwork", 0} else []
+            if method == "getPathItems":
+                return [child_path] if args[0] in {"compound-1", "Compound Logo", 0} else []
+        if host == "illustrator" and namespace == "placedItem":
+            placed = {
+                "id": "placed-1",
+                "index": 0,
+                "name": "Placed",
+                "itemType": "PlacedItem",
+                "hidden": False,
+                "locked": False,
+                "selected": False,
+                "editable": True,
+                "sliced": False,
+                "position": [100, 400],
+                "geometricBounds": [100, 400, 260, 240],
+                "visibleBounds": [100, 400, 260, 240],
+                "controlBounds": [98, 402, 262, 238],
+                "width": 160,
+                "height": 160,
+                "opacity": 90,
+                "parentName": "Artwork",
+                "parentTypename": "Layer",
+                "layerName": "Artwork",
+                "note": "linked",
+                "url": "https://example.com/placed",
+                "filePath": "C:/assets/logo.pdf",
+                "fileName": "logo.pdf",
+                "boundingBox": [100, 400, 260, 240],
+                "matrix": {"mValueA": 1, "mValueD": 1, "mValueTX": 0, "mValueTY": 0},
+                "typename": "PlacedItem",
+            }
+            if method == "getPlacedItems":
+                return [placed]
+            if method == "getSelected":
+                return []
+            if method == "getByName":
+                return placed if args[0] == "Placed" else None
+            if method == "getLayerItems":
+                return [placed] if args[0] in {"layer-1", "Artwork", 0} else []
+        if host == "illustrator" and namespace == "rasterItem":
+            raster = {
+                "id": "raster-1",
+                "index": 0,
+                "name": "Raster",
+                "itemType": "RasterItem",
+                "hidden": False,
+                "locked": False,
+                "selected": True,
+                "editable": True,
+                "sliced": False,
+                "position": [300, 300],
+                "geometricBounds": [300, 300, 500, 100],
+                "visibleBounds": [300, 300, 500, 100],
+                "controlBounds": [298, 302, 502, 98],
+                "width": 200,
+                "height": 200,
+                "opacity": 75,
+                "parentName": "Artwork",
+                "parentTypename": "Layer",
+                "layerName": "Artwork",
+                "note": "photo",
+                "url": "https://example.com/raster",
+                "filePath": "C:/assets/photo.png",
+                "fileName": "photo.png",
+                "boundingBox": [300, 300, 500, 100],
+                "matrix": {"mValueA": 1, "mValueD": 1},
+                "embedded": False,
+                "bitsPerChannel": 8,
+                "channels": 4,
+                "colorants": ["Cyan", "Magenta", "Yellow", "Black"],
+                "colorizedGrayscale": False,
+                "imageColorSpace": "CMYK",
+                "overprint": True,
+                "typename": "RasterItem",
+            }
+            if method == "getRasterItems":
+                return [raster]
+            if method == "getSelected":
+                return [raster]
+            if method == "getByName":
+                return raster if args[0] == "Raster" else None
+            if method == "getLayerItems":
+                return [raster] if args[0] in {"layer-1", "Artwork", 0} else []
         if namespace == "raw" and method == "evalJs":
             return {"source": args[0], "args": list(args[1:])}
         if namespace == "raw" and method == "getPath":
@@ -1313,8 +1530,16 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(doc.artboard_count, 2)
         self.assertEqual(doc.artboardCount, 2)
         self.assertEqual(doc.layer_count, 1)
-        self.assertEqual(doc.page_item_count, 2)
-        self.assertEqual(doc.selection_count, 1)
+        self.assertEqual(doc.page_item_count, 4)
+        self.assertEqual(doc.path_item_count, 1)
+        self.assertEqual(doc.pathItemCount, 1)
+        self.assertEqual(doc.compound_path_item_count, 1)
+        self.assertEqual(doc.compoundPathItemCount, 1)
+        self.assertEqual(doc.placed_item_count, 1)
+        self.assertEqual(doc.placedItemCount, 1)
+        self.assertEqual(doc.raster_item_count, 1)
+        self.assertEqual(doc.rasterItemCount, 1)
+        self.assertEqual(doc.selection_count, 3)
         self.assertEqual(doc.typename, "Document")
         self.assertEqual(doc.artboards[0].name, "Artboard 1")
         self.assertEqual(doc.artboards[0].artboard_rect, [0, 500, 500, 0])
@@ -1390,6 +1615,104 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(doc.selection[0].name, "Logo")
         self.assertEqual(doc.get_page_item_by_name("Logo").typename, "PathItem")
         self.assertEqual(doc.getPageItemByName("Logo").layerName, "Artwork")
+        path = doc.path_items[0]
+        self.assertEqual(path.name, "Logo Path")
+        self.assertEqual(path.item_type, "PathItem")
+        self.assertEqual(path.itemType, "PathItem")
+        self.assertEqual(path.area, 1024.5)
+        self.assertTrue(path.closed)
+        self.assertFalse(path.clipping)
+        self.assertTrue(path.evenodd)
+        self.assertTrue(path.filled)
+        self.assertEqual(path.fill_color["typename"], "RGBColor")
+        self.assertEqual(path.fillColor["red"], 255)
+        self.assertFalse(path.fill_overprint)
+        self.assertFalse(path.fillOverprint)
+        self.assertTrue(path.stroked)
+        self.assertEqual(path.stroke_color["typename"], "CMYKColor")
+        self.assertEqual(path.strokeColor["black"], 100)
+        self.assertEqual(path.stroke_width, 2)
+        self.assertEqual(path.strokeWidth, 2)
+        self.assertEqual(path.stroke_cap, "RoundEndCap")
+        self.assertEqual(path.strokeCap, "RoundEndCap")
+        self.assertEqual(path.stroke_join, "RoundEndJoin")
+        self.assertEqual(path.strokeJoin, "RoundEndJoin")
+        self.assertEqual(path.stroke_dashes, [4, 2])
+        self.assertEqual(path.strokeDashes, [4, 2])
+        self.assertEqual(path.stroke_dash_offset, 1)
+        self.assertEqual(path.strokeDashOffset, 1)
+        self.assertEqual(path.stroke_miter_limit, 10)
+        self.assertEqual(path.strokeMiterLimit, 10)
+        self.assertFalse(path.stroke_overprint)
+        self.assertFalse(path.strokeOverprint)
+        self.assertFalse(path.guides)
+        self.assertEqual(path.length, 128.5)
+        self.assertEqual(path.path_point_count, 4)
+        self.assertEqual(path.pathPointCount, 4)
+        self.assertEqual(path.selected_path_point_count, 2)
+        self.assertEqual(path.selectedPathPointCount, 2)
+        self.assertTrue(path.pixel_aligned)
+        self.assertTrue(path.pixelAligned)
+        self.assertEqual(path.polarity, "Positive")
+        self.assertEqual(doc.selected_path_items[0].name, "Logo Path")
+        self.assertEqual(doc.selectedPathItems[0].typename, "PathItem")
+        self.assertEqual(layer.path_items[0].name, "Logo Path")
+        self.assertEqual(layer.pathItems[0].pathPointCount, 4)
+        self.assertEqual(doc.get_path_item_by_name("Logo Path").strokeWidth, 2)
+        self.assertEqual(doc.getPathItemByName("Logo Path").fillColor["red"], 255)
+        with self.assertRaises(NotImplementedError):
+            path.set_entire_path([[0, 0], [10, 10]])
+        with self.assertRaises(NotImplementedError):
+            path.setEntirePath([[0, 0], [10, 10]])
+        with self.assertRaises(NotImplementedError):
+            path.translate(10, 20)
+        compound = doc.compound_path_items[0]
+        self.assertEqual(compound.name, "Compound Logo")
+        self.assertEqual(compound.path_item_count, 1)
+        self.assertEqual(compound.pathItemCount, 1)
+        self.assertEqual(compound.path_items[0].name, "Compound Child")
+        self.assertEqual(compound.pathItems[0].fillColor["typename"], "GrayColor")
+        self.assertEqual(doc.selected_compound_path_items[0].name, "Compound Logo")
+        self.assertEqual(doc.selectedCompoundPathItems[0].typename, "CompoundPathItem")
+        self.assertEqual(layer.compound_path_items[0].name, "Compound Logo")
+        self.assertEqual(layer.compoundPathItems[0].pathItemCount, 1)
+        self.assertEqual(doc.get_compound_path_item_by_name("Compound Logo").pathItemCount, 1)
+        self.assertEqual(doc.getCompoundPathItemByName("Compound Logo").pathItems[0].name, "Compound Child")
+        placed = doc.placed_items[0]
+        self.assertEqual(placed.name, "Placed")
+        self.assertEqual(placed.file_path, "C:/assets/logo.pdf")
+        self.assertEqual(placed.filePath, "C:/assets/logo.pdf")
+        self.assertEqual(placed.file_name, "logo.pdf")
+        self.assertEqual(placed.fileName, "logo.pdf")
+        self.assertEqual(placed.bounding_box, [100, 400, 260, 240])
+        self.assertEqual(placed.boundingBox, [100, 400, 260, 240])
+        self.assertEqual(placed.matrix["mValueA"], 1)
+        self.assertEqual(doc.selected_placed_items, [])
+        self.assertEqual(doc.selectedPlacedItems, [])
+        self.assertEqual(layer.placed_items[0].name, "Placed")
+        self.assertEqual(layer.placedItems[0].fileName, "logo.pdf")
+        self.assertEqual(doc.get_placed_item_by_name("Placed").filePath, "C:/assets/logo.pdf")
+        self.assertEqual(doc.getPlacedItemByName("Placed").typename, "PlacedItem")
+        raster = doc.raster_items[0]
+        self.assertEqual(raster.name, "Raster")
+        self.assertEqual(raster.file_path, "C:/assets/photo.png")
+        self.assertEqual(raster.fileName, "photo.png")
+        self.assertFalse(raster.embedded)
+        self.assertEqual(raster.bits_per_channel, 8)
+        self.assertEqual(raster.bitsPerChannel, 8)
+        self.assertEqual(raster.channels, 4)
+        self.assertEqual(raster.colorants, ["Cyan", "Magenta", "Yellow", "Black"])
+        self.assertFalse(raster.colorized_grayscale)
+        self.assertFalse(raster.colorizedGrayscale)
+        self.assertEqual(raster.image_color_space, "CMYK")
+        self.assertEqual(raster.imageColorSpace, "CMYK")
+        self.assertTrue(raster.overprint)
+        self.assertEqual(doc.selected_raster_items[0].name, "Raster")
+        self.assertEqual(doc.selectedRasterItems[0].typename, "RasterItem")
+        self.assertEqual(layer.raster_items[0].name, "Raster")
+        self.assertEqual(layer.rasterItems[0].bitsPerChannel, 8)
+        self.assertEqual(doc.get_raster_item_by_name("Raster").filePath, "C:/assets/photo.png")
+        self.assertEqual(doc.getRasterItemByName("Raster").imageColorSpace, "CMYK")
 
     def test_raw_session(self):
         client = CapturingClient()

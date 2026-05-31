@@ -118,11 +118,29 @@ for item in doc.selection:
     print(item.name, item.layer_name)
 
 logo = doc.get_page_item_by_name("Logo")
+
+for path in doc.path_items:
+    print(path.name, path.closed, path.fill_color, path.stroke_width)
+
+for compound in doc.compound_path_items:
+    print(compound.name, compound.path_item_count)
+    for child_path in compound.path_items:
+        print(child_path.name, child_path.path_point_count)
+
+for placed in doc.placed_items:
+    print(placed.name, placed.file_path)
+
+for raster in doc.selected_raster_items:
+    print(raster.name, raster.file_path, raster.image_color_space)
 ```
 
 Use `adobe.raw.RawSession("illustrator").eval_extendscript(...)` for Illustrator
-APIs outside the typed document/artboard/layer/page-item facade, such as path
-construction, text-frame editing, swatches, colors, and export workflows.
+APIs outside the typed document/artboard/layer/page-item/path/placed/raster
+facade. Geometry mutations such as `PathItem.setEntirePath`, `translate`,
+`resize`, and `rotate` are intentionally deferred in the typed facade until
+their mutation semantics and modal/error behavior are covered by replay or live
+host tests. Text-frame editing, swatches, colors, and export workflows are also
+still outside the typed Illustrator MVP surface.
 
 ## Bridges
 

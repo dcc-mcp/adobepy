@@ -413,12 +413,94 @@ function testExtendScriptDispatchers() {
     layer: aiLayer,
     parent: aiLayer,
   };
-  const aiPlacedItem = { ...aiPageItem, uuid: "item-2", name: "Placed", typename: "PlacedItem", selected: false };
+  const aiPathItem = {
+    ...aiPageItem,
+    uuid: "path-1",
+    name: "Logo Path",
+    area: 1024.5,
+    closed: true,
+    clipping: false,
+    evenodd: true,
+    filled: true,
+    fillColor: { typename: "RGBColor", red: 255, green: 0, blue: 0 },
+    fillOverprint: false,
+    stroked: true,
+    strokeColor: { typename: "CMYKColor", cyan: 0, magenta: 0, yellow: 0, black: 100 },
+    strokeWidth: 2,
+    strokeCap: "RoundEndCap",
+    strokeJoin: "RoundEndJoin",
+    strokeDashes: [4, 2],
+    strokeDashOffset: 1,
+    strokeMiterLimit: 10,
+    strokeOverprint: false,
+    guides: false,
+    length: 128.5,
+    pathPoints: [{}, {}, {}, {}],
+    selectedPathPoints: [{}, {}],
+    pixelAligned: true,
+    polarity: "Positive",
+  };
+  const aiCompoundChildPath = {
+    ...aiPathItem,
+    uuid: "path-2",
+    name: "Compound Child",
+    parent: null,
+    selected: false,
+    fillColor: { typename: "GrayColor", gray: 50 },
+    stroked: false,
+    pathPoints: [{}, {}, {}],
+    selectedPathPoints: [],
+  };
+  const aiCompoundPathItem = {
+    ...aiPageItem,
+    uuid: "compound-1",
+    name: "Compound Logo",
+    typename: "CompoundPathItem",
+    selected: true,
+    note: "compound",
+    pathItems: [aiCompoundChildPath],
+  };
+  aiCompoundChildPath.parent = aiCompoundPathItem;
+  const aiPlacedItem = {
+    ...aiPageItem,
+    uuid: "placed-1",
+    name: "Placed",
+    typename: "PlacedItem",
+    selected: false,
+    file: { fsName: "C:/assets/logo.pdf", name: "logo.pdf" },
+    boundingBox: [100, 400, 260, 240],
+    matrix: { mValueA: 1, mValueD: 1, mValueTX: 0, mValueTY: 0 },
+  };
+  const aiRasterItem = {
+    ...aiPageItem,
+    uuid: "raster-1",
+    name: "Raster",
+    typename: "RasterItem",
+    selected: true,
+    file: { fsName: "C:/assets/photo.png", name: "photo.png" },
+    boundingBox: [300, 300, 500, 100],
+    matrix: { mValueA: 1, mValueD: 1 },
+    embedded: false,
+    bitsPerChannel: 8,
+    channels: 4,
+    colorants: ["Cyan", "Magenta", "Yellow", "Black"],
+    colorizedGrayscale: false,
+    imageColorSpace: "CMYK",
+    overprint: true,
+  };
   aiLayer.layers = [aiChildLayer];
-  aiLayer.pageItems = [aiPageItem, aiPlacedItem];
+  aiLayer.pageItems = [aiPathItem, aiCompoundPathItem, aiPlacedItem, aiRasterItem];
+  aiLayer.pathItems = [aiPathItem];
+  aiLayer.compoundPathItems = [aiCompoundPathItem];
+  aiLayer.placedItems = [aiPlacedItem];
+  aiLayer.rasterItems = [aiRasterItem];
   aiLayer.parent = { name: "poster.ai", typename: "Document" };
   aiChildLayer.layers = [];
-  aiChildLayer.pageItems = [aiPageItem];
+  aiChildLayer.pageItems = [aiPathItem];
+  aiChildLayer.pathItems = [aiPathItem];
+  aiChildLayer.compoundPathItems = [];
+  aiChildLayer.placedItems = [];
+  aiChildLayer.rasterItems = [];
   aiChildLayer.parent = aiLayer;
   const aiDocument = {
     name: "poster.ai",
@@ -427,8 +509,12 @@ function testExtendScriptDispatchers() {
     height: 600,
     artboards: aiArtboards,
     layers: [aiLayer],
-    pageItems: [aiPageItem, aiPlacedItem],
-    selection: [aiPageItem],
+    pageItems: [aiPathItem, aiCompoundPathItem, aiPlacedItem, aiRasterItem],
+    pathItems: [aiPathItem],
+    compoundPathItems: [aiCompoundPathItem],
+    placedItems: [aiPlacedItem],
+    rasterItems: [aiRasterItem],
+    selection: [aiPathItem, aiCompoundPathItem, aiRasterItem],
     typename: "Document",
   };
   const ai = loadDispatcher(illustratorDispatcherPath, {
@@ -446,20 +532,42 @@ function testExtendScriptDispatchers() {
     height: 600,
     artboardCount: 2,
     layerCount: 1,
-    pageItemCount: 2,
-    selectionCount: 1,
+    pageItemCount: 4,
+    pathItemCount: 1,
+    compoundPathItemCount: 1,
+    placedItemCount: 1,
+    rasterItemCount: 1,
+    selectionCount: 3,
     typename: "Document",
   });
   assert.strictEqual(dispatch(ai, "ai_artboards", "artboard", "getArtboards").result[0].name, "Artboard 1");
   assert.strictEqual(dispatch(ai, "ai_active_artboard", "artboard", "getActive").result.name, "Artboard 2");
   assert.strictEqual(dispatch(ai, "ai_active_artboard_index", "artboard", "getActiveIndex").result, 1);
-  assert.strictEqual(dispatch(ai, "ai_layers", "layer", "getLayers").result[0].pageItemCount, 2);
+  assert.strictEqual(dispatch(ai, "ai_layers", "layer", "getLayers").result[0].pageItemCount, 4);
   assert.strictEqual(dispatch(ai, "ai_layer_by_name", "layer", "getByName", ["Artwork"]).result.name, "Artwork");
   assert.strictEqual(dispatch(ai, "ai_layer_children", "layer", "getChildren", ["Artwork"]).result[0].name, "Icons");
   assert.strictEqual(dispatch(ai, "ai_page_items", "pageItem", "getPageItems").result[0].typename, "PathItem");
   assert.strictEqual(dispatch(ai, "ai_selected_items", "pageItem", "getSelected").result[0].selected, true);
-  assert.strictEqual(dispatch(ai, "ai_page_item_by_name", "pageItem", "getByName", ["Logo"]).result.layerName, "Artwork");
-  assert.strictEqual(dispatch(ai, "ai_layer_page_items", "pageItem", "getLayerItems", ["Artwork"]).result[0].name, "Logo");
+  assert.strictEqual(dispatch(ai, "ai_page_item_by_name", "pageItem", "getByName", ["Logo Path"]).result.layerName, "Artwork");
+  assert.strictEqual(dispatch(ai, "ai_layer_page_items", "pageItem", "getLayerItems", ["Artwork"]).result[0].name, "Logo Path");
+  assert.strictEqual(dispatch(ai, "ai_path_items", "pathItem", "getPathItems").result[0].fillColor.red, 255);
+  assert.strictEqual(dispatch(ai, "ai_selected_path_items", "pathItem", "getSelected").result[0].pathPointCount, 4);
+  assert.strictEqual(dispatch(ai, "ai_path_item_by_name", "pathItem", "getByName", ["Logo Path"]).result.strokeWidth, 2);
+  assert.strictEqual(dispatch(ai, "ai_layer_path_items", "pathItem", "getLayerItems", ["Artwork"]).result[0].strokeDashes[1], 2);
+  assert.strictEqual(dispatch(ai, "ai_compound_items", "compoundPath", "getCompoundPathItems").result[0].pathItemCount, 1);
+  assert.strictEqual(dispatch(ai, "ai_selected_compound_items", "compoundPath", "getSelected").result[0].name, "Compound Logo");
+  assert.strictEqual(dispatch(ai, "ai_compound_by_name", "compoundPath", "getByName", ["Compound Logo"]).result.typename, "CompoundPathItem");
+  assert.strictEqual(dispatch(ai, "ai_layer_compound_items", "compoundPath", "getLayerItems", ["Artwork"]).result[0].name, "Compound Logo");
+  assert.strictEqual(dispatch(ai, "ai_compound_path_items", "compoundPath", "getPathItems", ["Compound Logo"]).result[0].fillColor.typename, "GrayColor");
+  assert.strictEqual(dispatch(ai, "ai_placed_items", "placedItem", "getPlacedItems").result[0].filePath, "C:/assets/logo.pdf");
+  assert.deepStrictEqual(dispatch(ai, "ai_selected_placed_items", "placedItem", "getSelected").result, []);
+  assert.strictEqual(dispatch(ai, "ai_placed_by_name", "placedItem", "getByName", ["Placed"]).result.fileName, "logo.pdf");
+  assert.strictEqual(dispatch(ai, "ai_layer_placed_items", "placedItem", "getLayerItems", ["Artwork"]).result[0].boundingBox[2], 260);
+  assert.strictEqual(dispatch(ai, "ai_raster_items", "rasterItem", "getRasterItems").result[0].bitsPerChannel, 8);
+  assert.strictEqual(dispatch(ai, "ai_selected_raster_items", "rasterItem", "getSelected").result[0].name, "Raster");
+  assert.strictEqual(dispatch(ai, "ai_raster_by_name", "rasterItem", "getByName", ["Raster"]).result.filePath, "C:/assets/photo.png");
+  assert.strictEqual(dispatch(ai, "ai_layer_raster_items", "rasterItem", "getLayerItems", ["Artwork"]).result[0].imageColorSpace, "CMYK");
+  assert.strictEqual(dispatch(ai, "ai_unsupported_path_mutation", "pathItem", "setEntirePath", ["Logo Path", [[0, 0]]]).error.code, -32601);
   assert.strictEqual(dispatch(ai, "ai_raw", "raw", "evalExtendScript", ["app.version"]).result, "28.2.0");
 
   const aiNoDocument = loadDispatcher(illustratorDispatcherPath, { app: { version: "28.2.0", documents: { length: 0 } } });

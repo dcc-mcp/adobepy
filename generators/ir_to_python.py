@@ -282,7 +282,7 @@ def camel_case(value: str) -> str:
 
 def py_type(value: str) -> str:
     return re.sub(
-        r"\b(Artboard|Channel|CharacterStyle|Clip|Composition|Document|Effect|FolderItem|FootageItem|Layer|Link|Marker|Mask|OutputModule|Page|PageItem|ParagraphStyle|Project|ProjectItem|RenderQueue|RenderQueueItem|Selection|Sequence|SourceText|Spread|Story|Swatch|TextFrame|TextItem|TextSelection|Track)\b",
+        r"\b(Artboard|Channel|CharacterStyle|Clip|CompoundPathItem|Composition|Document|Effect|FolderItem|FootageItem|Layer|Link|Marker|Mask|OutputModule|Page|PageItem|ParagraphStyle|PathItem|PlacedItem|Project|ProjectItem|RasterItem|RenderQueue|RenderQueueItem|Selection|Sequence|SourceText|Spread|Story|Swatch|TextFrame|TextItem|TextSelection|Track)\b",
         r"\1Proxy",
         value,
     )

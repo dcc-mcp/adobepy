@@ -24,7 +24,7 @@ IR, bridge capabilities, Python facade, and Pythonic aliases.
 | InDesign | UXP | 5 | 0 | 100.0% | none |
 | Premiere Pro | UXP | 5 | 0 | 100.0% | none |
 | After Effects | CEP/ExtendScript | 5 | 0 | 100.0% | none |
-| Illustrator | CEP/ExtendScript | 3 | 2 | 60.0% | Path items, compound paths, and placed/raster items; text frames, stories, swatches, colors, and export workflows |
+| Illustrator | CEP/ExtendScript | 4 | 1 | 80.0% | Text frames, stories, swatches, colors, and export workflows |
 
 ## Coverage Rules
 

@@ -33,6 +33,43 @@
         {"name": "getLayerItems", "returns": "list[PageItem]"}
       ]
     },
+    {
+      "name": "pathItem",
+      "methods": [
+        {"name": "getPathItems", "returns": "list[PathItem]"},
+        {"name": "getSelected", "returns": "list[PathItem]"},
+        {"name": "getByName", "returns": "PathItem | None"},
+        {"name": "getLayerItems", "returns": "list[PathItem]"}
+      ]
+    },
+    {
+      "name": "compoundPath",
+      "methods": [
+        {"name": "getCompoundPathItems", "returns": "list[CompoundPathItem]"},
+        {"name": "getSelected", "returns": "list[CompoundPathItem]"},
+        {"name": "getByName", "returns": "CompoundPathItem | None"},
+        {"name": "getLayerItems", "returns": "list[CompoundPathItem]"},
+        {"name": "getPathItems", "returns": "list[PathItem]"}
+      ]
+    },
+    {
+      "name": "placedItem",
+      "methods": [
+        {"name": "getPlacedItems", "returns": "list[PlacedItem]"},
+        {"name": "getSelected", "returns": "list[PlacedItem]"},
+        {"name": "getByName", "returns": "PlacedItem | None"},
+        {"name": "getLayerItems", "returns": "list[PlacedItem]"}
+      ]
+    },
+    {
+      "name": "rasterItem",
+      "methods": [
+        {"name": "getRasterItems", "returns": "list[RasterItem]"},
+        {"name": "getSelected", "returns": "list[RasterItem]"},
+        {"name": "getByName", "returns": "RasterItem | None"},
+        {"name": "getLayerItems", "returns": "list[RasterItem]"}
+      ]
+    },
     {"name": "raw", "methods": [{"name": "evalExtendScript", "returns": "Any", "raw": true}]}
   ],
   "proxies": [
@@ -46,6 +83,10 @@
         {"name": "artboard_count", "type": "int | None"},
         {"name": "layer_count", "type": "int | None"},
         {"name": "page_item_count", "type": "int | None"},
+        {"name": "path_item_count", "type": "int | None"},
+        {"name": "compound_path_item_count", "type": "int | None"},
+        {"name": "placed_item_count", "type": "int | None"},
+        {"name": "raster_item_count", "type": "int | None"},
         {"name": "selection_count", "type": "int | None"},
         {"name": "artboards", "type": "list[Artboard]", "source": "artboard.getArtboards"},
         {"name": "active_artboard", "type": "Artboard | None", "source": "artboard.getActive"},
@@ -53,11 +94,23 @@
         {"name": "layers", "type": "list[Layer]", "source": "layer.getLayers"},
         {"name": "page_items", "type": "list[PageItem]", "source": "pageItem.getPageItems"},
         {"name": "selection", "type": "list[PageItem]", "source": "pageItem.getSelected"},
+        {"name": "path_items", "type": "list[PathItem]", "source": "pathItem.getPathItems"},
+        {"name": "selected_path_items", "type": "list[PathItem]", "source": "pathItem.getSelected"},
+        {"name": "compound_path_items", "type": "list[CompoundPathItem]", "source": "compoundPath.getCompoundPathItems"},
+        {"name": "selected_compound_path_items", "type": "list[CompoundPathItem]", "source": "compoundPath.getSelected"},
+        {"name": "placed_items", "type": "list[PlacedItem]", "source": "placedItem.getPlacedItems"},
+        {"name": "selected_placed_items", "type": "list[PlacedItem]", "source": "placedItem.getSelected"},
+        {"name": "raster_items", "type": "list[RasterItem]", "source": "rasterItem.getRasterItems"},
+        {"name": "selected_raster_items", "type": "list[RasterItem]", "source": "rasterItem.getSelected"},
         {"name": "typename", "type": "str | None"}
       ],
       "methods": [
         {"name": "getLayerByName", "returns": "Layer | None"},
-        {"name": "getPageItemByName", "returns": "PageItem | None"}
+        {"name": "getPageItemByName", "returns": "PageItem | None"},
+        {"name": "getPathItemByName", "returns": "PathItem | None"},
+        {"name": "getCompoundPathItemByName", "returns": "CompoundPathItem | None"},
+        {"name": "getPlacedItemByName", "returns": "PlacedItem | None"},
+        {"name": "getRasterItemByName", "returns": "RasterItem | None"}
       ]
     },
     {
@@ -92,6 +145,10 @@
         {"name": "page_item_count", "type": "int | None"},
         {"name": "layers", "type": "list[Layer]", "source": "layer.getChildren"},
         {"name": "page_items", "type": "list[PageItem]", "source": "pageItem.getLayerItems"},
+        {"name": "path_items", "type": "list[PathItem]", "source": "pathItem.getLayerItems"},
+        {"name": "compound_path_items", "type": "list[CompoundPathItem]", "source": "compoundPath.getLayerItems"},
+        {"name": "placed_items", "type": "list[PlacedItem]", "source": "placedItem.getLayerItems"},
+        {"name": "raster_items", "type": "list[RasterItem]", "source": "rasterItem.getLayerItems"},
         {"name": "typename", "type": "str | None"}
       ]
     },
@@ -119,6 +176,159 @@
         {"name": "layer_name", "type": "str | None"},
         {"name": "note", "type": "str | None"},
         {"name": "url", "type": "str | None"},
+        {"name": "typename", "type": "str | None"}
+      ]
+    },
+    {
+      "name": "PathItemProxy",
+      "properties": [
+        {"name": "id", "type": "Any"},
+        {"name": "index", "type": "int | None"},
+        {"name": "name", "type": "str | None"},
+        {"name": "item_type", "type": "str | None"},
+        {"name": "hidden", "type": "bool | None"},
+        {"name": "locked", "type": "bool | None"},
+        {"name": "selected", "type": "bool | None"},
+        {"name": "editable", "type": "bool | None"},
+        {"name": "sliced", "type": "bool | None"},
+        {"name": "position", "type": "Any"},
+        {"name": "geometric_bounds", "type": "Any"},
+        {"name": "visible_bounds", "type": "Any"},
+        {"name": "control_bounds", "type": "Any"},
+        {"name": "width", "type": "Any"},
+        {"name": "height", "type": "Any"},
+        {"name": "opacity", "type": "float | None"},
+        {"name": "parent_name", "type": "str | None"},
+        {"name": "parent_typename", "type": "str | None"},
+        {"name": "layer_name", "type": "str | None"},
+        {"name": "note", "type": "str | None"},
+        {"name": "url", "type": "str | None"},
+        {"name": "area", "type": "float | None"},
+        {"name": "closed", "type": "bool | None"},
+        {"name": "clipping", "type": "bool | None"},
+        {"name": "evenodd", "type": "bool | None"},
+        {"name": "filled", "type": "bool | None"},
+        {"name": "fill_color", "type": "Any"},
+        {"name": "fill_overprint", "type": "bool | None"},
+        {"name": "stroked", "type": "bool | None"},
+        {"name": "stroke_color", "type": "Any"},
+        {"name": "stroke_width", "type": "float | None"},
+        {"name": "stroke_cap", "type": "Any"},
+        {"name": "stroke_join", "type": "Any"},
+        {"name": "stroke_dashes", "type": "Any"},
+        {"name": "stroke_dash_offset", "type": "float | None"},
+        {"name": "stroke_miter_limit", "type": "float | None"},
+        {"name": "stroke_overprint", "type": "bool | None"},
+        {"name": "guides", "type": "bool | None"},
+        {"name": "length", "type": "float | None"},
+        {"name": "path_point_count", "type": "int | None"},
+        {"name": "selected_path_point_count", "type": "int | None"},
+        {"name": "pixel_aligned", "type": "bool | None"},
+        {"name": "polarity", "type": "Any"},
+        {"name": "typename", "type": "str | None"}
+      ],
+      "methods": [
+        {"name": "setEntirePath", "returns": "Any"},
+        {"name": "translate", "returns": "Any"},
+        {"name": "resize", "returns": "Any"},
+        {"name": "rotate", "returns": "Any"}
+      ]
+    },
+    {
+      "name": "CompoundPathItemProxy",
+      "properties": [
+        {"name": "id", "type": "Any"},
+        {"name": "index", "type": "int | None"},
+        {"name": "name", "type": "str | None"},
+        {"name": "item_type", "type": "str | None"},
+        {"name": "hidden", "type": "bool | None"},
+        {"name": "locked", "type": "bool | None"},
+        {"name": "selected", "type": "bool | None"},
+        {"name": "editable", "type": "bool | None"},
+        {"name": "sliced", "type": "bool | None"},
+        {"name": "position", "type": "Any"},
+        {"name": "geometric_bounds", "type": "Any"},
+        {"name": "visible_bounds", "type": "Any"},
+        {"name": "control_bounds", "type": "Any"},
+        {"name": "width", "type": "Any"},
+        {"name": "height", "type": "Any"},
+        {"name": "opacity", "type": "float | None"},
+        {"name": "parent_name", "type": "str | None"},
+        {"name": "parent_typename", "type": "str | None"},
+        {"name": "layer_name", "type": "str | None"},
+        {"name": "note", "type": "str | None"},
+        {"name": "url", "type": "str | None"},
+        {"name": "path_item_count", "type": "int | None"},
+        {"name": "path_items", "type": "list[PathItem]", "source": "compoundPath.getPathItems"},
+        {"name": "typename", "type": "str | None"}
+      ]
+    },
+    {
+      "name": "PlacedItemProxy",
+      "properties": [
+        {"name": "id", "type": "Any"},
+        {"name": "index", "type": "int | None"},
+        {"name": "name", "type": "str | None"},
+        {"name": "item_type", "type": "str | None"},
+        {"name": "hidden", "type": "bool | None"},
+        {"name": "locked", "type": "bool | None"},
+        {"name": "selected", "type": "bool | None"},
+        {"name": "editable", "type": "bool | None"},
+        {"name": "sliced", "type": "bool | None"},
+        {"name": "position", "type": "Any"},
+        {"name": "geometric_bounds", "type": "Any"},
+        {"name": "visible_bounds", "type": "Any"},
+        {"name": "control_bounds", "type": "Any"},
+        {"name": "width", "type": "Any"},
+        {"name": "height", "type": "Any"},
+        {"name": "opacity", "type": "float | None"},
+        {"name": "parent_name", "type": "str | None"},
+        {"name": "parent_typename", "type": "str | None"},
+        {"name": "layer_name", "type": "str | None"},
+        {"name": "note", "type": "str | None"},
+        {"name": "url", "type": "str | None"},
+        {"name": "file_path", "type": "str | None"},
+        {"name": "file_name", "type": "str | None"},
+        {"name": "bounding_box", "type": "Any"},
+        {"name": "matrix", "type": "Any"},
+        {"name": "typename", "type": "str | None"}
+      ]
+    },
+    {
+      "name": "RasterItemProxy",
+      "properties": [
+        {"name": "id", "type": "Any"},
+        {"name": "index", "type": "int | None"},
+        {"name": "name", "type": "str | None"},
+        {"name": "item_type", "type": "str | None"},
+        {"name": "hidden", "type": "bool | None"},
+        {"name": "locked", "type": "bool | None"},
+        {"name": "selected", "type": "bool | None"},
+        {"name": "editable", "type": "bool | None"},
+        {"name": "sliced", "type": "bool | None"},
+        {"name": "position", "type": "Any"},
+        {"name": "geometric_bounds", "type": "Any"},
+        {"name": "visible_bounds", "type": "Any"},
+        {"name": "control_bounds", "type": "Any"},
+        {"name": "width", "type": "Any"},
+        {"name": "height", "type": "Any"},
+        {"name": "opacity", "type": "float | None"},
+        {"name": "parent_name", "type": "str | None"},
+        {"name": "parent_typename", "type": "str | None"},
+        {"name": "layer_name", "type": "str | None"},
+        {"name": "note", "type": "str | None"},
+        {"name": "url", "type": "str | None"},
+        {"name": "file_path", "type": "str | None"},
+        {"name": "file_name", "type": "str | None"},
+        {"name": "bounding_box", "type": "Any"},
+        {"name": "matrix", "type": "Any"},
+        {"name": "embedded", "type": "bool | None"},
+        {"name": "bits_per_channel", "type": "int | None"},
+        {"name": "channels", "type": "int | None"},
+        {"name": "colorants", "type": "Any"},
+        {"name": "colorized_grayscale", "type": "bool | None"},
+        {"name": "image_color_space", "type": "Any"},
+        {"name": "overprint", "type": "bool | None"},
         {"name": "typename", "type": "str | None"}
       ]
     }
