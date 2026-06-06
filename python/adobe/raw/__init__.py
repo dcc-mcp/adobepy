@@ -73,7 +73,7 @@ def connect(
     *,
     broker_url: str | None = None,
     token: str | None = None,
-    target: str = "default",
+    target: str | None = None,
     timeout: float = 30.0,
 ) -> RawSession:
     return RawSession(host, BrokerClient(broker_url=broker_url, token=token, target=target, timeout=timeout))
@@ -84,7 +84,7 @@ async def connect_async(
     *,
     broker_url: str | None = None,
     token: str | None = None,
-    target: str = "default",
+    target: str | None = None,
     timeout: float = 30.0,
 ) -> RawSession:
     return connect(host, broker_url=broker_url, token=token, target=target, timeout=timeout)
