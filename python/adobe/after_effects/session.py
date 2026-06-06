@@ -19,7 +19,7 @@ class AfterEffects(AfterEffectsSession):
         *,
         broker_url: str | None = None,
         token: str | None = None,
-        target: str = "default",
+        target: str | None = None,
         timeout: float = 30.0,
         client: BrokerClient | None = None,
     ) -> None:
@@ -1629,7 +1629,7 @@ def connect(
     *,
     broker_url: str | None = None,
     token: str | None = None,
-    target: str = "default",
+    target: str | None = None,
     timeout: float = 30.0,
 ) -> AfterEffectsSession:
     return AfterEffects(broker_url=broker_url, token=token, target=target, timeout=timeout)
@@ -1639,7 +1639,7 @@ async def connect_async(
     *,
     broker_url: str | None = None,
     token: str | None = None,
-    target: str = "default",
+    target: str | None = None,
     timeout: float = 30.0,
 ) -> AfterEffectsSession:
     return connect(broker_url=broker_url, token=token, target=target, timeout=timeout)

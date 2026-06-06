@@ -43,7 +43,7 @@ vx just package
 
 The archive is written to `dist/adobepy-0.1.0-windows-x64.zip` with a sibling
 SHA256 file. Usage and packaging notes are in `docs/usage.md` and
-`docs/distribution.md`. Architecture boundaries and Adobe API source tracking
+`docs/distribution-contract.md`. Architecture boundaries and Adobe API source tracking
 are documented in `docs/architecture.md`, `docs/api-sources.md`, and
 `docs/dcc-mcp-integration.md`.
 

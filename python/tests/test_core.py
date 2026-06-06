@@ -7,6 +7,7 @@ import urllib.request
 from unittest import mock
 
 from adobe.core import BrokerClient, BrokerConnectionError, HostSession, UnauthorizedError, connect
+from adobe.photoshop import Photoshop
 from adobe.core.errors import BridgeNotInstalledError, CapabilityError, HostScriptError, MethodNotFoundError, error_from_rpc
 
 
@@ -113,6 +114,24 @@ class CoreTests(unittest.TestCase):
         with mock.patch.object(urllib.request, "urlopen", return_value=FakeResponse(b"no json")):
             with self.assertRaises(BrokerConnectionError):
                 BrokerClient("http://broker.test").capabilities()
+
+    def test_adobepy_target_env_var_in_broker_client(self):
+        with mock.patch.dict(os.environ, {"ADOBEPY_TARGET": "env-target"}):
+            client = BrokerClient()
+            self.assertEqual(client.target, "env-target")
+
+        with mock.patch.dict(os.environ, {"ADOBEPY_TARGET": "env-target"}):
+            client = BrokerClient(target="explicit")
+            self.assertEqual(client.target, "explicit")
+
+    def test_adobepy_target_env_var_in_photoshop(self):
+        with mock.patch.dict(os.environ, {"ADOBEPY_TARGET": "env-target"}):
+            ps = Photoshop()
+            self.assertEqual(ps.client.target, "env-target")
+
+        with mock.patch.dict(os.environ, {"ADOBEPY_TARGET": "env-target"}):
+            ps = Photoshop(target="explicit")
+            self.assertEqual(ps.client.target, "explicit")
 
     def test_session_capabilities_and_raw(self):
         client = CapturingClient()

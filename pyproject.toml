@@ -30,10 +30,10 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/loonghao/adobepy"
-Repository = "https://github.com/loonghao/adobepy"
-"Bug Tracker" = "https://github.com/loonghao/adobepy/issues"
-Documentation = "https://github.com/loonghao/adobepy/tree/main/docs"
+Homepage = "https://github.com/dcc-mcp/adobepy"
+Repository = "https://github.com/dcc-mcp/adobepy"
+"Bug Tracker" = "https://github.com/dcc-mcp/adobepy/issues"
+Documentation = "https://github.com/dcc-mcp/adobepy/tree/main/docs"
 
 [tool.setuptools]
 package-dir = {"" = "python"}
