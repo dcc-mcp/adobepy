@@ -64,10 +64,10 @@ print('SDK import smoke passed')
         throw "adobepy.exe not found at $doctorExe"
     }
 
-    Write-Host "Running adobepy doctor..."
+    Write-Host "Running adobepy doctor --json..."
     Push-Location $extractedRoot.FullName
     try {
-        $doctorOutput = & $doctorExe doctor 2>&1
+        $doctorOutput = & $doctorExe doctor --json 2>&1
         $doctorCode = $LASTEXITCODE
     }
     finally {
@@ -78,13 +78,17 @@ print('SDK import smoke passed')
         throw "adobepy doctor exited with $doctorCode`n$($doctorOutput -join "`n")"
     }
 
-    Write-Host "Doctor output:"
-    Write-Host ($doctorOutput -join "`n")
+    $doctorResults = ($doctorOutput | Out-String).Trim() | ConvertFrom-Json
+    $unexpectedFails = @($doctorResults | Where-Object { -not $_.ok -and $_.name -ne 'broker_port' })
+    if ($unexpectedFails.Count -gt 0) {
+        $details = ($unexpectedFails | ForEach-Object { "  $($_.name): $($_.detail)" }) -join "`n"
+        throw "adobepy doctor found unexpected failures:`n$details"
+    }
 
-    $doctorOutput | ForEach-Object {
-        if ($_ -match '^\s*warn') {
-            Write-Host "Doctor warning (expected in CI): $_"
-        }
+    Write-Host "Doctor results:"
+    $doctorResults | ForEach-Object {
+        $status = if ($_.ok) { " ok " } else { "warn" }
+        Write-Host "  [$status] $($_.name): $($_.detail)"
     }
 
     Write-Host "Install smoke test passed"
