@@ -87,7 +87,7 @@ jobs:
         if: github.event_name == 'release'
         shell: pwsh
         run: |
-          $assets = @(Get-ChildItem dist -Include "*.zip","*.zip.sha256" | ForEach-Object { $_.FullName })
+          $assets = @(Get-ChildItem "dist/*" -Include "*.zip","*.zip.sha256" | ForEach-Object { $_.FullName })
           if ($assets.Count -eq 0) { throw "No release assets found in dist/" }
           gh release upload ${{ github.event.release.tag_name }} $assets --clobber
         env:
