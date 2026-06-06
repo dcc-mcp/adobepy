@@ -432,7 +432,7 @@ def render_pyi(contract: HostIr) -> str:
         "",
         "",
         f"class {class_name}({session_name}):",
-        "    def __init__(self, *, broker_url: str | None = ..., token: str | None = ..., target: str = \"default\", timeout: float = ..., client: BrokerClient | None = ...) -> None: ...",
+        "    def __init__(self, *, broker_url: str | None = ..., token: str | None = ..., target: str | None = None, timeout: float = ..., client: BrokerClient | None = ...) -> None: ...",
     ]
 
     app = contract.namespace("app")
