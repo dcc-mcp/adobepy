@@ -54,6 +54,8 @@ jobs:
   windows-package:
     name: Build Windows package artifact
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -69,9 +71,20 @@ jobs:
       - name: Package
         shell: pwsh
         run: ./scripts/package-release.ps1
+      - name: Install smoke test
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist -Filter "adobepy-*-windows-x64.zip" | Select-Object -First 1
+          if (-not $zip) { throw "package zip was not created" }
+          ./scripts/smoke_install.ps1 -ZipPath $zip.FullName
       - uses: actions/upload-artifact@v4
         with:
           name: adobepy-windows-x64
           path: |
             dist/*.zip
             dist/*.zip.sha256
+      - name: Upload to GitHub Release
+        if: github.event_name == 'release'
+        run: gh release upload ${{ github.event.release.tag_name }} dist/*.zip dist/*.zip.sha256 --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

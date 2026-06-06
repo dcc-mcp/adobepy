@@ -29,6 +29,7 @@
     "abi3:check": "python scripts/check_native_abi3_config.py",
     "capabilities:check": "node scripts/check-bridge-capabilities.js",
     "smoke:photoshop:live": "python scripts/live_photoshop_smoke.py",
+    "smoke:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke_install.ps1",
     "lint:python": "python -m compileall -q python generators scripts && npm run protocol:check && npm run architecture:check && npm run facades:check && npm run stubs:check && npm run api:sources:validate && npm run abi3:check",
     "lint:typescript": "npm run bridge:check",
     "lint:rust": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings",
