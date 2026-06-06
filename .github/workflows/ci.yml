@@ -102,6 +102,11 @@ jobs:
           $zip = Get-ChildItem dist -Filter "adobepy-*-windows-x64.zip" | Select-Object -First 1
           if (-not $zip) { throw "package zip was not created" }
           if (-not (Test-Path "$($zip.FullName).sha256")) { throw "package checksum was not created" }
+      - name: Install smoke test
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist -Filter "adobepy-*-windows-x64.zip" | Select-Object -First 1
+          ./scripts/smoke_install.ps1 -ZipPath $zip.FullName
       - uses: actions/upload-artifact@v4
         with:
           name: adobepy-windows-x64
