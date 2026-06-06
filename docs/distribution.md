@@ -1,5 +1,9 @@
 # Distribution Packaging
 
+> **Note:** This document covers packaging mechanics. For the public distribution
+> contract (PyPI, GitHub Release, supported platforms), see
+> [`distribution-contract.md`](distribution-contract.md).
+
 Use `vx just package` to build a redistributable archive for the current
 platform.
 
@@ -39,7 +43,7 @@ template is configured for PyO3 `abi3-py38`, and the wheel tag validator still
 rejects CPython-minor native tags such as `cp312-cp312`.
 
 PyPI publishing uses trusted publishing. The PyPI publisher entry must point to
-repository `loonghao/adobepy`, workflow `.github/workflows/release.yml`, and
+repository `dcc-mcp/adobepy`, workflow `.github/workflows/release.yml`, and
 environment `pypi`.
 
 Keep repository-level GitHub Actions workflow permissions at read-only by
@@ -84,7 +88,7 @@ PyPI trusted publisher configuration:
 
 | Field | Value |
 | --- | --- |
-| Repository owner | `loonghao` |
+| Repository owner | `dcc-mcp` |
 | Repository name | `adobepy` |
 | Workflow | `release.yml` |
 | Environment | `pypi` |
