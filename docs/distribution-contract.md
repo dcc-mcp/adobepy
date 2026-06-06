@@ -38,7 +38,7 @@ permissions:
 
 | Field | Value |
 | --- | --- |
-| Repository owner | `loonghao` |
+| Repository owner | `dcc-mcp` |
 | Repository name | `adobepy` |
 | Workflow | `release.yml` |
 | Environment | `pypi` |
@@ -92,8 +92,12 @@ adobepy-<version>-windows-x64.zip.sha256
 
 ```
 adobepy-<version>-windows-x64/
-  adobepy.exe              # Rust CLI (broker, doctor, install-bridge, repl)
-  python/                  # Bundled embedded Python runtime (optional)
+  bin/
+    adobepy.exe            # Rust CLI (broker, doctor, install-bridge, repl)
+    adobepy.pdb            # Debug symbols (optional)
+  wheels/
+    adobepy-<version>-py3-none-any.whl
+  python/                  # Python SDK source tree (python/adobe)
   bridges/
     uxp/
       photoshop/
@@ -102,10 +106,18 @@ adobepy-<version>-windows-x64/
     cep/
       after-effects/
       illustrator/
-  install.ps1              # One-shot installer (adds to PATH, installs bridges)
+  docs/                    # Operation docs
+  generators/              # IR contracts and generators
+  install.ps1              # One-shot installer (installs wheel, optionally adds bin/ to PATH)
+  DISTRIBUTION-README.md
+  package-manifest.json
   README.md
-  LICENSE-MIT
-  LICENSE-APACHE
+  pyproject.toml
+  package.json
+  package-lock.json
+  Cargo.toml
+  Cargo.lock
+  python-runtime/          # Bundled embedded Python runtime (optional, only with -IncludePortablePython)
 ```
 
 ### Build pipeline
@@ -158,7 +170,7 @@ Python SDK version is bumped to match.
 | --- | --- | --- |
 | Install Python SDK only | Yes | No |
 | Run broker + CLI | No | Yes |
-| Install bridge templates | No | Yes |
+| Install bridge templates | No | Yes (manual copy from archive) |
 | CI dependency (`adobepy>=0.1.0`) | Yes | No |
 | Manual Windows install | Recommend both | Yes |
 | macOS / Linux brokering | No | No (Phase 1) |

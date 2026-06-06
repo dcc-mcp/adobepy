@@ -14,8 +14,6 @@ When a DCC MCP adapter needs to locate `adobepy.exe` (the broker CLI), it
 | --- | --- | --- |
 | 1 | `ADOBEPY_BROKER_PATH` environment variable | `C:\tools\adobepy\bin\adobepy.exe` |
 | 2 | `PATH` search | `where adobepy.exe` / `adobepy` on PATH |
-| 3 | `InstallDir` registry key | See §1.3 |
-| 4 | Well-known install directories | See §1.4 |
 
 ### 1.1 Environment Variable: `ADOBEPY_BROKER_PATH`
 
@@ -26,7 +24,6 @@ steps.
 ```python
 import os
 import shutil
-import subprocess
 
 
 def resolve_adobepy_broker() -> str | None:
@@ -38,8 +35,7 @@ def resolve_adobepy_broker() -> str | None:
     if resolved:
         return resolved
 
-    # fall through to registry and well-known paths
-    ...
+    return None
 ```
 
 ### 1.2 PATH Search
@@ -48,65 +44,9 @@ If `ADOBEPY_BROKER_PATH` is not set, the adapter calls the platform equivalent
 of `where adobepy.exe`. The standard Python API `shutil.which("adobepy")` is
 sufficient.
 
-### 1.3 Registry Key (Windows)
-
-If the broker was installed via `install.ps1`, the following registry value is
-set:
-
-```
-Key:   HKCU\Software\Adobe\adobepy
-Value: InstallDir
-Type:  REG_SZ
-Data:  C:\Users\<user>\AppData\Local\adobepy
-```
-
-The adapter reads this key and appends `bin\adobepy.exe`:
-
-```python
-import os
-import winreg
-
-
-def find_broker_via_registry() -> str | None:
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Adobe\adobepy",
-        ) as key:
-            install_dir = winreg.QueryValueEx(key, "InstallDir")[0]
-    except OSError:
-        return None
-    candidate = os.path.join(install_dir, "bin", "adobepy.exe")
-    return candidate if os.path.isfile(candidate) else None
-```
-
-### 1.4 Well-Known Install Directories
-
-If none of the above find the binary, the adapter checks these paths in order:
-
-1. `%LOCALAPPDATA%\adobepy\bin\adobepy.exe`
-2. `%ProgramFiles%\adobepy\bin\adobepy.exe`
-3. `%ProgramFiles(x86)%\adobepy\bin\adobepy.exe`
-
-```python
-import os
-
-
-def find_broker_via_wellknown() -> str | None:
-    local = os.environ.get("LOCALAPPDATA", "")
-    progfiles = os.environ.get("ProgramFiles", "")
-    progfiles32 = os.environ.get("ProgramFiles(x86)", "")
-
-    candidates = [
-        os.path.join(local, "adobepy", "bin", "adobepy.exe"),
-        os.path.join(progfiles, "adobepy", "bin", "adobepy.exe"),
-        os.path.join(progfiles32, "adobepy", "bin", "adobepy.exe"),
-    ]
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-```
+When the release bundle is installed with `install.ps1 -AddToUserPath`, the
+unpack directory's `bin\` is added to the user `PATH`, which makes `adobepy`
+resolvable via `shutil.which()` in new terminal sessions.
 
 ---
 
@@ -223,18 +163,18 @@ app = Photoshop()
 
 ---
 
-## 7. Registry Integration (install.ps1)
+## 7. install.ps1 Behavior
 
-When the Windows bundle is installed via `install.ps1`, the installer:
+The `install.ps1` script bundled in the release archive has a limited scope:
 
-1. Extracts the archive to `%LOCALAPPDATA%\adobepy\<version>\`.
-2. Creates a junction `%LOCALAPPDATA%\adobepy\current` pointing to the
-   versioned directory.
-3. Adds `%LOCALAPPDATA%\adobepy\current\bin` to the user `PATH`.
-4. Writes `HKCU\Software\Adobe\adobepy\InstallDir` =
-   `%LOCALAPPDATA%\adobepy\current`.
-5. Optionally installs bridge templates into Adobe application plugin
-   directories.
+1. Finds the first `*.whl` file in the `wheels/` directory.
+2. Installs the wheel via `pip install --user --force-reinstall`.
+3. If `-AddToUserPath` is passed, adds the archive's `bin\` directory to the
+   user `PATH`.
 
-Multiple versions may coexist under `%LOCALAPPDATA%\adobepy\<version>\`; the
-`current` junction always points to the most recently installed version.
+It does **not** write registry keys, create versioned directories or junctions,
+or automatically install bridge templates into Adobe plugin directories. Those
+capabilities are out of scope for Phase 1.
+
+The user is expected to extract the archive to a location of their choice and
+run `install.ps1` from that extracted directory.
