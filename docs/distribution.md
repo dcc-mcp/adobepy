@@ -1,7 +1,7 @@
 # Distribution Packaging
 
 > **Note:** This document covers packaging mechanics. For the public distribution
-> contract (PyPI, GitHub Release, supported platforms), see
+> contract (PyPI, GitHub Actions artifact, supported platforms), see
 > [`distribution-contract.md`](distribution-contract.md).
 
 Use `vx just package` to build a redistributable archive for the current

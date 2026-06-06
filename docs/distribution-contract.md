@@ -5,12 +5,13 @@
 | Artifact | Where | Consumers |
 | --- | --- | --- |
 | `adobepy` Python wheel | PyPI | DCC MCP adapters, skill scripts, end-user Python code |
-| `adobepy-<version>-windows-x64.zip` | GitHub Release | dcc-mcp-photoshop, host runners, manual installs |
-| `adobepy-<version>-windows-x64.zip.sha256` | GitHub Release | Integrity verification |
+| `adobepy-<version>-windows-x64.zip` | GitHub Actions (release workflow artifact) | dcc-mcp-photoshop, host runners, manual installs |
+| `adobepy-<version>-windows-x64.zip.sha256` | GitHub Actions (release workflow artifact) | Integrity verification |
 
 The two channels are independent: PyPI contains **only** the Python SDK, and the
-GitHub Release asset contains **only** the broker/runtime bundle. A consumer that
-needs both must install from both channels.
+GitHub Actions artifact contains **only** the broker/runtime bundle. A consumer that
+needs both must install from both channels. To attach the bundle to a GitHub Release
+page, download the artifact from the Actions run and upload it manually.
 
 ---
 
@@ -79,7 +80,7 @@ facades.
 
 ---
 
-## 2. GitHub Release — Windows Runtime Bundle
+## 2. GitHub Actions Artifact — Windows Runtime Bundle
 
 ### Archive naming
 
@@ -138,14 +139,20 @@ named `adobepy-windows-x64`.
 
 ### Release workflow
 
-1. A maintainer creates a GitHub Release from a tag (e.g. `v0.1.0`).
-2. The `release.yml` workflow runs:
+1. A maintainer creates a GitHub Release from a tag (e.g. `v0.1.0`). The
+   `release.yml` workflow is triggered by the `release.published` event
+   (or manually via `workflow_dispatch`).
+2. The workflow runs:
    - `python-package`: builds, checks, and smoke-installs the Python wheel.
    - `pypi`: publishes the wheel to PyPI (only on `release` event or manual
      `publish_to_pypi=true`).
-   - `windows-package`: builds the full Windows bundle and uploads artifacts.
-3. After the workflow completes, the release draft is published so the `.zip`
-   artifact is attached to the GitHub Release page.
+   - `windows-package`: builds the full Windows bundle and uploads the `.zip`
+     and `.sha256` as a GitHub Actions workflow artifact named
+     `adobepy-windows-x64`.
+3. The Windows bundle is available as a **GitHub Actions workflow artifact**
+   (not automatically attached to the GitHub Release page). To attach it to
+   the Release, download the artifact from the Actions run and upload it
+   manually via the GitHub Release UI or `gh release upload`.
 
 ### Version scheme
 
@@ -157,7 +164,7 @@ Windows bundle share the same version string.
 
 ## 3. Version Lockstep
 
-The PyPI package and the GitHub Release asset always share the same version.
+The PyPI package and the GitHub Actions artifact always share the same version.
 There is no mechanism to publish a Python SDK `0.2.0` while the runtime bundle
 stays at `0.1.0`. If a breaking change is made to the broker protocol, the
 Python SDK version is bumped to match.
@@ -166,7 +173,7 @@ Python SDK version is bumped to match.
 
 ## 4. Channel Boundaries
 
-| Scenario | PyPI | GitHub Release |
+| Scenario | PyPI | GitHub Actions Artifact |
 | --- | --- | --- |
 | Install Python SDK only | Yes | No |
 | Run broker + CLI | No | Yes |
