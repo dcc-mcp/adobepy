@@ -135,7 +135,7 @@ without explicit arguments:
 ```python
 from adobe.photoshop import Photoshop
 
-# Uses ADOBEPY_BROKER_URL and ADOBEPY_TOKEN from the environment
+# Uses ADOBEPY_BROKER_URL, ADOBEPY_TOKEN, and ADOBEPY_TARGET from the environment
 app = Photoshop()
 ```
 
