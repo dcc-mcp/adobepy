@@ -31,10 +31,12 @@ def make_exe():
         config=python_config,
     )
 
-    # Install the pre-built adobepy wheel.
+    # Install the pre-built adobepy wheel.  ADOBEPY_WHEEL is required — the
+    # caller (CI or local) must pass --var ADOBEPY_WHEEL <path-to-wheel>.
     wheel_path = VARS.get("ADOBEPY_WHEEL")
-    if wheel_path:
-        exe.add_python_resources(exe.pip_install([wheel_path]))
+    if not wheel_path:
+        fail("ADOBEPY_WHEEL variable is required: pass --var ADOBEPY_WHEEL <path-to-wheel> to pyoxidizer build")
+    exe.add_python_resources(exe.pip_install([wheel_path]))
 
     return exe
 
