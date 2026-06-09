@@ -1,6 +1,6 @@
 {
   "name": "adobepy",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Shared Adobe desktop communication runtime for Python and DCC MCP adapters.",
   "scripts": {

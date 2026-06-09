@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adobepy"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python SDK and broker contracts for controlling Adobe desktop hosts through UXP and CEP bridges."
 readme = "README.md"
 requires-python = ">=3.8"
