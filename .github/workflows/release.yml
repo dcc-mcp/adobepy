@@ -124,6 +124,7 @@ jobs:
         run: |
           $buildDir = Get-ChildItem build/*/release/install -Directory | Select-Object -First 1
           if (-not $buildDir) { throw "PyOxidizer build output not found" }
+          echo "STANDALONE_BUILD_DIR=$($buildDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ASCII
           $runtimeId = "windows-x64"
           $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
           $packageName = "adobepy-standalone-$version-$runtimeId"
@@ -132,6 +133,13 @@ jobs:
           Compress-Archive -Path "$($buildDir.FullName)/*" -DestinationPath (Join-Path $distDir "$packageName.zip") -Force
           $hash = -join ((Get-FileHash (Join-Path $distDir "$packageName.zip") -Algorithm SHA256).Hash | ForEach-Object { $_.ToLower() })
           "$hash  $packageName.zip" | Out-File -FilePath (Join-Path $distDir "$packageName.zip.sha256") -Encoding ASCII
+      - name: Smoke test standalone interpreter
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:STANDALONE_BUILD_DIR "adobepy-python"
+          & $exe --version
+          & $exe -c "from adobe.photoshop import Photoshop; print('standalone smoke OK')"
+          if ($LASTEXITCODE -ne 0) { throw "standalone interpreter smoke failed" }
       - uses: actions/upload-artifact@v4
         with:
           name: adobepy-standalone-windows-x64
@@ -177,14 +185,21 @@ jobs:
         run: |
           build_dir=$(ls -d build/*/release/install 2>/dev/null | head -1)
           if [ -z "$build_dir" ]; then echo "PyOxidizer build output not found"; exit 1; fi
+          echo "STANDALONE_BUILD_DIR=$build_dir" >> $GITHUB_ENV
           arch="$(uname -m)"
           if [ "$arch" = "arm64" ]; then runtime_id="macos-arm64"; else runtime_id="macos-x64"; fi
           version=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
           package_name="adobepy-standalone-$version-$runtime_id"
-          mkdir -p dist
-          (cd "$build_dir" && zip -r "$(pwd)/../../../../dist/$package_name.zip" .)
-          hash=$(sha256sum "dist/$package_name.zip" | cut -d' ' -f1)
-          echo "$hash  $package_name.zip" > "dist/$package_name.zip.sha256"
+          dist_dir="${{ github.workspace }}/dist"
+          mkdir -p "$dist_dir"
+          (cd "$build_dir" && zip -r "$dist_dir/$package_name.zip" .)
+          hash=$(sha256sum "$dist_dir/$package_name.zip" | cut -d' ' -f1)
+          echo "$hash  $package_name.zip" > "$dist_dir/$package_name.zip.sha256"
+      - name: Smoke test standalone interpreter
+        shell: bash
+        run: |
+          "$STANDALONE_BUILD_DIR/adobepy-python" --version
+          "$STANDALONE_BUILD_DIR/adobepy-python" -c "from adobe.photoshop import Photoshop; print('standalone smoke OK')"
       - uses: actions/upload-artifact@v4
         with:
           name: adobepy-standalone-macos
@@ -230,14 +245,21 @@ jobs:
         run: |
           build_dir=$(ls -d build/*/release/install 2>/dev/null | head -1)
           if [ -z "$build_dir" ]; then echo "PyOxidizer build output not found"; exit 1; fi
+          echo "STANDALONE_BUILD_DIR=$build_dir" >> $GITHUB_ENV
           arch="$(uname -m)"
           if [ "$arch" = "aarch64" ]; then runtime_id="linux-arm64"; else runtime_id="linux-x64"; fi
           version=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
           package_name="adobepy-standalone-$version-$runtime_id"
-          mkdir -p dist
-          (cd "$build_dir" && zip -r "$(pwd)/../../../../dist/$package_name.zip" .)
-          hash=$(sha256sum "dist/$package_name.zip" | cut -d' ' -f1)
-          echo "$hash  $package_name.zip" > "dist/$package_name.zip.sha256"
+          dist_dir="${{ github.workspace }}/dist"
+          mkdir -p "$dist_dir"
+          (cd "$build_dir" && zip -r "$dist_dir/$package_name.zip" .)
+          hash=$(sha256sum "$dist_dir/$package_name.zip" | cut -d' ' -f1)
+          echo "$hash  $package_name.zip" > "$dist_dir/$package_name.zip.sha256"
+      - name: Smoke test standalone interpreter
+        shell: bash
+        run: |
+          "$STANDALONE_BUILD_DIR/adobepy-python" --version
+          "$STANDALONE_BUILD_DIR/adobepy-python" -c "from adobe.photoshop import Photoshop; print('standalone smoke OK')"
       - uses: actions/upload-artifact@v4
         with:
           name: adobepy-standalone-linux
