@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.2.0...adobepy-v0.3.0) (2026-06-09)
+
+
+### Features
+
+* add PyOxidizer standalone interpreter build to release workflow ([2c41083](https://github.com/dcc-mcp/adobepy/commit/2c410834c7d11e1e2f6002dedd00062f8dffba43))
+
+
+### Bug Fixes
+
+* address review feedback on PyOxidizer standalone interpreter build ([10c8757](https://github.com/dcc-mcp/adobepy/commit/10c8757809d58c7fd8443ab432a6985b4c2be9e9))
+* trigger CI on release-please PRs using a PAT ([4fa5bfd](https://github.com/dcc-mcp/adobepy/commit/4fa5bfd784833d45efdc6ecd6753eaee24cf61e5))
+
 ## [0.2.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.1.0...adobepy-v0.2.0) (2026-06-08)
 
 
