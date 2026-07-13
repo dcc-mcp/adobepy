@@ -76,6 +76,28 @@ function error(message) {
 
 async function testPhotoshopBridge() {
   const events = [];
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "bridges/uxp/photoshop/manifest.json"), "utf8"));
+  assert.strictEqual(manifest.requiredPermissions.localFileSystem, "fullAccess");
+  let fileAccessFails = false;
+  let pickerCalled = false;
+  const localFileSystem = {
+    createEntryWithUrl: async (url) => {
+      if (fileAccessFails) throw new Error("full access denied");
+      return { url };
+    },
+    getFileForSaving: async () => {
+      pickerCalled = true;
+      return { url: "picker://unexpected" };
+    },
+    getEntryWithUrl: async (url) => ({ url }),
+    createSessionToken: async (entry) => `token:${entry.url}`
+  };
+  class SolidColor {
+    constructor() {
+      this.typename = "SolidColor";
+      this.rgb = { red: 255, green: 255, blue: 255 };
+    }
+  }
   const channels = [
     {
       id: 21,
@@ -191,7 +213,7 @@ async function testPhotoshopBridge() {
   };
   const env = await loadBundle("bridges/uxp/photoshop/dist/main.js", {
     photoshop: {
-      app: { version: "26.5.1", activeDocument: document, documents: [document] },
+      app: { version: "26.5.1", activeDocument: document, documents: [document], SolidColor },
       action: {
         batchPlay: async (descriptors, options) => {
           events.push({ kind: "batchPlay", descriptors, options });
@@ -208,11 +230,7 @@ async function testPhotoshopBridge() {
     },
     uxp: {
       storage: {
-        localFileSystem: {
-          createEntryWithUrl: async (url) => ({ url }),
-          getEntryWithUrl: async (url) => ({ url }),
-          createSessionToken: async (entry) => `token:${entry.url}`
-        }
+        localFileSystem
       }
     }
   });
@@ -250,6 +268,9 @@ async function testPhotoshopBridge() {
   assert.strictEqual(result(await rpc(env, "photoshop", "text", "getByLayerId", [7])).characterStyle.size, 24);
   assert.strictEqual(result(await rpc(env, "photoshop", "text", "setContents", [7, "World"], { modal: true })).contents, "World");
   assert.strictEqual(result(await rpc(env, "photoshop", "text", "setCharacterStyle", [7, { size: 36, tracking: 20 }], { modal: true })).characterStyle.size, 36);
+  await rpc(env, "photoshop", "text", "setCharacterStyle", [7, { color: { rgb: { red: 77, green: 232, blue: 255 } } }], { modal: true });
+  assert.ok(textItem.characterStyle.color instanceof SolidColor);
+  assert.deepStrictEqual(textItem.characterStyle.color.rgb, { red: 77, green: 232, blue: 255 });
   assert.strictEqual(result(await rpc(env, "photoshop", "text", "setParagraphStyle", [7, { justification: "center" }], { modal: true })).paragraphStyle.justification, "center");
   assert.strictEqual(result(await rpc(env, "photoshop", "text", "setTextClickPoint", [7, { x: 4, y: 5 }], { modal: true })).textClickPoint.x, 4);
   assert.strictEqual(result(await rpc(env, "photoshop", "text", "setOrientation", [7, "vertical"], { modal: true })).orientation, "vertical");
@@ -285,6 +306,10 @@ async function testPhotoshopBridge() {
   assert.ok(events.some((event) => event.kind === "batchPlay" && event.descriptors.some((descriptor) => descriptor._obj === "newPlacedLayer")));
   assert.ok(events.some((event) => event.kind === "batchPlay" && event.descriptors.some((descriptor) => descriptor._obj === "placedLayerReplaceContents")));
   assert.ok(events.some((event) => event.kind === "saveAs" && event.url === "file:///C:/out.jpg" && event.options.quality === 10));
+
+  fileAccessFails = true;
+  assert.match(error(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/blocked.psd", format: "psd" }], { modal: true })).message, /full access/i);
+  assert.strictEqual(pickerCalled, false);
 }
 
 async function testInDesignBridge() {
@@ -751,7 +776,7 @@ function testManifestPermissions() {
       domains === "all" || domains.includes("ws://127.0.0.1:47391"),
       `${host} manifest must allow broker WebSocket`
     );
-    if (host === "photoshop") assert.strictEqual(manifest.requiredPermissions.localFileSystem, "request");
+    if (host === "photoshop") assert.strictEqual(manifest.requiredPermissions.localFileSystem, "fullAccess");
   }
 }
 
