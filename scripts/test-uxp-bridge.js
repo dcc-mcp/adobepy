@@ -80,8 +80,10 @@ async function testPhotoshopBridge() {
   assert.strictEqual(manifest.requiredPermissions.localFileSystem, "fullAccess");
   let fileAccessFails = false;
   let pickerCalled = false;
+  const entryRequests = [];
   const localFileSystem = {
-    createEntryWithUrl: async (url) => {
+    createEntryWithUrl: async (url, options) => {
+      entryRequests.push({ url, options });
       if (fileAccessFails) throw new Error("full access denied");
       return { url };
     },
@@ -306,6 +308,9 @@ async function testPhotoshopBridge() {
   assert.ok(events.some((event) => event.kind === "batchPlay" && event.descriptors.some((descriptor) => descriptor._obj === "newPlacedLayer")));
   assert.ok(events.some((event) => event.kind === "batchPlay" && event.descriptors.some((descriptor) => descriptor._obj === "placedLayerReplaceContents")));
   assert.ok(events.some((event) => event.kind === "saveAs" && event.url === "file:///C:/out.jpg" && event.options.quality === 10));
+  assert.ok(entryRequests.length >= 2);
+  assert.ok(entryRequests.every((request) => request.options && request.options.overwrite === true));
+  assert.ok(entryRequests.every((request) => !("type" in request.options)));
 
   fileAccessFails = true;
   assert.match(error(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/blocked.psd", format: "psd" }], { modal: true })).message, /full access/i);

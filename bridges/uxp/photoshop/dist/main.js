@@ -872,7 +872,7 @@
     const createEntryWithUrl = property(localFileSystem, "createEntryWithUrl");
     if (createEntryWithUrl) {
       try {
-        return await maybePromise(createEntryWithUrl.call(localFileSystem, toFileUrl(path), { type: "file", overwrite: true }));
+        return await maybePromise(createEntryWithUrl.call(localFileSystem, toFileUrl(path), { overwrite: true }));
       } catch (error) {
         throw new Error(`Photoshop bridge cannot write '${path}' without localFileSystem full access: ${String(error)}`);
       }
