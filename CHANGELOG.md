@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.3.0...adobepy-v0.3.1) (2026-07-13)
+
+
+### Bug Fixes
+
+* support headless Photoshop output ([#31](https://github.com/dcc-mcp/adobepy/issues/31)) ([7bdbe80](https://github.com/dcc-mcp/adobepy/commit/7bdbe809d7709ec9a46a44a029bccbac542e5dc8))
+
 ## [0.3.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.2.0...adobepy-v0.3.0) (2026-06-09)
 
 
