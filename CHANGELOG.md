@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.3.1...adobepy-v0.3.2) (2026-07-13)
+
+
+### Bug Fixes
+
+* create Photoshop export file entries ([#33](https://github.com/dcc-mcp/adobepy/issues/33)) ([446c668](https://github.com/dcc-mcp/adobepy/commit/446c668c5f1a4023151b64feb51b3bdf217ee822))
+
 ## [0.3.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.3.0...adobepy-v0.3.1) (2026-07-13)
 
 
