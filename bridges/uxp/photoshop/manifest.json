@@ -19,7 +19,7 @@
     "network": {
       "domains": "all"
     },
-    "localFileSystem": "request"
+    "localFileSystem": "fullAccess"
   },
   "main": "index.html"
 }

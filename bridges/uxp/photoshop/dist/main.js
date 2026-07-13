@@ -114,9 +114,6 @@
   async function maybePromise(value) {
     return await value;
   }
-  function fileName(path) {
-    return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
-  }
   function toFileUrl(path) {
     if (/^file:\/\//i.test(path)) return path;
     const normalized = path.replace(/\\/g, "/");
@@ -558,10 +555,27 @@
     if (!isObject(style)) unavailable(`Photoshop textItem.${styleName}`);
     return withModal(request, defaultCommandName, async () => {
       for (const [key, value] of Object.entries(isObject(properties) ? properties : {})) {
-        style[key] = value;
+        style[key] = styleName === "characterStyle" && key === "color" ? solidColor(value) : value;
       }
       return serializeTextItem(textItem, findLayer(request.args?.[0]));
     });
+  }
+  function solidColor(value) {
+    const payload = isObject(value) && isObject(value.rgb) ? value.rgb : value;
+    if (!isObject(payload)) return value;
+    const red = asNumber(payload.red);
+    const green = asNumber(payload.green);
+    const blue = asNumber(payload.blue);
+    if (red === void 0 || green === void 0 || blue === void 0) return value;
+    const SolidColor = property(photoshopApp(), "SolidColor");
+    if (!SolidColor) unavailable("Photoshop app.SolidColor");
+    const color = new SolidColor();
+    const rgb = property(color, "rgb");
+    if (!rgb) unavailable("Photoshop SolidColor.rgb");
+    rgb.red = red;
+    rgb.green = green;
+    rgb.blue = blue;
+    return color;
   }
   async function textCall(request, method, defaultCommandName) {
     const textItem = requiredTextItem(request.args?.[0]);
@@ -859,12 +873,11 @@
     if (createEntryWithUrl) {
       try {
         return await maybePromise(createEntryWithUrl.call(localFileSystem, toFileUrl(path), { type: "file", overwrite: true }));
-      } catch {
+      } catch (error) {
+        throw new Error(`Photoshop bridge cannot write '${path}' without localFileSystem full access: ${String(error)}`);
       }
     }
-    const getFileForSaving = property(localFileSystem, "getFileForSaving");
-    if (getFileForSaving) return await maybePromise(getFileForSaving.call(localFileSystem, fileName(path)));
-    return path;
+    unavailable("UXP localFileSystem.createEntryWithUrl (fullAccess required for headless save)");
   }
   async function actionFileReference(path) {
     const entry = await fileEntryForOpening(path);

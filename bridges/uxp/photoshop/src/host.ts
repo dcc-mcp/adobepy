@@ -6,7 +6,6 @@ import {
   asNumber,
   asString,
   evalJavaScript,
-  fileName,
   isObject,
   maybePromise,
   optionalRequire,
@@ -15,6 +14,7 @@ import {
 } from "../../core/src/runtime";
 
 type Callable = (...args: unknown[]) => unknown;
+type Constructable = new () => Record<string, unknown>;
 
 const FILTER_METHOD_PREFIX = "apply";
 
@@ -481,10 +481,28 @@ async function textSetNestedProperties(request: RpcRequest, styleName: string, p
   if (!isObject(style)) unavailable(`Photoshop textItem.${styleName}`);
   return withModal(request, defaultCommandName, async () => {
     for (const [key, value] of Object.entries(isObject(properties) ? properties : {})) {
-      (style as Record<string, unknown>)[key] = value;
+      (style as Record<string, unknown>)[key] = styleName === "characterStyle" && key === "color" ? solidColor(value) : value;
     }
     return serializeTextItem(textItem, findLayer(request.args?.[0]));
   });
+}
+
+function solidColor(value: unknown): unknown {
+  const payload = isObject(value) && isObject(value.rgb) ? value.rgb : value;
+  if (!isObject(payload)) return value;
+  const red = asNumber(payload.red);
+  const green = asNumber(payload.green);
+  const blue = asNumber(payload.blue);
+  if (red === undefined || green === undefined || blue === undefined) return value;
+  const SolidColor = property<Constructable>(photoshopApp(), "SolidColor");
+  if (!SolidColor) unavailable("Photoshop app.SolidColor");
+  const color = new SolidColor();
+  const rgb = property<Record<string, unknown>>(color, "rgb");
+  if (!rgb) unavailable("Photoshop SolidColor.rgb");
+  rgb.red = red;
+  rgb.green = green;
+  rgb.blue = blue;
+  return color;
 }
 
 async function textCall(request: RpcRequest, method: string, defaultCommandName: string) {
@@ -814,13 +832,11 @@ async function fileEntry(path: string) {
   if (createEntryWithUrl) {
     try {
       return await maybePromise(createEntryWithUrl.call(localFileSystem, toFileUrl(path), { type: "file", overwrite: true }));
-    } catch {
-      // Some hosts only allow picker-backed entries; fall through to getFileForSaving.
+    } catch (error) {
+      throw new Error(`Photoshop bridge cannot write '${path}' without localFileSystem full access: ${String(error)}`);
     }
   }
-  const getFileForSaving = property<Callable>(localFileSystem, "getFileForSaving");
-  if (getFileForSaving) return await maybePromise(getFileForSaving.call(localFileSystem, fileName(path)));
-  return path;
+  unavailable("UXP localFileSystem.createEntryWithUrl (fullAccess required for headless save)");
 }
 
 async function actionFileReference(path: string) {
