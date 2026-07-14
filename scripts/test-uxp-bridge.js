@@ -296,6 +296,19 @@ async function testPhotoshopBridge() {
   );
   assert.strictEqual(result(await rpc(env, "photoshop", "raw", "getPath", [["app", "activeDocument", "layers", 0, "name"]], {})), "Layer 1");
   assert.deepStrictEqual(result(await rpc(env, "photoshop", "action", "batchPlay", [[{ _obj: "hide" }], { synchronousExecution: true }], { modal: true, commandName: "Hide" })), [{ _obj: "hide" }]);
+  assert.deepStrictEqual(
+    result(
+      await rpc(
+        env,
+        "photoshop",
+        "action",
+        "batchPlay",
+        [[{ _obj: "placeEvent", null: { _path: "C:/composite.png", _kind: "local" } }], {}],
+        { modal: true }
+      )
+    ),
+    [{ _obj: "placeEvent", null: { _path: "token:file:///C:/composite.png", _kind: "local" } }]
+  );
   assert.deepStrictEqual(result(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/out.psd", format: "psd" }], { modal: true, commandName: "Save" })).id, 9);
   assert.strictEqual(result(await rpc(env, "photoshop", "raw", "evalJs", ["1 + 1"])), 2);
   assert.strictEqual(error(await rpc(env, "photoshop", "bad", "missing")).code, -32601);
