@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.4.1...adobepy-v0.5.0) (2026-07-14)
+
+
+### Features
+
+* add After Effects layer ordering ([#44](https://github.com/dcc-mcp/adobepy/issues/44)) ([2b7d0d0](https://github.com/dcc-mcp/adobepy/commit/2b7d0d03d5a1f91f4bf32eceed087e5acb88ba9e))
+
 ## [0.4.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.4.0...adobepy-v0.4.1) (2026-07-14)
 
 
