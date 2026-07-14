@@ -1,6 +1,7 @@
 import unittest
 
 from adobe.after_effects import AfterEffects
+from adobe.after_effects.session import LayerProxy
 from adobe.indesign import InDesign
 from adobe.illustrator import Illustrator
 from adobe.photoshop import Photoshop, PhotoshopSession, connect as connect_photoshop
@@ -840,7 +841,17 @@ class CapturingClient:
                 "hasAudio": False,
                 "typename": "TextLayer",
             }
-            if method in {"createText", "createSolid", "createFootage", "setTransform", "setKeyframes"}:
+            if method in {
+                "createText",
+                "createSolid",
+                "createFootage",
+                "setTransform",
+                "setKeyframes",
+                "moveToBeginning",
+                "moveToEnd",
+                "moveBefore",
+                "moveAfter",
+            }:
                 return text_layer
             av_layer = {
                 **text_layer,
@@ -1353,9 +1364,15 @@ class FacadeTests(unittest.TestCase):
         created_layer = created_comp.add_text_layer("DCC MCP")
         self.assertEqual(created_layer.name, "Title")
         created_comp.add_solid_layer([0.0, 0.1, 0.2])
-        created_comp.add_footage_layer(imported)
+        footage_layer = created_comp.add_footage_layer(imported)
         created_layer.set_transform(position=[960, 540], opacity=100)
         created_layer.set_keyframes("scale", [{"time": 0, "value": [0, 0]}, {"time": 1, "value": [100, 100]}])
+        footage_layer.move_to_end()
+        footage_layer.moveToBeginning()
+        footage_layer.move_before(created_layer)
+        footage_layer.moveAfter(created_layer)
+        with self.assertRaises(ValueError):
+            footage_layer.move_after(LayerProxy(ae, {"id": 99, "compId": 2}))
         self.assertEqual(ae.app.activeProject.item_count, 3)
         self.assertEqual(ae.app.activeItem.name, "Main Comp")
         self.assertEqual(ae.app.selectedItems[0].name, "Main Comp")

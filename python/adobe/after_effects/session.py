@@ -1143,6 +1143,61 @@ class LayerProxy:
     ) -> "LayerProxy":
         return self.set_keyframes(propertyName, keyframes, timeout_ms=timeoutMs)
 
+    def move_to_beginning(self, *, timeout_ms: int | None = None) -> "LayerProxy":
+        return self._move("moveToBeginning", timeout_ms=timeout_ms)
+
+    def moveToBeginning(self, *, timeoutMs: int | None = None) -> "LayerProxy":
+        return self.move_to_beginning(timeout_ms=timeoutMs)
+
+    def move_to_end(self, *, timeout_ms: int | None = None) -> "LayerProxy":
+        return self._move("moveToEnd", timeout_ms=timeout_ms)
+
+    def moveToEnd(self, *, timeoutMs: int | None = None) -> "LayerProxy":
+        return self.move_to_end(timeout_ms=timeoutMs)
+
+    def move_before(self, target: "LayerProxy", *, timeout_ms: int | None = None) -> "LayerProxy":
+        return self._move_relative("moveBefore", target, timeout_ms=timeout_ms)
+
+    def moveBefore(self, target: "LayerProxy", *, timeoutMs: int | None = None) -> "LayerProxy":
+        return self.move_before(target, timeout_ms=timeoutMs)
+
+    def move_after(self, target: "LayerProxy", *, timeout_ms: int | None = None) -> "LayerProxy":
+        return self._move_relative("moveAfter", target, timeout_ms=timeout_ms)
+
+    def moveAfter(self, target: "LayerProxy", *, timeoutMs: int | None = None) -> "LayerProxy":
+        return self.move_after(target, timeout_ms=timeoutMs)
+
+    def _move(self, method: str, *, timeout_ms: int | None) -> "LayerProxy":
+        payload = self._session.invoke(
+            "layer",
+            method,
+            self.comp_id,
+            self._layer_key,
+            options=_modal_options(timeout_ms=timeout_ms),
+        )
+        return LayerProxy(self._session, payload or self._payload)
+
+    def _move_relative(
+        self,
+        method: str,
+        target: "LayerProxy",
+        *,
+        timeout_ms: int | None,
+    ) -> "LayerProxy":
+        if not isinstance(target, LayerProxy):
+            raise TypeError("target must be a LayerProxy")
+        if self.comp_id != target.comp_id:
+            raise ValueError("Layers must belong to the same composition")
+        payload = self._session.invoke(
+            "layer",
+            method,
+            self.comp_id,
+            self._layer_key,
+            target._layer_key,
+            options=_modal_options(timeout_ms=timeout_ms),
+        )
+        return LayerProxy(self._session, payload or self._payload)
+
     @property
     def _layer_key(self) -> Any:
         return self.id or self.index or self.name
