@@ -4,7 +4,10 @@
   "namespaces": [
     {
       "name": "app",
-      "methods": [{"name": "getVersion", "returns": "str"}],
+      "methods": [
+        {"name": "getVersion", "returns": "str"},
+        {"name": "openProject", "returns": "Project", "mutates": true}
+      ],
       "properties": [
         {"name": "active_project", "type": "Project | None", "source": "project.getActive"},
         {"name": "active_item", "type": "ProjectItem | None", "source": "project.getActiveItem"},

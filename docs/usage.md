@@ -56,6 +56,7 @@ that are not modeled yet:
 from adobe.after_effects import AfterEffects
 
 app = AfterEffects()
+app.open_project("C:/templates/intro.aep")
 
 for comp in app.project.compositions:
     print(comp.name, comp.width, comp.height, comp.duration, comp.frame_rate)

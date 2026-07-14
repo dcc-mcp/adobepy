@@ -4,6 +4,11 @@ function adobepyDispatch(payload) {
     if (request.namespace === "app" && request.method === "getVersion") {
       return adobepyResult(request.id, String(app.version || ""));
     }
+    if (request.namespace === "app" && request.method === "openProject") {
+      var projectPath = String((request.args || [])[0] || "");
+      if (!projectPath) throw new Error("After Effects project path required");
+      return adobepyResult(request.id, adobepyAfterEffectsProject(app.open(new File(projectPath))));
+    }
     if (request.namespace === "project" && request.method === "getActive") {
       return adobepyResult(request.id, adobepyAfterEffectsProject(app.project));
     }

@@ -65,6 +65,12 @@ class AfterEffects(AfterEffectsSession):
     def renderQueue(self) -> "RenderQueueProxy":
         return self.render_queue
 
+    def open_project(self, path: str, *, timeout_ms: int | None = None) -> "ProjectProxy":
+        return self.app.open_project(path, timeout_ms=timeout_ms)
+
+    def openProject(self, path: str, *, timeoutMs: int | None = None) -> "ProjectProxy":
+        return self.open_project(path, timeout_ms=timeoutMs)
+
 
 class AfterEffectsApp:
     def __init__(self, session: AfterEffectsSession) -> None:
@@ -109,6 +115,15 @@ class AfterEffectsApp:
     @property
     def renderQueue(self) -> "RenderQueueProxy":
         return self.render_queue
+
+    def open_project(self, path: str, *, timeout_ms: int | None = None) -> "ProjectProxy":
+        payload = self._session.invoke(
+            "app", "openProject", path, options=_modal_options(timeout_ms=timeout_ms)
+        )
+        return ProjectProxy(self._session, payload or {})
+
+    def openProject(self, path: str, *, timeoutMs: int | None = None) -> "ProjectProxy":
+        return self.open_project(path, timeout_ms=timeoutMs)
 
 
 @dataclass

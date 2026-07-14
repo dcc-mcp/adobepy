@@ -66,7 +66,7 @@
       namespaces: ["app", "project", "item", "layer", "mask", "effect", "text", "renderQueue", "renderQueueItem", "outputModule", "raw"],
       features: ["extendscript", "projectInfo", "projectItems", "compositions", "footageItems", "layers", "masks", "effects", "text", "renderQueue", "outputModule"],
       methods: {
-        app: ["getVersion"],
+        app: ["getVersion", "openProject"],
         project: ["getActive", "getItems", "getCompositions", "getFootageItems", "getFolders", "getActiveItem", "getSelectedItems", "save", "importFile", "createComposition"],
         item: ["getById", "getByName"],
         layer: ["getLayers", "getSelected", "getById", "createText", "createSolid", "createFootage", "setTransform", "setKeyframes"],
