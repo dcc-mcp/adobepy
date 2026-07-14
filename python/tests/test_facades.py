@@ -20,6 +20,8 @@ class CapturingClient:
         if namespace == "app":
             if method == "getDocuments":
                 return [{"id": 7, "name": "demo", "path": "C:/demo", "width": 100, "height": 50}]
+            if host == "after-effects" and method == "openProject":
+                return {"name": "template.aep", "path": args[0], "itemCount": 3}
             return {"photoshop": "26.0", "indesign": "19.5", "premiere": "25.6", "after-effects": "24.4", "illustrator": "28.2"}[host]
         if namespace == "document" and method == "getActive":
             payload = {"id": 7, "name": "demo", "path": "C:/demo", "width": 100, "height": 50}
@@ -1343,6 +1345,7 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(ae.active_project.name, "cut")
         self.assertEqual(ae.project.name, "cut")
         self.assertEqual(ae.project.save("C:/out/cut.aep").path, "C:/out/cut.aep")
+        self.assertEqual(ae.open_project("C:/templates/intro.aep").path, "C:/templates/intro.aep")
         imported = ae.project.import_file("C:/assets/plate.mov")
         self.assertEqual(imported.file_path, "C:/assets/plate.mov")
         created_comp = ae.project.create_composition("DCC Intro", duration=5)

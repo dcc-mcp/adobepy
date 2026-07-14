@@ -373,8 +373,16 @@ function testExtendScriptDispatchers() {
       },
     },
   };
+  const aeApp = {
+    version: "24.4.1",
+    project: aeProject,
+    open(file) {
+      aeProject.file = file;
+      return aeProject;
+    },
+  };
   const ae = loadDispatcher(afterEffectsDispatcherPath, {
-    app: { version: "24.4.1", project: aeProject },
+    app: aeApp,
     File: function File(filePath) {
       return { fsName: filePath, fullName: filePath, name: String(filePath).split(/[\\/]/).pop() };
     },
@@ -384,7 +392,8 @@ function testExtendScriptDispatchers() {
     GetSettingsFormat: { STRING: "STRING", STRING_SETTABLE: "STRING_SETTABLE", NUMBER: "NUMBER", NUMBER_SETTABLE: "NUMBER_SETTABLE" },
   });
   assert.deepStrictEqual(dispatch(ae, "ae_app", "app", "getVersion").result, "24.4.1");
-  assert.deepStrictEqual(dispatch(ae, "ae_project", "project", "getActive").result, { name: "demo.aep", path: "C:/demo.aep", itemCount: 3 });
+  assert.strictEqual(dispatch(ae, "ae_open", "app", "openProject", ["C:/templates/intro.aep"]).result.path, "C:/templates/intro.aep");
+  assert.deepStrictEqual(dispatch(ae, "ae_project", "project", "getActive").result, { name: "intro.aep", path: "C:/templates/intro.aep", itemCount: 3 });
   assert.strictEqual(dispatch(ae, "ae_items", "project", "getItems").result[0].itemType, "composition");
   assert.strictEqual(dispatch(ae, "ae_comps", "project", "getCompositions").result[0].numLayers, 2);
   assert.strictEqual(dispatch(ae, "ae_footage", "project", "getFootageItems").result[0].filePath, "C:/plates/plate.mov");
