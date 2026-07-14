@@ -22,6 +22,17 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 class DistributionTests(unittest.TestCase):
+    def test_installed_bridge_config_precedes_bundle(self):
+        for kind, host in (
+            ("cep", "after-effects"),
+            ("cep", "illustrator"),
+            ("uxp", "indesign"),
+            ("uxp", "photoshop"),
+            ("uxp", "premiere"),
+        ):
+            html = (REPO_ROOT / "bridges" / kind / host / "index.html").read_text(encoding="utf-8")
+            self.assertLess(html.index("adobepy.config.js"), html.index("dist/main.js"))
+
     def test_cep_manifests_are_loadable(self):
         for host, adobe_host in (("after-effects", "AEFT"), ("illustrator", "ILST")):
             root = ET.parse(REPO_ROOT / "bridges" / "cep" / host / "CSXS" / "manifest.xml").getroot()
