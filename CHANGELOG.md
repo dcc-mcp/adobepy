@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.5.0...adobepy-v0.5.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* make installed Adobe bridges loadable ([#46](https://github.com/dcc-mcp/adobepy/issues/46)) ([50c692c](https://github.com/dcc-mcp/adobepy/commit/50c692c3ce0ce78ec42b97888ad37618a17df075))
+
 ## [0.5.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.4.1...adobepy-v0.5.0) (2026-07-14)
 
 
