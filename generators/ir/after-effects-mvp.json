@@ -46,7 +46,11 @@
         {"name": "createSolid", "returns": "Layer", "mutates": true},
         {"name": "createFootage", "returns": "Layer", "mutates": true},
         {"name": "setTransform", "returns": "Layer", "mutates": true},
-        {"name": "setKeyframes", "returns": "Layer", "mutates": true}
+        {"name": "setKeyframes", "returns": "Layer", "mutates": true},
+        {"name": "moveToBeginning", "returns": "Layer", "mutates": true},
+        {"name": "moveToEnd", "returns": "Layer", "mutates": true},
+        {"name": "moveBefore", "returns": "Layer", "mutates": true},
+        {"name": "moveAfter", "returns": "Layer", "mutates": true}
       ]
     },
     {
@@ -122,7 +126,10 @@
       ],
       "methods": [
         {"name": "getItemById", "returns": "ProjectItem | None"},
-        {"name": "getItemsByName", "returns": "list[ProjectItem]"}
+        {"name": "getItemsByName", "returns": "list[ProjectItem]"},
+        {"name": "save", "returns": "Project"},
+        {"name": "importFile", "returns": "FootageItem"},
+        {"name": "createComposition", "returns": "Composition"}
       ]
     },
     {
@@ -173,6 +180,9 @@
       ],
       "methods": [
         {"name": "getLayerById", "returns": "Layer | None"},
+        {"name": "addTextLayer", "returns": "Layer"},
+        {"name": "addSolidLayer", "returns": "Layer"},
+        {"name": "addFootageLayer", "returns": "Layer"},
         {"name": "addToRenderQueue", "returns": "RenderQueueItem"}
       ]
     },
@@ -247,7 +257,13 @@
       ],
       "methods": [
         {"name": "getEffect", "returns": "Effect | None"},
-        {"name": "setSourceText", "returns": "SourceText"}
+        {"name": "setSourceText", "returns": "SourceText"},
+        {"name": "setTransform", "returns": "Layer"},
+        {"name": "setKeyframes", "returns": "Layer"},
+        {"name": "moveToBeginning", "returns": "Layer"},
+        {"name": "moveToEnd", "returns": "Layer"},
+        {"name": "moveBefore", "returns": "Layer"},
+        {"name": "moveAfter", "returns": "Layer"}
       ]
     },
     {

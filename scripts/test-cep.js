@@ -168,6 +168,7 @@ function testExtendScriptDispatchers() {
   };
   const aeTransformValues = {};
   const aeTransformKeyframes = {};
+  const aeLayerMoves = [];
   const aeTransformGroup = {
     property(name) {
       return {
@@ -198,6 +199,10 @@ function testExtendScriptDispatchers() {
     height: 1080,
     hasVideo: true,
     hasAudio: false,
+    moveToBeginning() { aeLayerMoves.push(["moveToBeginning", this.id]); },
+    moveToEnd() { aeLayerMoves.push(["moveToEnd", this.id]); },
+    moveBefore(target) { aeLayerMoves.push(["moveBefore", this.id, target.id]); },
+    moveAfter(target) { aeLayerMoves.push(["moveAfter", this.id, target.id]); },
     property(name) {
       return {
         "ADBE Text Properties": aeTextGroup,
@@ -420,6 +425,11 @@ function testExtendScriptDispatchers() {
   assert.strictEqual(dispatch(ae, "ae_transform", "layer", "setTransform", [1, 11, { position: [960, 540], opacity: 80 }]).result.name, "Title");
   assert.deepStrictEqual(aeTransformValues["ADBE Position"], [960, 540]);
   assert.strictEqual(dispatch(ae, "ae_keyframes", "layer", "setKeyframes", [1, 11, { property: "scale", keyframes: [{ time: 0, value: [0, 0] }, { time: 1, value: [100, 100] }] }]).result.name, "Title");
+  assert.strictEqual(dispatch(ae, "ae_move_beginning", "layer", "moveToBeginning", [1, 11]).result.name, "Title");
+  assert.strictEqual(dispatch(ae, "ae_move_end", "layer", "moveToEnd", [1, 11]).result.name, "Title");
+  assert.strictEqual(dispatch(ae, "ae_move_before", "layer", "moveBefore", [1, 11, 12]).result.name, "Title");
+  assert.strictEqual(dispatch(ae, "ae_move_after", "layer", "moveAfter", [1, 11, 12]).result.name, "Title");
+  assert.deepStrictEqual(aeLayerMoves, [["moveToBeginning", 11], ["moveToEnd", 11], ["moveBefore", 11, 12], ["moveAfter", 11, 12]]);
   assert.deepStrictEqual(aeTransformKeyframes["ADBE Scale"], [{ time: 0, value: [0, 0] }, { time: 1, value: [100, 100] }]);
   assert.strictEqual(dispatch(ae, "ae_render_queue", "renderQueue", "get").result.numItems, 1);
   assert.strictEqual(dispatch(ae, "ae_render_items", "renderQueue", "getItems").result[0].compName, "Main Comp");

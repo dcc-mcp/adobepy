@@ -74,6 +74,18 @@ function adobepyDispatch(payload) {
     if (request.namespace === "layer" && request.method === "setKeyframes") {
       return adobepyResult(request.id, adobepyAfterEffectsSetKeyframes(app.project, (request.args || [])[0], (request.args || [])[1], (request.args || [])[2] || {}));
     }
+    if (request.namespace === "layer" && request.method === "moveToBeginning") {
+      return adobepyResult(request.id, adobepyAfterEffectsMoveLayer(app.project, (request.args || [])[0], (request.args || [])[1], "moveToBeginning"));
+    }
+    if (request.namespace === "layer" && request.method === "moveToEnd") {
+      return adobepyResult(request.id, adobepyAfterEffectsMoveLayer(app.project, (request.args || [])[0], (request.args || [])[1], "moveToEnd"));
+    }
+    if (request.namespace === "layer" && request.method === "moveBefore") {
+      return adobepyResult(request.id, adobepyAfterEffectsMoveLayer(app.project, (request.args || [])[0], (request.args || [])[1], "moveBefore", (request.args || [])[2]));
+    }
+    if (request.namespace === "layer" && request.method === "moveAfter") {
+      return adobepyResult(request.id, adobepyAfterEffectsMoveLayer(app.project, (request.args || [])[0], (request.args || [])[1], "moveAfter", (request.args || [])[2]));
+    }
     if (request.namespace === "mask" && request.method === "getMasks") {
       var maskArgs = request.args || [];
       var maskComp = adobepyAfterEffectsRequireComp(app.project, maskArgs[0]);
@@ -285,6 +297,18 @@ function adobepyAfterEffectsSetKeyframes(project, compKey, layerKey, options) {
   var keyframes = options.keyframes || [];
   for (var index = 0; index < keyframes.length; index += 1) {
     property.setValueAtTime(Number(keyframes[index].time), keyframes[index].value);
+  }
+  return adobepyAfterEffectsLayer(layer, comp);
+}
+
+function adobepyAfterEffectsMoveLayer(project, compKey, layerKey, method, targetKey) {
+  var comp = adobepyAfterEffectsRequireComp(project, compKey);
+  var layer = adobepyAfterEffectsRequireLayer(comp, layerKey);
+  if (typeof layer[method] !== "function") throw new Error("After Effects Layer." + method + " unavailable");
+  if (method === "moveBefore" || method === "moveAfter") {
+    layer[method](adobepyAfterEffectsRequireLayer(comp, targetKey));
+  } else {
+    layer[method]();
   }
   return adobepyAfterEffectsLayer(layer, comp);
 }
