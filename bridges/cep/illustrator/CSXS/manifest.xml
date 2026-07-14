@@ -1,1 +1,27 @@
-<?xml version="1.0" encoding="UTF-8"?><ExtensionManifest Version="7.0"><ExtensionList><Extension Id="com.adobepy.bridge.illustrator"/></ExtensionList></ExtensionManifest>
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.adobepy.bridge.illustrator" ExtensionBundleVersion="1.0.0" ExtensionBundleName="adobepy Illustrator Bridge">
+  <ExtensionList>
+    <Extension Id="com.adobepy.bridge.illustrator" Version="1.0.0" />
+  </ExtensionList>
+  <ExecutionEnvironment>
+    <HostList><Host Name="ILST" Version="[23.0,99.9]" /></HostList>
+    <LocaleList><Locale Code="All" /></LocaleList>
+    <RequiredRuntimeList><RequiredRuntime Name="CSXS" Version="9.0" /></RequiredRuntimeList>
+  </ExecutionEnvironment>
+  <DispatchInfoList>
+    <Extension Id="com.adobepy.bridge.illustrator">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./index.html</MainPath>
+          <ScriptPath>./host/dispatcher.jsx</ScriptPath>
+        </Resources>
+        <Lifecycle><AutoVisible>true</AutoVisible></Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>adobepy Bridge</Menu>
+          <Geometry><Size><Height>120</Height><Width>280</Width></Size></Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>
