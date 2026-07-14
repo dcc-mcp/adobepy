@@ -77,6 +77,16 @@ for layer in comp.layers:
 text = comp.get_layer_by_id(11).source_text
 comp.selected_layers[0].set_source_text("Updated title")
 
+footage = app.project.import_file("C:/assets/logo.png")
+intro = app.project.create_composition("DCC-MCP Intro", duration=6, frame_rate=30)
+title = intro.add_text_layer("DCC-MCP", name="Headline")
+title.set_transform(position=[960, 540], scale=[100, 100], opacity=100)
+title.set_keyframes("scale", [
+    {"time": 0, "value": [0, 0]},
+    {"time": 0.8, "value": [100, 100]},
+])
+intro.add_footage_layer(footage)
+
 render_queue = app.project.render_queue
 queued = render_queue.queue_selected_compositions(
     output_directory="C:/renders/review",
@@ -90,8 +100,25 @@ module.set_output_path("C:/renders/main.mov")
 ```
 
 Use `adobe.raw.RawSession("after-effects").eval_extendscript(...)` for APIs
-outside the typed composition/project-item/render-queue facade, such as deep
-layer/property mutation before those namespaces are added.
+outside the typed composition, layer, transform, keyframe, and render-queue facade.
+
+Premiere exposes project, sequence, timeline-edit, media, marker, and export helpers:
+
+```python
+from adobe.premiere import Premiere
+
+app = Premiere()
+project = app.project
+media = project.import_files(["C:/assets/shot.mp4"])[0]
+sequence = project.create_sequence("DCC-MCP Intro")
+sequence.insert_project_item(media, time=0, video_track=0, audio_track=0)
+sequence.overwrite_project_item(media, time=3.5, video_track=0, audio_track=0)
+project.save_as("C:/projects/dcc-mcp-intro.prproj")
+```
+
+Timeline edits use Premiere's `SequenceEditor`, `TickTime`, and undoable project
+transactions. Use `adobe.raw.RawSession("premiere").eval_js(...)` for long-tail
+host APIs that have not yet earned a typed facade method.
 
 Illustrator exposes common document, artboard, layer, and page-item collections
 with JavaScript-shaped names and Pythonic aliases:
