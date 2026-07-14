@@ -20,7 +20,8 @@
         {"name": "getFootageItems", "returns": "list[FootageItem]"},
         {"name": "getFolders", "returns": "list[FolderItem]"},
         {"name": "getActiveItem", "returns": "ProjectItem | None"},
-        {"name": "getSelectedItems", "returns": "list[ProjectItem]"}
+        {"name": "getSelectedItems", "returns": "list[ProjectItem]"},
+        {"name": "save", "returns": "Project", "mutates": true}
       ]
     },
     {

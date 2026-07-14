@@ -663,6 +663,8 @@ class CapturingClient:
                 return sequence
             if method == "getRootItem":
                 return root_item
+            if method == "save":
+                return {"id": "project-1", "name": "cut", "path": "C:/cut", "itemCount": 3}
             if method == "importFiles":
                 return [
                     {
@@ -793,6 +795,8 @@ class CapturingClient:
                 return comp
             if method == "getSelectedItems":
                 return [comp]
+            if method == "save":
+                return {"name": "cut", "path": args[0] or "C:/cut", "itemCount": 3}
         if host == "after-effects" and namespace == "item":
             if method == "getById":
                 return {"id": args[0], "index": 1, "name": "Main Comp", "typeName": "Composition", "itemType": "composition", "typename": "CompItem"}
@@ -1268,6 +1272,8 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(premiere.sequences[0].sequenceId, "sequence-1")
         self.assertEqual(premiere.active_sequence.name, "Main edit")
         self.assertEqual(premiere.project.getSequence("Main edit").duration, 120.0)
+        self.assertEqual(premiere.project.save(command_name="Save project").path, "C:/cut")
+        self.assertEqual(premiere_client.calls[-1]["options"]["commandName"], "Save project")
         sequence = premiere.project.activeSequence
         self.assertEqual(sequence.videoTracks[0].name, "V1")
         self.assertTrue(sequence.video_tracks[0].isTargeted)
@@ -1319,6 +1325,7 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(ae.project.path, "C:/cut")
         self.assertEqual(ae.active_project.name, "cut")
         self.assertEqual(ae.project.name, "cut")
+        self.assertEqual(ae.project.save("C:/out/cut.aep").path, "C:/out/cut.aep")
         self.assertEqual(ae.app.activeProject.item_count, 3)
         self.assertEqual(ae.app.activeItem.name, "Main Comp")
         self.assertEqual(ae.app.selectedItems[0].name, "Main Comp")

@@ -197,6 +197,12 @@ class ProjectProxy:
     def getItemsByName(self, name: str) -> list["ProjectItemProxy"]:
         return self.get_items_by_name(name)
 
+    def save(self, path: str | None = None, *, timeout_ms: int | None = None) -> "ProjectProxy":
+        payload = self._session.invoke(
+            "project", "save", path, options=_modal_options(timeout_ms=timeout_ms)
+        )
+        return ProjectProxy(self._session, payload or self._payload)
+
 
 @dataclass
 class ProjectItemProxy:

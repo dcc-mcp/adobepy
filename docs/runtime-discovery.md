@@ -52,7 +52,20 @@ resolvable via `shutil.which()` in new terminal sessions.
 
 ## 2. Broker Startup
 
-After locating `adobepy.exe`, the adapter starts the broker as a child process.
+Adapters should reuse the Python helper, which implements discovery, health
+polling, environment handoff, and owned-process shutdown:
+
+```python
+from adobe.runtime import ensure_broker
+
+broker = ensure_broker()
+try:
+    ...
+finally:
+    broker.stop()
+```
+
+After locating `adobepy.exe`, the helper starts the broker as a child process.
 
 ### 2.1 Command
 

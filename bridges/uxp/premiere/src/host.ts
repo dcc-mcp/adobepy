@@ -16,7 +16,7 @@ export const premiereAdapter: HostAdapter = {
       features: ["project", "sequence", "track", "clip", "projectItem", "bin", "marker", "encoder", "export"],
       methods: {
         app: ["getVersion"],
-        project: ["getActive", "getSequences", "getActiveSequence", "getRootItem", "importFiles"],
+        project: ["getActive", "getSequences", "getActiveSequence", "getRootItem", "save", "importFiles"],
         sequence: ["getVideoTracks", "getAudioTracks"],
         track: ["getClips"],
         clip: ["getSelected"],
@@ -35,6 +35,7 @@ export const premiereAdapter: HostAdapter = {
     if (request.namespace === "project" && request.method === "getSequences") return serializeSequences(await projectSequences(await activeProject()));
     if (request.namespace === "project" && request.method === "getActiveSequence") return serializeSequence(await activeSequence());
     if (request.namespace === "project" && request.method === "getRootItem") return serializeProjectItem(await rootProjectItem());
+    if (request.namespace === "project" && request.method === "save") return saveProject();
     if (request.namespace === "project" && request.method === "importFiles") return importFiles(request);
     if (request.namespace === "sequence" && request.method === "getVideoTracks") {
       return serializeTracks(sequenceTracks(await requireSequence(request.args?.[0]), "video"), "video");
@@ -91,6 +92,14 @@ async function projectSequences(project: unknown): Promise<unknown[]> {
   if (getSequences) return collectionItems(await maybePromise(getSequences.call(project)));
   const sequences = property(project, "sequences") ?? property(project, "sequenceCollection");
   return collectionItems(sequences);
+}
+
+async function saveProject() {
+  const project = await activeProject();
+  const save = property<Callable>(project, "save");
+  if (!save) unavailable("Premiere project save");
+  await maybePromise(save.call(project));
+  return serializeProject(project);
 }
 
 async function activeSequence() {

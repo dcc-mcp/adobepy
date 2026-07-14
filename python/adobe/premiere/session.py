@@ -595,6 +595,18 @@ class ProjectProxy:
     def getSequence(self, idOrName: Any) -> "SequenceProxy | None":
         return self.get_sequence(idOrName)
 
+    def save(self, *, command_name: str | None = None, timeout_ms: int | None = None) -> "ProjectProxy":
+        payload = self._session.invoke(
+            "project",
+            "save",
+            options=self._session.modal_options(
+                command_name=command_name,
+                default_command_name="Save Premiere project",
+                timeout_ms=timeout_ms,
+            ),
+        )
+        return ProjectProxy(self._session, payload or self._payload)
+
     def import_files(
         self,
         paths: str | list[str],

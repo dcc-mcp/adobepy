@@ -25,6 +25,12 @@ function adobepyDispatch(payload) {
     if (request.namespace === "project" && request.method === "getSelectedItems") {
       return adobepyResult(request.id, adobepyAfterEffectsSelectedItems(app.project));
     }
+    if (request.namespace === "project" && request.method === "save") {
+      var savePath = String((request.args || [])[0] || "");
+      if (!app.project) throw new Error("After Effects project unavailable");
+      app.project.save(savePath ? new File(savePath) : undefined);
+      return adobepyResult(request.id, adobepyAfterEffectsProject(app.project));
+    }
     if (request.namespace === "item" && request.method === "getById") {
       return adobepyResult(request.id, adobepyAfterEffectsItem(adobepyAfterEffectsFindItemById(app.project, (request.args || [])[0]), app.project));
     }

@@ -13,7 +13,7 @@ startCepBridge({
     features: ["extendscript", "projectInfo", "projectItems", "compositions", "footageItems", "layers", "masks", "effects", "text", "renderQueue", "outputModule"],
     methods: {
       app: ["getVersion"],
-      project: ["getActive", "getItems", "getCompositions", "getFootageItems", "getFolders", "getActiveItem", "getSelectedItems"],
+      project: ["getActive", "getItems", "getCompositions", "getFootageItems", "getFolders", "getActiveItem", "getSelectedItems", "save"],
       item: ["getById", "getByName"],
       layer: ["getLayers", "getSelected", "getById"],
       mask: ["getMasks"],
