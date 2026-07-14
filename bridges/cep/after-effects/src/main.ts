@@ -13,9 +13,9 @@ startCepBridge({
     features: ["extendscript", "projectInfo", "projectItems", "compositions", "footageItems", "layers", "masks", "effects", "text", "renderQueue", "outputModule"],
     methods: {
       app: ["getVersion"],
-      project: ["getActive", "getItems", "getCompositions", "getFootageItems", "getFolders", "getActiveItem", "getSelectedItems"],
+      project: ["getActive", "getItems", "getCompositions", "getFootageItems", "getFolders", "getActiveItem", "getSelectedItems", "save", "importFile", "createComposition"],
       item: ["getById", "getByName"],
-      layer: ["getLayers", "getSelected", "getById"],
+      layer: ["getLayers", "getSelected", "getById", "createText", "createSolid", "createFootage", "setTransform", "setKeyframes"],
       mask: ["getMasks"],
       effect: ["getEffects", "getByName"],
       text: ["getSourceText", "setSourceText"],

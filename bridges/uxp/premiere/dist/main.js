@@ -136,8 +136,8 @@
         features: ["project", "sequence", "track", "clip", "projectItem", "bin", "marker", "encoder", "export"],
         methods: {
           app: ["getVersion"],
-          project: ["getActive", "getSequences", "getActiveSequence", "getRootItem", "importFiles"],
-          sequence: ["getVideoTracks", "getAudioTracks"],
+          project: ["getActive", "getSequences", "getActiveSequence", "getRootItem", "save", "saveAs", "createSequence", "importFiles"],
+          sequence: ["getVideoTracks", "getAudioTracks", "insertProjectItem", "overwriteProjectItem"],
           track: ["getClips"],
           clip: ["getSelected"],
           projectItem: ["getChildren", "getSelected", "findByMediaPath"],
@@ -155,6 +155,9 @@
       if (request.namespace === "project" && request.method === "getSequences") return serializeSequences(await projectSequences(await activeProject()));
       if (request.namespace === "project" && request.method === "getActiveSequence") return serializeSequence(await activeSequence());
       if (request.namespace === "project" && request.method === "getRootItem") return serializeProjectItem(await rootProjectItem());
+      if (request.namespace === "project" && request.method === "save") return saveProject();
+      if (request.namespace === "project" && request.method === "saveAs") return saveProjectAs(request);
+      if (request.namespace === "project" && request.method === "createSequence") return createSequence(request);
       if (request.namespace === "project" && request.method === "importFiles") return importFiles(request);
       if (request.namespace === "sequence" && request.method === "getVideoTracks") {
         return serializeTracks(sequenceTracks(await requireSequence(request.args?.[0]), "video"), "video");
@@ -162,6 +165,8 @@
       if (request.namespace === "sequence" && request.method === "getAudioTracks") {
         return serializeTracks(sequenceTracks(await requireSequence(request.args?.[0]), "audio"), "audio");
       }
+      if (request.namespace === "sequence" && request.method === "insertProjectItem") return editProjectItem(request, false);
+      if (request.namespace === "sequence" && request.method === "overwriteProjectItem") return editProjectItem(request, true);
       if (request.namespace === "track" && request.method === "getClips") return trackClips(request);
       if (request.namespace === "clip" && request.method === "getSelected") return selectedClips(await requireSequence(request.args?.[0]));
       if (request.namespace === "projectItem" && request.method === "getChildren") return projectItemChildren(request);
@@ -206,6 +211,65 @@
     if (getSequences) return collectionItems(await maybePromise(getSequences.call(project)));
     const sequences = property(project, "sequences") ?? property(project, "sequenceCollection");
     return collectionItems(sequences);
+  }
+  async function saveProject() {
+    const project = await activeProject();
+    const save = property(project, "save");
+    if (!save) unavailable("Premiere project save");
+    await maybePromise(save.call(project));
+    return serializeProject(project);
+  }
+  async function saveProjectAs(request) {
+    const project = await activeProject();
+    const path = asString(request.args?.[0]);
+    const saveAs = property(project, "saveAs");
+    if (!path || !saveAs) unavailable("Premiere project saveAs");
+    await maybePromise(saveAs.call(project, path));
+    return serializeProject(project);
+  }
+  async function createSequence(request) {
+    const project = await activeProject();
+    const payload = isObject(request.args?.[0]) ? request.args?.[0] : { name: request.args?.[0] };
+    const name = asString(property(payload, "name"));
+    const presetPath = asString(property(payload, "presetPath") ?? property(payload, "preset_path"));
+    if (!name) unavailable("Premiere sequence name");
+    const createWithPreset = property(project, "createSequenceWithPresetPath");
+    const create = property(project, "createSequence");
+    if (presetPath && createWithPreset) return serializeSequence(await maybePromise(createWithPreset.call(project, name, presetPath)));
+    if (!create) unavailable("Premiere project.createSequence");
+    return serializeSequence(await maybePromise(create.call(project, name, presetPath)));
+  }
+  async function editProjectItem(request, overwrite) {
+    const sequence = await requireSequence(request.args?.[0]);
+    const payload = isObject(request.args?.[1]) ? request.args?.[1] : {};
+    const item = await requireProjectItem(property(payload, "projectItem") ?? property(payload, "project_item"));
+    const time = premiereTickTime(property(payload, "time") ?? 0);
+    const videoTrack = asNumber(property(payload, "videoTrack") ?? property(payload, "video_track")) ?? 0;
+    const audioTrack = asNumber(property(payload, "audioTrack") ?? property(payload, "audio_track")) ?? 0;
+    const premiere = premiereModule();
+    const editorType = property(premiere, "SequenceEditor");
+    const getEditor = property(editorType, "getEditor");
+    const editor = getEditor ? getEditor.call(editorType, sequence) : null;
+    const method = property(editor, overwrite ? "createOverwriteItemAction" : "createInsertProjectItemAction");
+    const project = await activeProject();
+    const execute = property(project, "executeTransaction");
+    if (!method || !execute) unavailable(`Premiere SequenceEditor ${overwrite ? "overwrite" : "insert"}`);
+    const action = overwrite ? method.call(editor, item, time, videoTrack, audioTrack) : method.call(editor, item, time, videoTrack, audioTrack, booleanValue(property(payload, "limitShift") ?? property(payload, "limit_shift")) ?? false);
+    await maybePromise(execute.call(project, (compound) => {
+      const add = property(compound, "addAction") ?? property(compound, "add");
+      if (add) add.call(compound, action);
+    }, asString(request.options?.commandName) ?? (overwrite ? "Overwrite project item" : "Insert project item")));
+    return { edited: true, mode: overwrite ? "overwrite" : "insert", sequence: serializeSequence(sequence), projectItem: serializeProjectItem(item) };
+  }
+  function premiereTickTime(value) {
+    if (isObject(value) && property(value, "ticks") !== void 0) return value;
+    const tickTime = property(premiereModule(), "TickTime");
+    const ticks = typeof value === "string" ? value : null;
+    const createWithTicks = property(tickTime, "createWithTicks");
+    if (ticks && createWithTicks) return createWithTicks.call(tickTime, ticks);
+    const createWithSeconds = property(tickTime, "createWithSeconds");
+    if (!createWithSeconds) unavailable("Premiere TickTime.createWithSeconds");
+    return createWithSeconds.call(tickTime, asNumber(value) ?? 0);
   }
   async function activeSequence() {
     const project = await activeProject();

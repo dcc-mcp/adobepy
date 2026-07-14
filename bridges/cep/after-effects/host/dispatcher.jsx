@@ -25,6 +25,18 @@ function adobepyDispatch(payload) {
     if (request.namespace === "project" && request.method === "getSelectedItems") {
       return adobepyResult(request.id, adobepyAfterEffectsSelectedItems(app.project));
     }
+    if (request.namespace === "project" && request.method === "save") {
+      var savePath = String((request.args || [])[0] || "");
+      if (!app.project) throw new Error("After Effects project unavailable");
+      app.project.save(savePath ? new File(savePath) : undefined);
+      return adobepyResult(request.id, adobepyAfterEffectsProject(app.project));
+    }
+    if (request.namespace === "project" && request.method === "importFile") {
+      return adobepyResult(request.id, adobepyAfterEffectsImportFile(app.project, (request.args || [])[0] || {}));
+    }
+    if (request.namespace === "project" && request.method === "createComposition") {
+      return adobepyResult(request.id, adobepyAfterEffectsCreateComposition(app.project, (request.args || [])[0] || {}));
+    }
     if (request.namespace === "item" && request.method === "getById") {
       return adobepyResult(request.id, adobepyAfterEffectsItem(adobepyAfterEffectsFindItemById(app.project, (request.args || [])[0]), app.project));
     }
@@ -41,6 +53,21 @@ function adobepyDispatch(payload) {
       var layerArgs = request.args || [];
       var layerComp = adobepyAfterEffectsRequireComp(app.project, layerArgs[0]);
       return adobepyResult(request.id, adobepyAfterEffectsLayer(adobepyAfterEffectsFindLayer(layerComp, layerArgs[1]), layerComp));
+    }
+    if (request.namespace === "layer" && request.method === "createText") {
+      return adobepyResult(request.id, adobepyAfterEffectsCreateTextLayer(app.project, (request.args || [])[0], (request.args || [])[1] || {}));
+    }
+    if (request.namespace === "layer" && request.method === "createSolid") {
+      return adobepyResult(request.id, adobepyAfterEffectsCreateSolidLayer(app.project, (request.args || [])[0], (request.args || [])[1] || {}));
+    }
+    if (request.namespace === "layer" && request.method === "createFootage") {
+      return adobepyResult(request.id, adobepyAfterEffectsCreateFootageLayer(app.project, (request.args || [])[0], (request.args || [])[1] || {}));
+    }
+    if (request.namespace === "layer" && request.method === "setTransform") {
+      return adobepyResult(request.id, adobepyAfterEffectsSetTransform(app.project, (request.args || [])[0], (request.args || [])[1], (request.args || [])[2] || {}));
+    }
+    if (request.namespace === "layer" && request.method === "setKeyframes") {
+      return adobepyResult(request.id, adobepyAfterEffectsSetKeyframes(app.project, (request.args || [])[0], (request.args || [])[1], (request.args || [])[2] || {}));
     }
     if (request.namespace === "mask" && request.method === "getMasks") {
       var maskArgs = request.args || [];
@@ -182,6 +209,94 @@ function adobepyAfterEffectsProject(project) {
     path: file ? String(file.fsName || file.fullName || "") : null,
     itemCount: Number(project.numItems || 0)
   };
+}
+
+function adobepyAfterEffectsImportFile(project, options) {
+  if (!project) throw new Error("After Effects project unavailable");
+  var path = String(options.path || "");
+  if (!path) throw new Error("After Effects import path required");
+  var importOptions = new ImportOptions(new File(path));
+  if (typeof options.sequence !== "undefined") importOptions.sequence = Boolean(options.sequence);
+  if (typeof options.forceAlphabetical !== "undefined") importOptions.forceAlphabetical = Boolean(options.forceAlphabetical);
+  return adobepyAfterEffectsItem(project.importFile(importOptions), project);
+}
+
+function adobepyAfterEffectsCreateComposition(project, options) {
+  if (!project || !project.items) throw new Error("After Effects project unavailable");
+  var name = String(options.name || "Composition");
+  var comp = project.items.addComp(
+    name,
+    Number(options.width || 1920),
+    Number(options.height || 1080),
+    Number(options.pixelAspect || 1),
+    Number(options.duration || 10),
+    Number(options.frameRate || 30)
+  );
+  return adobepyAfterEffectsItem(comp, project);
+}
+
+function adobepyAfterEffectsCreateTextLayer(project, compKey, options) {
+  var comp = adobepyAfterEffectsRequireComp(project, compKey);
+  var layer = comp.layers.addText(String(options.text || ""));
+  if (options.name) layer.name = String(options.name);
+  return adobepyAfterEffectsLayer(layer, comp);
+}
+
+function adobepyAfterEffectsCreateSolidLayer(project, compKey, options) {
+  var comp = adobepyAfterEffectsRequireComp(project, compKey);
+  var color = options.color || [0, 0, 0];
+  var layer = comp.layers.addSolid(
+    color,
+    String(options.name || "Solid"),
+    Number(options.width || comp.width),
+    Number(options.height || comp.height),
+    Number(options.pixelAspect || 1),
+    Number(options.duration || comp.duration)
+  );
+  return adobepyAfterEffectsLayer(layer, comp);
+}
+
+function adobepyAfterEffectsCreateFootageLayer(project, compKey, options) {
+  var comp = adobepyAfterEffectsRequireComp(project, compKey);
+  var item = adobepyAfterEffectsFindItemById(project, options.item);
+  if (!item) throw new Error("After Effects footage item unavailable");
+  var layer = typeof options.duration === "number" ? comp.layers.add(item, options.duration) : comp.layers.add(item);
+  return adobepyAfterEffectsLayer(layer, comp);
+}
+
+function adobepyAfterEffectsSetTransform(project, compKey, layerKey, values) {
+  var comp = adobepyAfterEffectsRequireComp(project, compKey);
+  var layer = adobepyAfterEffectsRequireLayer(comp, layerKey);
+  for (var name in values) {
+    if (values.hasOwnProperty(name)) adobepyAfterEffectsTransformProperty(layer, name).setValue(values[name]);
+  }
+  return adobepyAfterEffectsLayer(layer, comp);
+}
+
+function adobepyAfterEffectsSetKeyframes(project, compKey, layerKey, options) {
+  var comp = adobepyAfterEffectsRequireComp(project, compKey);
+  var layer = adobepyAfterEffectsRequireLayer(comp, layerKey);
+  var property = adobepyAfterEffectsTransformProperty(layer, String(options.property || ""));
+  var keyframes = options.keyframes || [];
+  for (var index = 0; index < keyframes.length; index += 1) {
+    property.setValueAtTime(Number(keyframes[index].time), keyframes[index].value);
+  }
+  return adobepyAfterEffectsLayer(layer, comp);
+}
+
+function adobepyAfterEffectsTransformProperty(layer, name) {
+  var names = {
+    anchor_point: "ADBE Anchor Point",
+    position: "ADBE Position",
+    scale: "ADBE Scale",
+    rotation: "ADBE Rotate Z",
+    opacity: "ADBE Opacity"
+  };
+  var matchName = names[name] || name;
+  var transform = layer.property("ADBE Transform Group");
+  var property = transform && transform.property(matchName);
+  if (!property) throw new Error("After Effects transform property unavailable: " + name);
+  return property;
 }
 
 function adobepyAfterEffectsItems(project) {

@@ -663,6 +663,12 @@ class CapturingClient:
                 return sequence
             if method == "getRootItem":
                 return root_item
+            if method == "save":
+                return {"id": "project-1", "name": "cut", "path": "C:/cut", "itemCount": 3}
+            if method == "saveAs":
+                return {"id": "project-1", "name": "cut", "path": args[0], "itemCount": 3}
+            if method == "createSequence":
+                return {**sequence, "name": args[0]["name"]}
             if method == "importFiles":
                 return [
                     {
@@ -722,6 +728,8 @@ class CapturingClient:
                 return [{"id": "v1", "name": "V1", "index": 0, "mediaType": "video", "isLocked": False, "isMuted": False, "isTargeted": True}]
             if method == "getAudioTracks":
                 return [{"id": "a1", "name": "A1", "index": 0, "mediaType": "audio", "isLocked": False, "isMuted": True, "isTargeted": False}]
+            if method in {"insertProjectItem", "overwriteProjectItem"}:
+                return {"edited": True, "mode": "insert" if method == "insertProjectItem" else "overwrite"}
         if host == "premiere" and namespace == "track" and method == "getClips":
             if args[1] == "audio":
                 return [{"id": "clip-a", "name": "dialog.wav", "mediaPath": "C:/media/dialog.wav", "start": 0, "end": 30, "duration": 30, "isEnabled": True}]
@@ -793,6 +801,12 @@ class CapturingClient:
                 return comp
             if method == "getSelectedItems":
                 return [comp]
+            if method == "save":
+                return {"name": "cut", "path": args[0] or "C:/cut", "itemCount": 3}
+            if method == "importFile":
+                return {**footage, "filePath": args[0]["path"]}
+            if method == "createComposition":
+                return {**comp, **args[0]}
         if host == "after-effects" and namespace == "item":
             if method == "getById":
                 return {"id": args[0], "index": 1, "name": "Main Comp", "typeName": "Composition", "itemType": "composition", "typename": "CompItem"}
@@ -824,6 +838,8 @@ class CapturingClient:
                 "hasAudio": False,
                 "typename": "TextLayer",
             }
+            if method in {"createText", "createSolid", "createFootage", "setTransform", "setKeyframes"}:
+                return text_layer
             av_layer = {
                 **text_layer,
                 "id": 12,
@@ -1268,6 +1284,11 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(premiere.sequences[0].sequenceId, "sequence-1")
         self.assertEqual(premiere.active_sequence.name, "Main edit")
         self.assertEqual(premiere.project.getSequence("Main edit").duration, 120.0)
+        self.assertEqual(premiere.project.save(command_name="Save project").path, "C:/cut")
+        self.assertEqual(premiere_client.calls[-1]["options"]["commandName"], "Save project")
+        self.assertEqual(premiere.project.save_as("C:/out/cut.prproj").path, "C:/out/cut.prproj")
+        created_sequence = premiere.project.create_sequence("DCC Intro")
+        self.assertEqual(created_sequence.name, "DCC Intro")
         sequence = premiere.project.activeSequence
         self.assertEqual(sequence.videoTracks[0].name, "V1")
         self.assertTrue(sequence.video_tracks[0].isTargeted)
@@ -1281,6 +1302,8 @@ class FacadeTests(unittest.TestCase):
         self.assertTrue(root.isBin)
         self.assertEqual(root.children[0].name, "Dailies")
         media_item = root.children[0].children[0]
+        self.assertTrue(created_sequence.insert_project_item(media_item, time=1.5)["edited"])
+        self.assertEqual(created_sequence.overwrite_project_item(media_item)["mode"], "overwrite")
         self.assertEqual(media_item.media_path, "C:/media/shot.mov")
         self.assertTrue(media_item.canProxy)
         self.assertFalse(media_item.isOffline)
@@ -1319,6 +1342,17 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(ae.project.path, "C:/cut")
         self.assertEqual(ae.active_project.name, "cut")
         self.assertEqual(ae.project.name, "cut")
+        self.assertEqual(ae.project.save("C:/out/cut.aep").path, "C:/out/cut.aep")
+        imported = ae.project.import_file("C:/assets/plate.mov")
+        self.assertEqual(imported.file_path, "C:/assets/plate.mov")
+        created_comp = ae.project.create_composition("DCC Intro", duration=5)
+        self.assertEqual(created_comp.name, "DCC Intro")
+        created_layer = created_comp.add_text_layer("DCC MCP")
+        self.assertEqual(created_layer.name, "Title")
+        created_comp.add_solid_layer([0.0, 0.1, 0.2])
+        created_comp.add_footage_layer(imported)
+        created_layer.set_transform(position=[960, 540], opacity=100)
+        created_layer.set_keyframes("scale", [{"time": 0, "value": [0, 0]}, {"time": 1, "value": [100, 100]}])
         self.assertEqual(ae.app.activeProject.item_count, 3)
         self.assertEqual(ae.app.activeItem.name, "Main Comp")
         self.assertEqual(ae.app.selectedItems[0].name, "Main Comp")

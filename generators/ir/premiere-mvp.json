@@ -21,6 +21,9 @@
         {"name": "getSequences", "returns": "list[Sequence]"},
         {"name": "getActiveSequence", "returns": "Sequence | None"},
         {"name": "getRootItem", "returns": "ProjectItem | None"},
+        {"name": "save", "returns": "Project", "mutates": true, "modal": true},
+        {"name": "saveAs", "returns": "Project", "mutates": true, "modal": true},
+        {"name": "createSequence", "returns": "Sequence", "mutates": true, "modal": true},
         {"name": "importFiles", "returns": "list[ProjectItem]", "mutates": true, "modal": true}
       ]
     },
@@ -28,7 +31,9 @@
       "name": "sequence",
       "methods": [
         {"name": "getVideoTracks", "returns": "list[Track]"},
-        {"name": "getAudioTracks", "returns": "list[Track]"}
+        {"name": "getAudioTracks", "returns": "list[Track]"},
+        {"name": "insertProjectItem", "returns": "dict", "mutates": true, "modal": true},
+        {"name": "overwriteProjectItem", "returns": "dict", "mutates": true, "modal": true}
       ]
     },
     {"name": "track", "methods": [{"name": "getClips", "returns": "list[Clip]"}]},

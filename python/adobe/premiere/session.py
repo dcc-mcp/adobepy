@@ -595,6 +595,73 @@ class ProjectProxy:
     def getSequence(self, idOrName: Any) -> "SequenceProxy | None":
         return self.get_sequence(idOrName)
 
+    def save(self, *, command_name: str | None = None, timeout_ms: int | None = None) -> "ProjectProxy":
+        payload = self._session.invoke(
+            "project",
+            "save",
+            options=self._session.modal_options(
+                command_name=command_name,
+                default_command_name="Save Premiere project",
+                timeout_ms=timeout_ms,
+            ),
+        )
+        return ProjectProxy(self._session, payload or self._payload)
+
+    def save_as(
+        self, path: str, *, command_name: str | None = None, timeout_ms: int | None = None
+    ) -> "ProjectProxy":
+        payload = self._session.invoke(
+            "project",
+            "saveAs",
+            path,
+            options=self._session.modal_options(
+                command_name=command_name,
+                default_command_name="Save Premiere project as",
+                timeout_ms=timeout_ms,
+            ),
+        )
+        return ProjectProxy(self._session, payload or self._payload)
+
+    def saveAs(
+        self, path: str, *, commandName: str | None = None, timeoutMs: int | None = None
+    ) -> "ProjectProxy":
+        return self.save_as(path, command_name=commandName, timeout_ms=timeoutMs)
+
+    def create_sequence(
+        self,
+        name: str,
+        *,
+        preset_path: str | None = None,
+        command_name: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> "SequenceProxy":
+        payload = self._session.invoke(
+            "project",
+            "createSequence",
+            {"name": name, "presetPath": preset_path},
+            options=self._session.modal_options(
+                command_name=command_name,
+                default_command_name="Create Premiere sequence",
+                timeout_ms=timeout_ms,
+            ),
+        )
+        return SequenceProxy(self._session, payload or {})
+
+    def createSequence(
+        self,
+        name: str,
+        *,
+        presetPath: str | None = None,
+        commandName: str | None = None,
+        timeoutMs: int | None = None,
+    ) -> "SequenceProxy":
+        return self.create_sequence(
+            name,
+            preset_path=presetPath,
+            command_name=commandName,
+            timeout_ms=timeoutMs,
+        )
+
     def import_files(
         self,
         paths: str | list[str],
@@ -883,6 +950,117 @@ class SequenceProxy:
     @property
     def audioTracks(self) -> list["TrackProxy"]:
         return self.audio_tracks
+
+    def insert_project_item(
+        self,
+        project_item: "ProjectItemProxy | str",
+        *,
+        time: Any = 0,
+        video_track: int = 0,
+        audio_track: int = 0,
+        limit_shift: bool = False,
+        command_name: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> dict[str, Any]:
+        return self._edit_project_item(
+            "insertProjectItem",
+            project_item,
+            time=time,
+            video_track=video_track,
+            audio_track=audio_track,
+            limit_shift=limit_shift,
+            command_name=command_name or "Insert project item",
+            timeout_ms=timeout_ms,
+        )
+
+    def insertProjectItem(
+        self,
+        projectItem: "ProjectItemProxy | str",
+        *,
+        time: Any = 0,
+        videoTrack: int = 0,
+        audioTrack: int = 0,
+        limitShift: bool = False,
+        commandName: str | None = None,
+        timeoutMs: int | None = None,
+    ) -> dict[str, Any]:
+        return self.insert_project_item(
+            projectItem,
+            time=time,
+            video_track=videoTrack,
+            audio_track=audioTrack,
+            limit_shift=limitShift,
+            command_name=commandName,
+            timeout_ms=timeoutMs,
+        )
+
+    def overwrite_project_item(
+        self,
+        project_item: "ProjectItemProxy | str",
+        *,
+        time: Any = 0,
+        video_track: int = 0,
+        audio_track: int = 0,
+        command_name: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> dict[str, Any]:
+        return self._edit_project_item(
+            "overwriteProjectItem",
+            project_item,
+            time=time,
+            video_track=video_track,
+            audio_track=audio_track,
+            command_name=command_name or "Overwrite project item",
+            timeout_ms=timeout_ms,
+        )
+
+    def overwriteProjectItem(
+        self,
+        projectItem: "ProjectItemProxy | str",
+        *,
+        time: Any = 0,
+        videoTrack: int = 0,
+        audioTrack: int = 0,
+        commandName: str | None = None,
+        timeoutMs: int | None = None,
+    ) -> dict[str, Any]:
+        return self.overwrite_project_item(
+            projectItem,
+            time=time,
+            video_track=videoTrack,
+            audio_track=audioTrack,
+            command_name=commandName,
+            timeout_ms=timeoutMs,
+        )
+
+    def _edit_project_item(
+        self,
+        method: str,
+        project_item: "ProjectItemProxy | str",
+        *,
+        time: Any,
+        video_track: int,
+        audio_track: int,
+        limit_shift: bool = False,
+        command_name: str,
+        timeout_ms: int | None,
+    ) -> dict[str, Any]:
+        return self._session.invoke(
+            "sequence",
+            method,
+            self._sequence_key,
+            {
+                "projectItem": _item_key(project_item),
+                "time": time,
+                "videoTrack": video_track,
+                "audioTrack": audio_track,
+                "limitShift": limit_shift,
+            },
+            options=self._session.modal_options(
+                command_name=command_name,
+                timeout_ms=timeout_ms,
+            ),
+        )
 
     @property
     def markers(self) -> list["MarkerProxy"]:

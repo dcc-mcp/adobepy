@@ -647,6 +647,24 @@ async function testPremiereBridge() {
     itemCount: 3,
     sequences: [sequence],
     activeSequence: sequence,
+    save() {
+      events.push({ kind: "project.save" });
+    },
+    saveAs(path) {
+      events.push({ kind: "project.saveAs", path });
+      this.path = path;
+    },
+    createSequence(name) {
+      const created = { ...sequence, id: `seq-${this.sequences.length + 1}`, sequenceId: `sequence-${this.sequences.length + 1}`, name };
+      this.sequences.push(created);
+      events.push({ kind: "project.createSequence", name });
+      return created;
+    },
+    executeTransaction(callback, commandName) {
+      const actions = [];
+      callback({ addAction(action) { actions.push(action); } });
+      events.push({ kind: "project.transaction", commandName, actions });
+    },
     getRootItem() {
       return rootItem;
     },
@@ -706,6 +724,29 @@ async function testPremiereBridge() {
         }
       },
       Exporter: exporter,
+      TickTime: {
+        createWithSeconds(seconds) {
+          return { seconds };
+        },
+        createWithTicks(ticks) {
+          return { ticks };
+        }
+      },
+      SequenceEditor: {
+        getEditor(sequenceToEdit) {
+          return {
+            createInsertProjectItemAction(item, time, videoTrack, audioTrack, limitShift) {
+              return { kind: "sequence.insert", sequence: sequenceToEdit.id, item: item.id, time, videoTrack, audioTrack, limitShift };
+            },
+            createOverwriteProjectItemAction(item, time, videoTrack, audioTrack) {
+              return { kind: "sequence.overwrite", sequence: sequenceToEdit.id, item: item.id, time, videoTrack, audioTrack };
+            },
+            createOverwriteItemAction(item, time, videoTrack, audioTrack) {
+              return { kind: "sequence.overwrite", sequence: sequenceToEdit.id, item: item.id, time, videoTrack, audioTrack };
+            }
+          };
+        }
+      },
       ProjectUtils: {
         getSelection(activeProject) {
           assert.strictEqual(activeProject, project);
@@ -722,6 +763,8 @@ async function testPremiereBridge() {
   assert.strictEqual(env.sent[0].capabilities.host, "premiere");
   assert.ok(env.sent[0].capabilities.methods.project.includes("getActiveSequence"));
   assert.ok(env.sent[0].capabilities.methods.project.includes("importFiles"));
+  assert.ok(env.sent[0].capabilities.methods.project.includes("createSequence"));
+  assert.ok(env.sent[0].capabilities.methods.sequence.includes("insertProjectItem"));
   assert.ok(env.sent[0].capabilities.methods.sequence.includes("getVideoTracks"));
   assert.ok(env.sent[0].capabilities.methods.track.includes("getClips"));
   assert.ok(env.sent[0].capabilities.methods.clip.includes("getSelected"));
@@ -740,6 +783,8 @@ async function testPremiereBridge() {
   });
   assert.strictEqual(result(await rpc(env, "premiere", "project", "getSequences"))[0].sequenceId, "sequence-1");
   assert.strictEqual(result(await rpc(env, "premiere", "project", "getActiveSequence")).name, "Main edit");
+  assert.strictEqual(result(await rpc(env, "premiere", "project", "saveAs", ["C:/edits/intro.prproj"])).path, "C:/edits/intro.prproj");
+  assert.strictEqual(result(await rpc(env, "premiere", "project", "createSequence", [{ name: "DCC Intro" }])).name, "DCC Intro");
   assert.strictEqual(result(await rpc(env, "premiere", "sequence", "getVideoTracks", ["seq-1"]))[0].isTargeted, true);
   assert.strictEqual(result(await rpc(env, "premiere", "sequence", "getAudioTracks", ["seq-1"]))[0].isMuted, true);
   assert.strictEqual(result(await rpc(env, "premiere", "track", "getClips", ["seq-1", "video", "v1"]))[0].mediaPath, "C:/media/shot.mov");
@@ -762,6 +807,12 @@ async function testPremiereBridge() {
   assert.strictEqual(imported[0].mediaPath, "C:/media/new.mov");
   assert.ok(events.some((event) => event.kind === "project.importFiles" && event.targetBin === "bin-1"));
   assert.strictEqual(error(await rpc(env, "premiere", "project", "importFiles", [{ filePaths: [] }])).code, -32004);
+  const inserted = result(await rpc(env, "premiere", "sequence", "insertProjectItem", ["seq-1", { projectItem: "media-1", time: 2.5, videoTrack: 1, audioTrack: 0, limitShift: true }]));
+  assert.strictEqual(inserted.mode, "insert");
+  const overwritten = result(await rpc(env, "premiere", "sequence", "overwriteProjectItem", ["seq-1", { projectItem: "media-1", time: "254016000000", videoTrack: 0, audioTrack: 0 }]));
+  assert.strictEqual(overwritten.mode, "overwrite");
+  assert.ok(events.some((event) => event.kind === "project.transaction" && event.actions[0].kind === "sequence.insert" && event.actions[0].time.seconds === 2.5));
+  assert.ok(events.some((event) => event.kind === "project.transaction" && event.actions[0].kind === "sequence.overwrite" && event.actions[0].time.ticks === "254016000000"));
   assert.strictEqual(result(await rpc(env, "premiere", "encoder", "getManager")).isAMEInstalled, true);
   assert.strictEqual(result(await rpc(env, "premiere", "encoder", "getPresets"))[0].path, "C:/presets/h264.epr");
   assert.strictEqual(result(await rpc(env, "premiere", "encoder", "getExportFileExtension", [{ sequence: "seq-1", presetPath: "C:/presets/h264.epr" }])), "mp4");
