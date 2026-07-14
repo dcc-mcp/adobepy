@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.3.3...adobepy-v0.4.0) (2026-07-14)
+
+
+### Features
+
+* document daily Adobe editing APIs ([#40](https://github.com/dcc-mcp/adobepy/issues/40)) ([8a35dbf](https://github.com/dcc-mcp/adobepy/commit/8a35dbf01b589920a9f43b0e58cc1100bf390074))
+
 ## [0.3.3](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.3.2...adobepy-v0.3.3) (2026-07-14)
 
 
