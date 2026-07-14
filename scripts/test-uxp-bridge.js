@@ -100,6 +100,12 @@ async function testPhotoshopBridge() {
       this.rgb = { red: 255, green: 255, blue: 255 };
     }
   }
+  const componentChannel = { id: 22, name: "Red", kind: "component", visible: true, typename: "Channel" };
+  Object.defineProperty(componentChannel, "opacity", {
+    get() {
+      throw new Error("The operation is not valid for channels of type component.");
+    }
+  });
   const channels = [
     {
       id: 21,
@@ -110,7 +116,7 @@ async function testPhotoshopBridge() {
       typename: "Channel",
       remove: async () => events.push({ kind: "channel.remove" })
     },
-    { id: 22, name: "Red", kind: "component", visible: true, typename: "Channel" }
+    componentChannel
   ];
   channels.getByName = (name) => channels.find((channel) => channel.name === name);
   channels.add = async () => {
@@ -216,10 +222,16 @@ async function testPhotoshopBridge() {
   const env = await loadBundle("bridges/uxp/photoshop/dist/main.js", {
     photoshop: {
       app: { version: "26.5.1", activeDocument: document, documents: [document], SolidColor },
+      constants: {
+        SelectionType: { REPLACE: 1, EXTEND: 2, DIMINISH: 3, INTERSECT: 4 }
+      },
       action: {
         batchPlay: async (descriptors, options) => {
           events.push({ kind: "batchPlay", descriptors, options });
           if (descriptors.some((descriptor) => descriptor._obj === "newPlacedLayer")) textLayer.kind = "smartObject";
+          if (descriptors.some((descriptor) => descriptor._obj === "fail")) {
+            return [{ _obj: "error", message: "Forced batchPlay failure", result: -1 }];
+          }
           return descriptors;
         }
       },
@@ -256,9 +268,10 @@ async function testPhotoshopBridge() {
   assert.strictEqual(result(await rpc(env, "photoshop", "layer", "getChildren", [8]))[0].name, "Child");
   assert.strictEqual(result(await rpc(env, "photoshop", "selection", "get", [9])).bounds.right, 100);
   assert.strictEqual(
-    result(await rpc(env, "photoshop", "selection", "selectRectangle", [9, { top: 4, left: 5, bottom: 9, right: 10 }, "replace", 0, true], { modal: true })).bounds.left,
+    result(await rpc(env, "photoshop", "selection", "selectRectangle", [9, { top: 4, left: 5, bottom: 9, right: 10 }, null, 0, true], { modal: true })).bounds.left,
     5
   );
+  assert.strictEqual(events.find((event) => event.kind === "selection.selectRectangle").mode, 1);
   assert.strictEqual(result(await rpc(env, "photoshop", "selection", "selectAll", [9], { modal: true })).bounds.bottom, 1080);
   assert.strictEqual(result(await rpc(env, "photoshop", "channel", "getChannels", [9]))[0].name, "Alpha 1");
   assert.strictEqual(result(await rpc(env, "photoshop", "channel", "getActiveChannels", [9]))[0].opacity, 50);
@@ -309,6 +322,7 @@ async function testPhotoshopBridge() {
     ),
     [{ _obj: "placeEvent", null: { _path: "token:file:///C:/composite.png", _kind: "local" } }]
   );
+  assert.match(error(await rpc(env, "photoshop", "action", "batchPlay", [[{ _obj: "fail" }], {}], { modal: true })).message, /forced batchPlay failure/i);
   assert.deepStrictEqual(result(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/out.psd", format: "psd" }], { modal: true, commandName: "Save" })).id, 9);
   assert.strictEqual(result(await rpc(env, "photoshop", "raw", "evalJs", ["1 + 1"])), 2);
   assert.strictEqual(error(await rpc(env, "photoshop", "bad", "missing")).code, -32601);
