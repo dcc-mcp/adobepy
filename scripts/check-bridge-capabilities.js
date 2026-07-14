@@ -120,6 +120,7 @@ async function captureCapabilities(entry) {
   }
 
   const fakeCep = {
+    getSystemPath() { return "C:/extension"; },
     evalScript(_script, callback) {
       callback(JSON.stringify({ jsonrpc: "2.0", id: "unused", result: null }));
     }

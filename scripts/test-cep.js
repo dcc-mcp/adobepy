@@ -43,7 +43,9 @@ async function main() {
   }
 
   const fakeCep = {
+    getSystemPath() { return "C:/extension"; },
     evalScript(script, callback) {
+      if (script.startsWith("$.evalFile(")) { callback("true"); return; }
       evalScripts.push(script);
       const match = script.match(/^adobepyDispatch\(decodeURIComponent\('([^']*)'\)\)$/);
       assert.ok(match, `unexpected evalScript payload: ${script}`);
