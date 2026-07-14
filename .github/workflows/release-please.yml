@@ -55,7 +55,6 @@ jobs:
       - python-package
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
-    environment: pypi
     permissions:
       contents: read
       id-token: write
