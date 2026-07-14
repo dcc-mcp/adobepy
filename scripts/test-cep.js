@@ -40,7 +40,7 @@ async function main() {
     }
   }
 
-  class FakeCSInterface {
+  const fakeCep = {
     evalScript(script, callback) {
       evalScripts.push(script);
       const match = script.match(/^adobepyDispatch\(decodeURIComponent\('([^']*)'\)\)$/);
@@ -56,14 +56,14 @@ async function main() {
         callback(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { namespace: request.namespace } }));
       }
     }
-  }
+  };
 
   const context = {
     console,
     setTimeout,
     setImmediate,
     WebSocket: FakeWebSocket,
-    CSInterface: FakeCSInterface,
+    __adobe_cep__: fakeCep,
     document: { getElementById() { return { textContent: "", addEventListener() {} }; } },
     __ADOBEPY_TOKEN: "test-token",
     __ADOBEPY_BROKER_URL: "ws://127.0.0.1:47391/v1/bridge/after-effects/ws",

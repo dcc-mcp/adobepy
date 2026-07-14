@@ -10,11 +10,11 @@ export interface CepConfig {
 }
 
 declare const WebSocket: any;
-declare const CSInterface: any;
 
 export function startCepBridge(config: CepConfig): void {
+  const cep = (globalThis as any).__adobe_cep__;
+  if (!cep || typeof cep.evalScript !== "function") throw new Error("Adobe CEP evalScript API unavailable");
   const socket = new WebSocket(config.brokerUrl);
-  const cs = new CSInterface();
   socket.addEventListener("open", () => {
     socket.send(JSON.stringify({ type: "hello", token: config.token, target: config.target, capabilities: config.capabilities }));
     console.log("adobepy CEP bridge connected", config.capabilities);
@@ -25,7 +25,7 @@ export function startCepBridge(config: CepConfig): void {
     const request = message.request as RpcRequest;
     const encoded = encodeURIComponent(JSON.stringify(request)).replace(/'/g, "%27");
     try {
-      cs.evalScript(`adobepyDispatch(decodeURIComponent('${encoded}'))`, (raw: string) => {
+      cep.evalScript(`adobepyDispatch(decodeURIComponent('${encoded}'))`, (raw: string) => {
         try {
           const parsed = raw ? JSON.parse(raw) : { jsonrpc: "2.0", id: request.id, result: null };
           if (parsed.error) {

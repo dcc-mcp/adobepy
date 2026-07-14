@@ -117,11 +117,11 @@ async function captureCapabilities(entry) {
     }
   }
 
-  class FakeCSInterface {
+  const fakeCep = {
     evalScript(_script, callback) {
       callback(JSON.stringify({ jsonrpc: "2.0", id: "unused", result: null }));
     }
-  }
+  };
 
   const context = {
     ...entry.globals,
@@ -129,7 +129,7 @@ async function captureCapabilities(entry) {
     setImmediate,
     setTimeout,
     WebSocket: FakeWebSocket,
-    CSInterface: FakeCSInterface,
+    __adobe_cep__: fakeCep,
     document: { getElementById() { return { textContent: "", addEventListener() {} }; } },
     __ADOBEPY_TOKEN: "test-token",
     __ADOBEPY_TARGET: "default",
