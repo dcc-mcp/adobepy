@@ -664,7 +664,19 @@ function findLayerInTree(layers: unknown, id: unknown): unknown {
 async function batchPlay(request: RpcRequest) {
   const descriptors = request.args?.[0] ?? [];
   const actionOptions = isObject(request.args?.[1]) ? request.args?.[1] : {};
-  return runBatchPlay(request, asArray(descriptors), actionOptions, "Run batchPlay");
+  return runBatchPlay(request, await normalizePlaceEventDescriptors(asArray(descriptors)), actionOptions, "Run batchPlay");
+}
+
+async function normalizePlaceEventDescriptors(descriptors: unknown[]): Promise<unknown[]> {
+  return Promise.all(descriptors.map(normalizePlaceEventDescriptor));
+}
+
+async function normalizePlaceEventDescriptor(descriptor: unknown): Promise<unknown> {
+  if (!isObject(descriptor) || asString(property(descriptor, "_obj")) !== "placeEvent") return descriptor;
+  const file = property(descriptor, "null");
+  const path = isObject(file) ? asString(property(file, "_path")) : undefined;
+  if (!path || path.startsWith("token:")) return descriptor;
+  return { ...descriptor, null: await actionFileReference(path) };
 }
 
 async function runBatchPlay(request: RpcRequest, descriptors: unknown[], actionOptions: Record<string, unknown>, defaultCommandName: string) {
