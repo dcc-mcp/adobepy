@@ -24,9 +24,10 @@ async function main() {
   class FakeWebSocket {
     constructor(url) {
       this.url = url;
+      this.readyState = 0;
       this.listeners = {};
       socketInstance = this;
-      setImmediate(() => this.emit("open", {}));
+      setImmediate(() => { this.readyState = 1; this.emit("open", {}); });
     }
     addEventListener(name, listener) {
       this.listeners[name] = this.listeners[name] || [];
@@ -36,12 +37,15 @@ async function main() {
       sent.push(JSON.parse(payload));
     }
     emit(name, event) {
+      if (this[`on${name}`]) this[`on${name}`](event);
       for (const listener of this.listeners[name] || []) listener(event);
     }
   }
 
-  class FakeCSInterface {
+  const fakeCep = {
+    getSystemPath() { return "C:/extension"; },
     evalScript(script, callback) {
+      if (script.startsWith("$.evalFile(")) { callback("true"); return; }
       evalScripts.push(script);
       const match = script.match(/^adobepyDispatch\(decodeURIComponent\('([^']*)'\)\)$/);
       assert.ok(match, `unexpected evalScript payload: ${script}`);
@@ -56,14 +60,14 @@ async function main() {
         callback(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { namespace: request.namespace } }));
       }
     }
-  }
+  };
 
   const context = {
     console,
     setTimeout,
     setImmediate,
     WebSocket: FakeWebSocket,
-    CSInterface: FakeCSInterface,
+    __adobe_cep__: fakeCep,
     document: { getElementById() { return { textContent: "", addEventListener() {} }; } },
     __ADOBEPY_TOKEN: "test-token",
     __ADOBEPY_BROKER_URL: "ws://127.0.0.1:47391/v1/bridge/after-effects/ws",

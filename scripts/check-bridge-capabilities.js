@@ -101,9 +101,10 @@ async function captureCapabilities(entry) {
   class FakeWebSocket {
     constructor(url) {
       this.url = url;
+      this.readyState = 0;
       this.listeners = {};
       socketInstance = this;
-      setImmediate(() => this.emit("open", {}));
+      setImmediate(() => { this.readyState = 1; this.emit("open", {}); });
     }
     addEventListener(name, listener) {
       this.listeners[name] = this.listeners[name] || [];
@@ -113,15 +114,17 @@ async function captureCapabilities(entry) {
       sent.push(JSON.parse(payload));
     }
     emit(name, event) {
+      if (this[`on${name}`]) this[`on${name}`](event);
       for (const listener of this.listeners[name] || []) listener(event);
     }
   }
 
-  class FakeCSInterface {
+  const fakeCep = {
+    getSystemPath() { return "C:/extension"; },
     evalScript(_script, callback) {
       callback(JSON.stringify({ jsonrpc: "2.0", id: "unused", result: null }));
     }
-  }
+  };
 
   const context = {
     ...entry.globals,
@@ -129,7 +132,7 @@ async function captureCapabilities(entry) {
     setImmediate,
     setTimeout,
     WebSocket: FakeWebSocket,
-    CSInterface: FakeCSInterface,
+    __adobe_cep__: fakeCep,
     document: { getElementById() { return { textContent: "", addEventListener() {} }; } },
     __ADOBEPY_TOKEN: "test-token",
     __ADOBEPY_TARGET: "default",

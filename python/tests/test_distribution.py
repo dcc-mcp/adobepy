@@ -2,6 +2,7 @@ import pathlib
 import tempfile
 import unittest
 import zipfile
+import xml.etree.ElementTree as ET
 
 from scripts.check_wheel_compat import (
     REQUIRED_PACKAGE_FILES,
@@ -21,6 +22,26 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 class DistributionTests(unittest.TestCase):
+    def test_installed_bridge_config_precedes_bundle(self):
+        for kind, host in (
+            ("cep", "after-effects"),
+            ("cep", "illustrator"),
+            ("uxp", "indesign"),
+            ("uxp", "photoshop"),
+            ("uxp", "premiere"),
+        ):
+            html = (REPO_ROOT / "bridges" / kind / host / "index.html").read_text(encoding="utf-8")
+            self.assertLess(html.index("adobepy.config.js"), html.index("dist/main.js"))
+
+    def test_cep_manifests_are_loadable(self):
+        for host, adobe_host in (("after-effects", "AEFT"), ("illustrator", "ILST")):
+            root = ET.parse(REPO_ROOT / "bridges" / "cep" / host / "CSXS" / "manifest.xml").getroot()
+            extension_id = root.find("./ExtensionList/Extension").attrib["Id"]
+            self.assertEqual(root.find("./ExecutionEnvironment/HostList/Host").attrib["Name"], adobe_host)
+            self.assertEqual(root.findtext("./DispatchInfoList/Extension/DispatchInfo/Resources/MainPath"), "./index.html")
+            self.assertEqual(root.findtext("./DispatchInfoList/Extension/DispatchInfo/Resources/ScriptPath"), "./host/dispatcher.jsx")
+            self.assertEqual(root.find("./DispatchInfoList/Extension").attrib["Id"], extension_id)
+
     def test_wheel_tags_accept_pure_python_and_abi3_py38(self):
         assert_compatible_wheel_name("adobepy-0.1.0-py3-none-any.whl")
         assert_compatible_wheel_name("adobepy-0.1.0-cp38-abi3-win_amd64.whl")
