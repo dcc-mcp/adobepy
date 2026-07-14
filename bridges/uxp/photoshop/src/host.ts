@@ -126,13 +126,13 @@ export const photoshopAdapter: HostAdapter = {
     if (request.namespace === "selection" && request.method === "deselect") return selectionCall(request, "deselect", [], "Deselect");
     if (request.namespace === "selection" && request.method === "inverse") return selectionCall(request, "inverse", [], "Invert selection");
     if (request.namespace === "selection" && request.method === "selectRectangle") {
-      return selectionCall(request, "selectRectangle", request.args?.slice(1) ?? [], "Select rectangle");
+      return selectionCall(request, "selectRectangle", selectionShapeArgs(request.args?.slice(1) ?? []), "Select rectangle");
     }
     if (request.namespace === "selection" && request.method === "selectEllipse") {
-      return selectionCall(request, "selectEllipse", request.args?.slice(1) ?? [], "Select ellipse");
+      return selectionCall(request, "selectEllipse", selectionShapeArgs(request.args?.slice(1) ?? []), "Select ellipse");
     }
     if (request.namespace === "selection" && request.method === "selectPolygon") {
-      return selectionCall(request, "selectPolygon", request.args?.slice(1) ?? [], "Select polygon");
+      return selectionCall(request, "selectPolygon", selectionShapeArgs(request.args?.slice(1) ?? []), "Select polygon");
     }
     if (request.namespace === "selection" && request.method === "selectRow") return selectionCall(request, "selectRow", request.args?.slice(1) ?? [], "Select row");
     if (request.namespace === "selection" && request.method === "selectColumn") return selectionCall(request, "selectColumn", request.args?.slice(1) ?? [], "Select column");
@@ -294,14 +294,24 @@ function serializeBounds(bounds: unknown) {
 
 function serializeChannel(channel: unknown) {
   if (!isObject(channel)) return null;
+  const kind = safeProperty(channel, "kind");
+  const opacity = safeProperty(channel, "opacity");
   return {
-    id: property(channel, "id"),
-    name: asString(property(channel, "name")),
-    kind: asString(property(channel, "kind")) ?? property(channel, "kind"),
-    opacity: asNumber(property(channel, "opacity")) ?? property(channel, "opacity"),
-    visible: property(channel, "visible"),
-    typename: asString(property(channel, "typename"))
+    id: safeProperty(channel, "id"),
+    name: asString(safeProperty(channel, "name")),
+    kind: asString(kind) ?? kind,
+    opacity: asNumber(opacity) ?? opacity,
+    visible: safeProperty(channel, "visible"),
+    typename: asString(safeProperty(channel, "typename"))
   };
+}
+
+function safeProperty(target: unknown, name: string): unknown {
+  try {
+    return property(target, name);
+  } catch {
+    return undefined;
+  }
 }
 
 function serializeTextItem(textItem: unknown, layer?: unknown) {
@@ -418,6 +428,27 @@ async function selectionCall(request: RpcRequest, method: string, args: unknown[
     await maybePromise(fn.apply(selection, args));
     return serializeSelection(selection);
   });
+}
+
+function selectionShapeArgs(args: unknown[]): unknown[] {
+  const normalized = [...args];
+  normalized[1] = selectionType(normalized[1]);
+  return normalized;
+}
+
+function selectionType(value: unknown): unknown {
+  const numeric = asNumber(value);
+  if (numeric !== undefined) return numeric;
+  const aliases: Record<string, string> = {
+    add: "EXTEND",
+    subtract: "DIMINISH"
+  };
+  const requested = (asString(value) ?? "REPLACE").toUpperCase();
+  const key = aliases[requested.toLowerCase()] ?? requested;
+  const constants = property(property(photoshopModule(), "constants"), "SelectionType");
+  const resolved = property(constants, key);
+  if (resolved === undefined) unavailable(`Photoshop selection type ${requested}`);
+  return resolved;
 }
 
 function selectionForDocument(documentId: unknown) {
@@ -683,7 +714,18 @@ async function runBatchPlay(request: RpcRequest, descriptors: unknown[], actionO
   const action = property(photoshopModule(), "action");
   const runBatchPlay = property<Callable>(action, "batchPlay");
   if (!runBatchPlay) unavailable("Photoshop action.batchPlay");
-  return withModal(request, defaultCommandName, () => maybePromise(runBatchPlay.call(action, descriptors, actionOptions)));
+  return withModal(request, defaultCommandName, async () => {
+    const result = await maybePromise(runBatchPlay.call(action, descriptors, actionOptions));
+    assertBatchPlaySucceeded(result);
+    return result;
+  });
+}
+
+function assertBatchPlaySucceeded(result: unknown): void {
+  const errors = asArray(result).filter((item) => isObject(item) && asString(property(item, "_obj")) === "error");
+  if (!errors.length) return;
+  const messages = errors.map((item) => asString(property(item, "message")) ?? "Photoshop batchPlay command failed");
+  throw new Error(messages.join("; "));
 }
 
 function selectLayerDescriptor(layerId: unknown): Record<string, unknown> {
