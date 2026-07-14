@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.4.0...adobepy-v0.4.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* bind PyPI trusted publisher environment ([#42](https://github.com/dcc-mcp/adobepy/issues/42)) ([ca3c30c](https://github.com/dcc-mcp/adobepy/commit/ca3c30c36d80769c1c7bbad149c24734a7f4c344))
+
 ## [0.4.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.3.3...adobepy-v0.4.0) (2026-07-14)
 
 
