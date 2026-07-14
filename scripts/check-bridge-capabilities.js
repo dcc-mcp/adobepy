@@ -101,9 +101,10 @@ async function captureCapabilities(entry) {
   class FakeWebSocket {
     constructor(url) {
       this.url = url;
+      this.readyState = 0;
       this.listeners = {};
       socketInstance = this;
-      setImmediate(() => this.emit("open", {}));
+      setImmediate(() => { this.readyState = 1; this.emit("open", {}); });
     }
     addEventListener(name, listener) {
       this.listeners[name] = this.listeners[name] || [];

@@ -15,10 +15,15 @@ export function startCepBridge(config: CepConfig): void {
   const cep = (globalThis as any).__adobe_cep__;
   if (!cep || typeof cep.evalScript !== "function") throw new Error("Adobe CEP evalScript API unavailable");
   const socket = new WebSocket(config.brokerUrl);
-  socket.onopen = () => {
+  let greeted = false;
+  const greet = () => {
+    if (greeted || socket.readyState !== 1) return;
+    greeted = true;
     socket.send(JSON.stringify({ type: "hello", token: config.token, target: config.target, capabilities: config.capabilities }));
     console.log("adobepy CEP bridge connected", config.capabilities);
   };
+  socket.onopen = greet;
+  setTimeout(greet, 0);
   socket.onmessage = (event: { data: string }) => {
     const message = JSON.parse(event.data);
     if (message.type !== "request") return;
