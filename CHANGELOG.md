@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.3](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.3.2...adobepy-v0.3.3) (2026-07-14)
+
+
+### Bug Fixes
+
+* automate PyPI publishing ([2f3f275](https://github.com/dcc-mcp/adobepy/commit/2f3f275c00a1678e82d05821cf53da2585b5c24f))
+* harden Photoshop bridge actions ([bff54e3](https://github.com/dcc-mcp/adobepy/commit/bff54e33429f300c0112944c6f6e6169dda860c1))
+* tokenize Photoshop place event paths ([#37](https://github.com/dcc-mcp/adobepy/issues/37)) ([3110e11](https://github.com/dcc-mcp/adobepy/commit/3110e113ff245922e3d257754a1daef30cf4f7a3))
+
 ## [0.3.2](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.3.1...adobepy-v0.3.2) (2026-07-13)
 
 
