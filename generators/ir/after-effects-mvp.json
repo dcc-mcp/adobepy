@@ -21,7 +21,9 @@
         {"name": "getFolders", "returns": "list[FolderItem]"},
         {"name": "getActiveItem", "returns": "ProjectItem | None"},
         {"name": "getSelectedItems", "returns": "list[ProjectItem]"},
-        {"name": "save", "returns": "Project", "mutates": true}
+        {"name": "save", "returns": "Project", "mutates": true},
+        {"name": "importFile", "returns": "FootageItem", "mutates": true},
+        {"name": "createComposition", "returns": "Composition", "mutates": true}
       ]
     },
     {
@@ -36,7 +38,12 @@
       "methods": [
         {"name": "getLayers", "returns": "list[Layer]"},
         {"name": "getSelected", "returns": "list[Layer]"},
-        {"name": "getById", "returns": "Layer | None"}
+        {"name": "getById", "returns": "Layer | None"},
+        {"name": "createText", "returns": "Layer", "mutates": true},
+        {"name": "createSolid", "returns": "Layer", "mutates": true},
+        {"name": "createFootage", "returns": "Layer", "mutates": true},
+        {"name": "setTransform", "returns": "Layer", "mutates": true},
+        {"name": "setKeyframes", "returns": "Layer", "mutates": true}
       ]
     },
     {

@@ -203,6 +203,84 @@ class ProjectProxy:
         )
         return ProjectProxy(self._session, payload or self._payload)
 
+    def import_file(
+        self,
+        path: str,
+        *,
+        sequence: bool = False,
+        force_alphabetical: bool = False,
+        timeout_ms: int | None = None,
+    ) -> "FootageItemProxy":
+        payload = self._session.invoke(
+            "project",
+            "importFile",
+            {"path": path, "sequence": sequence, "forceAlphabetical": force_alphabetical},
+            options=_modal_options(timeout_ms=timeout_ms),
+        )
+        return FootageItemProxy(payload or {})
+
+    def importFile(
+        self,
+        path: str,
+        *,
+        sequence: bool = False,
+        forceAlphabetical: bool = False,
+        timeoutMs: int | None = None,
+    ) -> "FootageItemProxy":
+        return self.import_file(
+            path,
+            sequence=sequence,
+            force_alphabetical=forceAlphabetical,
+            timeout_ms=timeoutMs,
+        )
+
+    def create_composition(
+        self,
+        name: str,
+        *,
+        width: int = 1920,
+        height: int = 1080,
+        pixel_aspect: float = 1.0,
+        duration: float = 10.0,
+        frame_rate: float = 30.0,
+        timeout_ms: int | None = None,
+    ) -> "CompositionProxy":
+        payload = self._session.invoke(
+            "project",
+            "createComposition",
+            {
+                "name": name,
+                "width": width,
+                "height": height,
+                "pixelAspect": pixel_aspect,
+                "duration": duration,
+                "frameRate": frame_rate,
+            },
+            options=_modal_options(timeout_ms=timeout_ms),
+        )
+        return CompositionProxy(self._session, payload or {})
+
+    def createComposition(
+        self,
+        name: str,
+        *,
+        width: int = 1920,
+        height: int = 1080,
+        pixelAspect: float = 1.0,
+        duration: float = 10.0,
+        frameRate: float = 30.0,
+        timeoutMs: int | None = None,
+    ) -> "CompositionProxy":
+        return self.create_composition(
+            name,
+            width=width,
+            height=height,
+            pixel_aspect=pixelAspect,
+            duration=duration,
+            frame_rate=frameRate,
+            timeout_ms=timeoutMs,
+        )
+
 
 @dataclass
 class ProjectItemProxy:
@@ -446,6 +524,96 @@ class CompositionProxy:
 
     def getLayerById(self, layerId: Any) -> "LayerProxy | None":
         return self.get_layer_by_id(layerId)
+
+    def add_text_layer(
+        self, text: str, *, name: str | None = None, timeout_ms: int | None = None
+    ) -> "LayerProxy":
+        payload = self._session.invoke(
+            "layer",
+            "createText",
+            self._comp_key,
+            {"text": text, "name": name},
+            options=_modal_options(timeout_ms=timeout_ms),
+        )
+        return LayerProxy(self._session, payload or {})
+
+    def addTextLayer(
+        self, text: str, *, name: str | None = None, timeoutMs: int | None = None
+    ) -> "LayerProxy":
+        return self.add_text_layer(text, name=name, timeout_ms=timeoutMs)
+
+    def add_solid_layer(
+        self,
+        color: list[float],
+        *,
+        name: str = "Solid",
+        width: int | None = None,
+        height: int | None = None,
+        pixel_aspect: float = 1.0,
+        duration: float | None = None,
+        timeout_ms: int | None = None,
+    ) -> "LayerProxy":
+        payload = self._session.invoke(
+            "layer",
+            "createSolid",
+            self._comp_key,
+            {
+                "color": color,
+                "name": name,
+                "width": width,
+                "height": height,
+                "pixelAspect": pixel_aspect,
+                "duration": duration,
+            },
+            options=_modal_options(timeout_ms=timeout_ms),
+        )
+        return LayerProxy(self._session, payload or {})
+
+    def addSolidLayer(
+        self,
+        color: list[float],
+        *,
+        name: str = "Solid",
+        width: int | None = None,
+        height: int | None = None,
+        pixelAspect: float = 1.0,
+        duration: float | None = None,
+        timeoutMs: int | None = None,
+    ) -> "LayerProxy":
+        return self.add_solid_layer(
+            color,
+            name=name,
+            width=width,
+            height=height,
+            pixel_aspect=pixelAspect,
+            duration=duration,
+            timeout_ms=timeoutMs,
+        )
+
+    def add_footage_layer(
+        self,
+        item: "FootageItemProxy | ProjectItemProxy | Any",
+        *,
+        duration: float | None = None,
+        timeout_ms: int | None = None,
+    ) -> "LayerProxy":
+        payload = self._session.invoke(
+            "layer",
+            "createFootage",
+            self._comp_key,
+            {"item": _facade_key(item), "duration": duration},
+            options=_modal_options(timeout_ms=timeout_ms),
+        )
+        return LayerProxy(self._session, payload or {})
+
+    def addFootageLayer(
+        self,
+        item: "FootageItemProxy | ProjectItemProxy | Any",
+        *,
+        duration: float | None = None,
+        timeoutMs: int | None = None,
+    ) -> "LayerProxy":
+        return self.add_footage_layer(item, duration=duration, timeout_ms=timeoutMs)
 
     def add_to_render_queue(
         self,
@@ -883,6 +1051,82 @@ class LayerProxy:
         **properties: Any,
     ) -> "SourceTextProxy":
         return self.set_source_text(text, command_name=commandName, timeout_ms=timeoutMs, **properties)
+
+    def set_transform(
+        self,
+        *,
+        position: list[float] | None = None,
+        scale: list[float] | None = None,
+        rotation: float | None = None,
+        opacity: float | None = None,
+        anchor_point: list[float] | None = None,
+        timeout_ms: int | None = None,
+    ) -> "LayerProxy":
+        values = {
+            key: value
+            for key, value in {
+                "position": position,
+                "scale": scale,
+                "rotation": rotation,
+                "opacity": opacity,
+                "anchor_point": anchor_point,
+            }.items()
+            if value is not None
+        }
+        payload = self._session.invoke(
+            "layer",
+            "setTransform",
+            self.comp_id,
+            self._layer_key,
+            values,
+            options=_modal_options(timeout_ms=timeout_ms),
+        )
+        return LayerProxy(self._session, payload or self._payload)
+
+    def setTransform(
+        self,
+        *,
+        position: list[float] | None = None,
+        scale: list[float] | None = None,
+        rotation: float | None = None,
+        opacity: float | None = None,
+        anchorPoint: list[float] | None = None,
+        timeoutMs: int | None = None,
+    ) -> "LayerProxy":
+        return self.set_transform(
+            position=position,
+            scale=scale,
+            rotation=rotation,
+            opacity=opacity,
+            anchor_point=anchorPoint,
+            timeout_ms=timeoutMs,
+        )
+
+    def set_keyframes(
+        self,
+        property_name: str,
+        keyframes: list[dict[str, Any]],
+        *,
+        timeout_ms: int | None = None,
+    ) -> "LayerProxy":
+        payload = self._session.invoke(
+            "layer",
+            "setKeyframes",
+            self.comp_id,
+            self._layer_key,
+            {"property": property_name, "keyframes": keyframes},
+            options=_modal_options(timeout_ms=timeout_ms),
+        )
+        return LayerProxy(self._session, payload or self._payload)
+
+    def setKeyframes(
+        self,
+        propertyName: str,
+        keyframes: list[dict[str, Any]],
+        *,
+        timeoutMs: int | None = None,
+    ) -> "LayerProxy":
+        return self.set_keyframes(propertyName, keyframes, timeout_ms=timeoutMs)
 
     @property
     def _layer_key(self) -> Any:

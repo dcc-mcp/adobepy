@@ -166,6 +166,20 @@ function testExtendScriptDispatchers() {
       return index === 1 ? aeEffect : null;
     },
   };
+  const aeTransformValues = {};
+  const aeTransformKeyframes = {};
+  const aeTransformGroup = {
+    property(name) {
+      return {
+        setValue(value) {
+          aeTransformValues[name] = value;
+        },
+        setValueAtTime(time, value) {
+          (aeTransformKeyframes[name] ||= []).push({ time, value });
+        },
+      };
+    },
+  };
   const aeTextLayer = {
     id: 11,
     index: 1,
@@ -189,6 +203,7 @@ function testExtendScriptDispatchers() {
         "ADBE Text Properties": aeTextGroup,
         "ADBE Mask Parade": aeMaskGroup,
         "ADBE Effect Parade": aeEffectGroup,
+        "ADBE Transform Group": aeTransformGroup,
       }[name] || null;
     },
   };
@@ -220,6 +235,23 @@ function testExtendScriptDispatchers() {
   };
   const aeItems = [aeComp, aeFootage, aeFolder];
   const aeLayers = [aeTextLayer, aePlateLayer];
+  function addAeLayer(layer) {
+    layer.id ||= 10 + aeLayers.length + 1;
+    layer.index = aeLayers.length + 1;
+    layer.selected = false;
+    layer.enabled = true;
+    layer.solo = false;
+    layer.locked = false;
+    layer.shy = false;
+    layer.startTime = 0;
+    layer.inPoint = 0;
+    layer.outPoint ||= aeComp.duration;
+    layer.stretch = 100;
+    layer.property ||= aeTextLayer.property;
+    aeLayers.push(layer);
+    aeComp.numLayers = aeLayers.length;
+    return layer;
+  }
   const aeOutputModule = {
     name: "Lossless",
     file: { fsName: "C:/renders/Main Comp.mov", fullName: "C:/renders/Main Comp.mov", name: "Main Comp.mov" },
@@ -307,6 +339,17 @@ function testExtendScriptDispatchers() {
   aeComp.numLayers = aeLayers.length;
   aeComp.selectedLayers = [aeTextLayer];
   aeComp.layer = (index) => aeLayers[index - 1];
+  aeComp.layers = {
+    addText(text) {
+      return addAeLayer({ name: text, typeName: "TextLayer", width: 1920, height: 1080, hasVideo: true, hasAudio: false });
+    },
+    addSolid(color, name, width, height, pixelAspect, duration) {
+      return addAeLayer({ name, typeName: "AVLayer", width, height, pixelAspect, duration, color, hasVideo: true, hasAudio: false });
+    },
+    add(item, duration) {
+      return addAeLayer({ name: item.name, typeName: "AVLayer", source: item, duration, width: item.width, height: item.height, hasVideo: item.hasVideo, hasAudio: item.hasAudio });
+    },
+  };
   const aeProject = {
     file: { name: "demo.aep", fsName: "C:/demo.aep" },
     numItems: aeItems.length,
@@ -315,11 +358,28 @@ function testExtendScriptDispatchers() {
     item(index) {
       return aeItems[index - 1];
     },
+    importFile(importOptions) {
+      const item = { ...aeFootage, id: aeItems.length + 1, name: importOptions.file.name, mainSource: { file: importOptions.file, missingFootage: false } };
+      aeItems.push(item);
+      this.numItems = aeItems.length;
+      return item;
+    },
+    items: {
+      addComp(name, width, height, pixelAspect, duration, frameRate) {
+        const comp = { ...aeComp, id: aeItems.length + 1, name, width, height, pixelAspect, duration, frameRate, selected: false };
+        aeItems.push(comp);
+        aeProject.numItems = aeItems.length;
+        return comp;
+      },
+    },
   };
   const ae = loadDispatcher(afterEffectsDispatcherPath, {
     app: { version: "24.4.1", project: aeProject },
     File: function File(filePath) {
       return { fsName: filePath, fullName: filePath, name: String(filePath).split(/[\\/]/).pop() };
+    },
+    ImportOptions: function ImportOptions(file) {
+      this.file = file;
     },
     GetSettingsFormat: { STRING: "STRING", STRING_SETTABLE: "STRING_SETTABLE", NUMBER: "NUMBER", NUMBER_SETTABLE: "NUMBER_SETTABLE" },
   });
@@ -343,6 +403,15 @@ function testExtendScriptDispatchers() {
   assert.strictEqual(dispatch(ae, "ae_set_text", "text", "setSourceText", [1, 11, { text: "World", fontSize: 36 }]).result.text, "World");
   assert.strictEqual(aeTextProperty.value.fontSize, 36);
   assert.strictEqual(dispatch(ae, "ae_missing_text", "text", "setSourceText", [1, 12, { text: "Nope" }]).error.code, -32004);
+  assert.strictEqual(dispatch(ae, "ae_import", "project", "importFile", [{ path: "C:/media/logo.png" }]).result.name, "logo.png");
+  assert.strictEqual(dispatch(ae, "ae_create_comp", "project", "createComposition", [{ name: "Intro", width: 1280, height: 720, duration: 5, frameRate: 30 }]).result.name, "Intro");
+  assert.strictEqual(dispatch(ae, "ae_create_text", "layer", "createText", [1, { text: "DCC-MCP", name: "Headline" }]).result.name, "Headline");
+  assert.strictEqual(dispatch(ae, "ae_create_solid", "layer", "createSolid", [1, { name: "Background", color: [0.1, 0.2, 0.3] }]).result.name, "Background");
+  assert.strictEqual(dispatch(ae, "ae_create_footage", "layer", "createFootage", [1, { item: 2 }]).result.sourceId, 2);
+  assert.strictEqual(dispatch(ae, "ae_transform", "layer", "setTransform", [1, 11, { position: [960, 540], opacity: 80 }]).result.name, "Title");
+  assert.deepStrictEqual(aeTransformValues["ADBE Position"], [960, 540]);
+  assert.strictEqual(dispatch(ae, "ae_keyframes", "layer", "setKeyframes", [1, 11, { property: "scale", keyframes: [{ time: 0, value: [0, 0] }, { time: 1, value: [100, 100] }] }]).result.name, "Title");
+  assert.deepStrictEqual(aeTransformKeyframes["ADBE Scale"], [{ time: 0, value: [0, 0] }, { time: 1, value: [100, 100] }]);
   assert.strictEqual(dispatch(ae, "ae_render_queue", "renderQueue", "get").result.numItems, 1);
   assert.strictEqual(dispatch(ae, "ae_render_items", "renderQueue", "getItems").result[0].compName, "Main Comp");
   assert.strictEqual(dispatch(ae, "ae_render_item", "renderQueue", "getItemByIndex", [1]).result.status, "QUEUED");
