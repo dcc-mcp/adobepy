@@ -15,11 +15,11 @@ export function startCepBridge(config: CepConfig): void {
   const cep = (globalThis as any).__adobe_cep__;
   if (!cep || typeof cep.evalScript !== "function") throw new Error("Adobe CEP evalScript API unavailable");
   const socket = new WebSocket(config.brokerUrl);
-  socket.addEventListener("open", () => {
+  socket.onopen = () => {
     socket.send(JSON.stringify({ type: "hello", token: config.token, target: config.target, capabilities: config.capabilities }));
     console.log("adobepy CEP bridge connected", config.capabilities);
-  });
-  socket.addEventListener("message", (event: { data: string }) => {
+  };
+  socket.onmessage = (event: { data: string }) => {
     const message = JSON.parse(event.data);
     if (message.type !== "request") return;
     const request = message.request as RpcRequest;
@@ -41,7 +41,7 @@ export function startCepBridge(config: CepConfig): void {
     } catch (error: any) {
       socket.send(JSON.stringify({ type: "error", error: hostScriptError(request.id, error) }));
     }
-  });
+  };
 }
 
 function hostScriptError(id: string | number, error: any) {

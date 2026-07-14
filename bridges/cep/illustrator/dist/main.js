@@ -21,11 +21,11 @@
     const cep = globalThis.__adobe_cep__;
     if (!cep || typeof cep.evalScript !== "function") throw new Error("Adobe CEP evalScript API unavailable");
     const socket = new WebSocket(config.brokerUrl);
-    socket.addEventListener("open", () => {
+    socket.onopen = () => {
       socket.send(JSON.stringify({ type: "hello", token: config.token, target: config.target, capabilities: config.capabilities }));
       console.log("adobepy CEP bridge connected", config.capabilities);
-    });
-    socket.addEventListener("message", (event) => {
+    };
+    socket.onmessage = (event) => {
       const message = JSON.parse(event.data);
       if (message.type !== "request") return;
       const request = message.request;
@@ -48,7 +48,7 @@
       } catch (error) {
         socket.send(JSON.stringify({ type: "error", error: hostScriptError(request.id, error) }));
       }
-    });
+    };
   }
   function hostScriptError(id, error) {
     return { jsonrpc: "2.0", id, error: { code: ERROR_CODES.ERROR_HOST_SCRIPT, message: (error == null ? void 0 : error.message) || String(error) } };

@@ -36,6 +36,7 @@ async function main() {
       sent.push(JSON.parse(payload));
     }
     emit(name, event) {
+      if (this[`on${name}`]) this[`on${name}`](event);
       for (const listener of this.listeners[name] || []) listener(event);
     }
   }
