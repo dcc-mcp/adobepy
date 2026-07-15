@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.5.1...adobepy-v0.5.2) (2026-07-15)
+
+
+### Bug Fixes
+
+* **uxp:** preserve Unicode file paths ([ce4972d](https://github.com/dcc-mcp/adobepy/commit/ce4972df8333f48fc81b8f5751e3e8cbcb118d9c))
+
 ## [0.5.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.5.0...adobepy-v0.5.1) (2026-07-14)
 
 
