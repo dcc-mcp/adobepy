@@ -117,8 +117,8 @@
   function toFileUrl(path) {
     if (/^file:\/\//i.test(path)) return path;
     const normalized = path.replace(/\\/g, "/");
-    if (/^[A-Za-z]:\//.test(normalized)) return `file:///${encodeURI(normalized)}`;
-    if (normalized.startsWith("/")) return `file://${encodeURI(normalized)}`;
+    if (/^[A-Za-z]:\//.test(normalized)) return `file:///${normalized}`;
+    if (normalized.startsWith("/")) return `file://${normalized}`;
     return normalized;
   }
   async function evalJavaScript(source, args) {

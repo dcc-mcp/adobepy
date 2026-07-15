@@ -324,10 +324,15 @@ async function testPhotoshopBridge() {
   );
   assert.match(error(await rpc(env, "photoshop", "action", "batchPlay", [[{ _obj: "fail" }], {}], { modal: true })).message, /forced batchPlay failure/i);
   assert.deepStrictEqual(result(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/out.psd", format: "psd" }], { modal: true, commandName: "Save" })).id, 9);
+  assert.deepStrictEqual(
+    result(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/输出/卡牌 模板.psd", format: "psd" }], { modal: true, commandName: "Save Unicode" })).id,
+    9
+  );
   assert.strictEqual(result(await rpc(env, "photoshop", "raw", "evalJs", ["1 + 1"])), 2);
   assert.strictEqual(error(await rpc(env, "photoshop", "bad", "missing")).code, -32601);
   assert.ok(events.some((event) => event.kind === "modal" && event.commandName === "Hide"));
   assert.ok(events.some((event) => event.kind === "saveAs" && event.url === "file:///C:/out.psd"));
+  assert.ok(events.some((event) => event.kind === "saveAs" && event.url === "file:///C:/输出/卡牌 模板.psd"));
   assert.ok(events.some((event) => event.kind === "selection.selectRectangle"));
   assert.ok(events.some((event) => event.kind === "channel.remove"));
   assert.ok(events.some((event) => event.kind === "text.convertToShape"));

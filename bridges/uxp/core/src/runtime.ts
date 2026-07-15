@@ -60,8 +60,10 @@ export function fileName(path: string): string {
 export function toFileUrl(path: string): string {
   if (/^file:\/\//i.test(path)) return path;
   const normalized = path.replace(/\\/g, "/");
-  if (/^[A-Za-z]:\//.test(normalized)) return `file:///${encodeURI(normalized)}`;
-  if (normalized.startsWith("/")) return `file://${encodeURI(normalized)}`;
+  // UXP's FileSystemProvider expects a native file URL string. Percent-encoded
+  // segments are treated as literal filename characters by createEntryWithUrl.
+  if (/^[A-Za-z]:\//.test(normalized)) return `file:///${normalized}`;
+  if (normalized.startsWith("/")) return `file://${normalized}`;
   return normalized;
 }
 
