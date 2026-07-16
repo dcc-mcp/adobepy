@@ -77,6 +77,8 @@ function error(message) {
 async function testPhotoshopBridge() {
   const events = [];
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "bridges/uxp/photoshop/manifest.json"), "utf8"));
+  assert.strictEqual(manifest.host.data.apiVersion, 2);
+  assert.strictEqual(manifest.host.data.loadEvent, "startup");
   assert.strictEqual(manifest.requiredPermissions.localFileSystem, "fullAccess");
   let fileAccessFails = false;
   let pickerCalled = false;

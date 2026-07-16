@@ -3,7 +3,14 @@
   "id": "com.adobepy.bridge.photoshop",
   "name": "Adobe Python Bridge for Photoshop",
   "version": "0.1.0",
-  "host": { "app": "PS", "minVersion": "25.0.0" },
+  "host": {
+    "app": "PS",
+    "minVersion": "25.0.0",
+    "data": {
+      "apiVersion": 2,
+      "loadEvent": "startup"
+    }
+  },
   "entrypoints": [
     {
       "type": "panel",
