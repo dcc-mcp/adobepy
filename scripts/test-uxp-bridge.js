@@ -305,10 +305,9 @@ async function testPhotoshopBridge() {
   assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "editContents", [7], { modal: true })).id, 7);
   assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "replaceContents", [7, "C:/replacement.psb"], { modal: true })).id, 7);
   assert.strictEqual(result(await rpc(env, "photoshop", "export", "getPresets"))[0].name, "png");
-  assert.deepStrictEqual(
-    result(await rpc(env, "photoshop", "export", "exportWithPreset", [{ id: 9, path: "C:/out.jpg", preset: "jpg_high", options: { quality: 10 } }], { modal: true })).id,
-    9
-  );
+  const exportResult = result(await rpc(env, "photoshop", "export", "exportWithPreset", [{ id: 9, path: "C:/out.jpg", preset: "jpg_high", options: { quality: 10 } }], { modal: true }));
+  assert.strictEqual(exportResult.id, 9);
+  assert.strictEqual(exportResult.path, "C:/out.jpg");
   assert.strictEqual(result(await rpc(env, "photoshop", "raw", "getPath", [["app", "activeDocument", "layers", 0, "name"]], {})), "Layer 1");
   assert.deepStrictEqual(result(await rpc(env, "photoshop", "action", "batchPlay", [[{ _obj: "hide" }], { synchronousExecution: true }], { modal: true, commandName: "Hide" })), [{ _obj: "hide" }]);
   assert.deepStrictEqual(
@@ -325,11 +324,12 @@ async function testPhotoshopBridge() {
     [{ _obj: "placeEvent", null: { _path: "token:file:///C:/composite.png", _kind: "local" } }]
   );
   assert.match(error(await rpc(env, "photoshop", "action", "batchPlay", [[{ _obj: "fail" }], {}], { modal: true })).message, /forced batchPlay failure/i);
-  assert.deepStrictEqual(result(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/out.psd", format: "psd" }], { modal: true, commandName: "Save" })).id, 9);
-  assert.deepStrictEqual(
-    result(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/输出/卡牌 模板.psd", format: "psd" }], { modal: true, commandName: "Save Unicode" })).id,
-    9
-  );
+  const saveResult = result(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/out.psd", format: "psd" }], { modal: true, commandName: "Save" }));
+  assert.strictEqual(saveResult.id, 9);
+  assert.strictEqual(saveResult.path, "C:/out.psd");
+  const unicodeSaveResult = result(await rpc(env, "photoshop", "document", "saveAs", [{ id: 9, path: "C:/输出/卡牌 模板.psd", format: "psd" }], { modal: true, commandName: "Save Unicode" }));
+  assert.strictEqual(unicodeSaveResult.id, 9);
+  assert.strictEqual(unicodeSaveResult.path, "C:/输出/卡牌 模板.psd");
   assert.strictEqual(result(await rpc(env, "photoshop", "raw", "evalJs", ["1 + 1"])), 2);
   assert.strictEqual(error(await rpc(env, "photoshop", "bad", "missing")).code, -32601);
   assert.ok(events.some((event) => event.kind === "modal" && event.commandName === "Hide"));
