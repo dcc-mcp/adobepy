@@ -859,12 +859,12 @@ async function saveDocument(request: RpcRequest, asCopy: boolean) {
     const saveFormat = property<Callable>(saveAs, format);
     if (saveFormat) {
       await maybePromise(saveFormat.call(saveAs, entry, saveOptions, saveAsCopy));
-      return serializeDocument(document);
+      return { ...serializeDocument(document), path };
     }
     const directSaveAs = property<Callable>(document, "saveAs");
     if (directSaveAs) {
       await maybePromise(directSaveAs.call(document, entry, { ...saveOptions, format }, saveAsCopy));
-      return serializeDocument(document);
+      return { ...serializeDocument(document), path };
     }
     unavailable(`Photoshop document.saveAs.${format}`);
   });
