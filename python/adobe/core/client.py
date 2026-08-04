@@ -25,7 +25,7 @@ class BrokerClient:
         timeout: float = 30.0,
     ) -> None:
         self.broker_url = (broker_url or os.getenv("ADOBEPY_BROKER_URL") or DEFAULT_BROKER_URL).rstrip("/")
-        self.token = token if token is not None else os.getenv("ADOBEPY_TOKEN", "dev-token")
+        self.token = token if token is not None else os.getenv("ADOBEPY_TOKEN", "")
         self.target = target if target is not None else os.getenv("ADOBEPY_TARGET", "default")
         self.timeout = timeout
 

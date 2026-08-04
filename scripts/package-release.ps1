@@ -126,7 +126,7 @@ compiled UXP/CEP bridge templates, IR contracts, and operation docs.
 ```powershell
 .\install.ps1 -Python python -AddToUserPath
 .\bin\adobepy.exe doctor
-`$env:ADOBEPY_TOKEN = "dev-token"
+`$env:ADOBEPY_TOKEN = "choose-a-local-token"
 .\bin\adobepy.exe broker --token `$env:ADOBEPY_TOKEN
 ```
 

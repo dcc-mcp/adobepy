@@ -6,7 +6,11 @@ declare const WebSocket: any;
 
 export function connectBridge(adapter: HostAdapter): void {
   const url = (globalThis as any).__ADOBEPY_BROKER_URL || `ws://127.0.0.1:47391/v1/bridge/${adapter.capabilities().host}/ws`;
-  const token = (globalThis as any).__ADOBEPY_TOKEN || "dev-token";
+  const token = (globalThis as any).__ADOBEPY_TOKEN;
+  if (typeof token !== "string" || token.trim() === "") {
+    console.error("[adobepy] ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
+    return;
+  }
   const target = (globalThis as any).__ADOBEPY_TARGET || "default";
   const socket = new WebSocket(url);
   socket.addEventListener("open", () => {

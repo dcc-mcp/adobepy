@@ -20,6 +20,9 @@
   function startCepBridge(config) {
     const cep = globalThis.__adobe_cep__;
     if (!cep || typeof cep.evalScript !== "function") throw new Error("Adobe CEP evalScript API unavailable");
+    if (typeof config.token !== "string" || config.token.trim() === "") {
+      throw new Error("ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
+    }
     const extensionPath = cep.getSystemPath("extension").replace(/\\/g, "/");
     cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/host/dispatcher.jsx`)})`, () => {
       const socket = new WebSocket(config.brokerUrl);
@@ -66,7 +69,7 @@
   startCepBridge({
     host: "after-effects",
     brokerUrl: globalThis.__ADOBEPY_BROKER_URL || "ws://127.0.0.1:47391/v1/bridge/after-effects/ws",
-    token: globalThis.__ADOBEPY_TOKEN || "dev-token",
+    token: globalThis.__ADOBEPY_TOKEN || "",
     target: globalThis.__ADOBEPY_TARGET || "default",
     capabilities: {
       host: "after-effects",

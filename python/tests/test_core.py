@@ -115,6 +115,10 @@ class CoreTests(unittest.TestCase):
             with self.assertRaises(BrokerConnectionError):
                 BrokerClient("http://broker.test").capabilities()
 
+    def test_broker_client_does_not_invent_a_token(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(BrokerClient("http://broker.test").token, "")
+
     def test_adobepy_target_env_var_in_broker_client(self):
         with mock.patch.dict(os.environ, {"ADOBEPY_TARGET": "env-target"}):
             client = BrokerClient()

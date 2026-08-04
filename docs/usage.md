@@ -3,7 +3,8 @@
 ## Broker
 
 ```powershell
-adobepy broker --token dev-token
+$env:ADOBEPY_TOKEN = "choose-a-local-token"
+adobepy broker --token $env:ADOBEPY_TOKEN
 ```
 
 The broker listens on `127.0.0.1:47391` and exposes `/health`,
@@ -13,8 +14,8 @@ routes use `x-adobepy-token`.
 ## Python
 
 ```powershell
-$env:ADOBEPY_TOKEN = "dev-token"
-python -c "from adobe.photoshop import Photoshop; print(Photoshop(token='dev-token').version)"
+$env:ADOBEPY_TOKEN = "choose-a-local-token"
+python -c "import os; from adobe.photoshop import Photoshop; print(Photoshop(token=os.environ['ADOBEPY_TOKEN']).version)"
 ```
 
 Photoshop exposes JS-shaped aliases such as `activeDocument`,
@@ -187,8 +188,12 @@ until they are promoted into typed facades.
 ## Bridges
 
 ```powershell
-adobepy install-bridge photoshop --dest C:\Temp\adobepy-photoshop-bridge --token dev-token
+adobepy install-bridge photoshop --dest C:\Temp\adobepy-photoshop-bridge --token $env:ADOBEPY_TOKEN --json
 ```
+
+`install-bridge` requires the same token as the running broker. With `--json`,
+it returns the host, bridge kind, destination, generated config path, and a
+`token_configured` boolean without printing the secret.
 
 UXP templates cover Photoshop, InDesign, and Premiere. CEP templates cover After
 Effects and Illustrator. Host-specific loading, signing, and marketplace flows
