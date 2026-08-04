@@ -58,10 +58,12 @@ struct InstallBridgeArgs {
     kind: BridgeInstallKind,
     #[arg(long, env = "ADOBEPY_BROKER_URL")]
     broker_url: Option<String>,
-    #[arg(long, env = "ADOBEPY_TOKEN", default_value = "dev-token")]
+    #[arg(long, env = "ADOBEPY_TOKEN")]
     token: String,
     #[arg(long, default_value = "default")]
     target: String,
+    #[arg(long, help = "Print machine-readable installation metadata")]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -77,7 +79,7 @@ struct ReplArgs {
     host: String,
     #[arg(long, default_value = "http://127.0.0.1:47391")]
     broker_url: String,
-    #[arg(long, env = "ADOBEPY_TOKEN", default_value = "dev-token")]
+    #[arg(long, env = "ADOBEPY_TOKEN")]
     token: String,
     #[arg(long, env = "ADOBEPY_PYTHON")]
     python: Option<PathBuf>,
@@ -198,6 +200,9 @@ fn python_runtime_check(
 }
 
 fn install_bridge(args: InstallBridgeArgs) -> Result<()> {
+    if args.token.trim().is_empty() {
+        bail!("ADOBEPY_TOKEN is required; pass --token or set ADOBEPY_TOKEN to the broker token");
+    }
     let host: HostKind = args.host.parse()?;
     let kind = match args.kind {
         BridgeInstallKind::Auto => match host {
@@ -221,10 +226,24 @@ fn install_bridge(args: InstallBridgeArgs) -> Result<()> {
         &args.token,
         &args.target,
     )?;
-    println!(
-        "installed bridge template for {host} to {}",
-        args.dest.display()
-    );
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "success": true,
+                "host": host.as_str(),
+                "kind": format!("{kind:?}").to_lowercase(),
+                "destination": args.dest.display().to_string(),
+                "config": args.dest.join("adobepy.config.js").display().to_string(),
+                "token_configured": true,
+            }))?
+        );
+    } else {
+        println!(
+            "installed bridge template for {host} to {} (token configured)",
+            args.dest.display()
+        );
+    }
     Ok(())
 }
 

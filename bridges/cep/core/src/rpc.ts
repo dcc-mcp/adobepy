@@ -14,6 +14,9 @@ declare const WebSocket: any;
 export function startCepBridge(config: CepConfig): void {
   const cep = (globalThis as any).__adobe_cep__;
   if (!cep || typeof cep.evalScript !== "function") throw new Error("Adobe CEP evalScript API unavailable");
+  if (typeof config.token !== "string" || config.token.trim() === "") {
+    throw new Error("ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
+  }
   const extensionPath = cep.getSystemPath("extension").replace(/\\/g, "/");
   cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/host/dispatcher.jsx`)})`, () => {
     const socket = new WebSocket(config.brokerUrl);

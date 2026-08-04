@@ -87,7 +87,8 @@ The `adobepy broker` command prints the token to stderr on startup:
 ADOBEPY_TOKEN=dev-<uuid>
 ```
 
-The adapter **may** capture and forward this token to other consumers.
+Automated installers should pass the token through `ADOBEPY_TOKEN` or
+`--token`; they must not assume `dev-token`.
 
 ### 2.3 Lifecycle Ownership
 

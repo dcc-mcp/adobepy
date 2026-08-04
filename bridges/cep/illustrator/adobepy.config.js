@@ -1,1 +1,1 @@
-(function(){globalThis.__ADOBEPY_BROKER_URL=globalThis.__ADOBEPY_BROKER_URL||"ws://127.0.0.1:47391/v1/bridge/illustrator/ws";globalThis.__ADOBEPY_TOKEN=globalThis.__ADOBEPY_TOKEN||"dev-token";globalThis.__ADOBEPY_TARGET=globalThis.__ADOBEPY_TARGET||"default";}());
+(function(){globalThis.__ADOBEPY_BROKER_URL=globalThis.__ADOBEPY_BROKER_URL||"ws://127.0.0.1:47391/v1/bridge/illustrator/ws";globalThis.__ADOBEPY_TOKEN=globalThis.__ADOBEPY_TOKEN||"";globalThis.__ADOBEPY_TARGET=globalThis.__ADOBEPY_TARGET||"default";}());

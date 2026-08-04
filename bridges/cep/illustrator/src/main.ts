@@ -3,7 +3,7 @@ import { startCepBridge } from "../../core/src/rpc";
 startCepBridge({
   host: "illustrator",
   brokerUrl: (globalThis as any).__ADOBEPY_BROKER_URL || "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
-  token: (globalThis as any).__ADOBEPY_TOKEN || "dev-token",
+  token: (globalThis as any).__ADOBEPY_TOKEN || "",
   target: (globalThis as any).__ADOBEPY_TARGET || "default",
   capabilities: {
     host: "illustrator",
