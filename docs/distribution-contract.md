@@ -109,6 +109,7 @@ adobepy-<version>-windows-x64/
   docs/                    # Operation docs
   generators/              # IR contracts and generators
   install.ps1              # One-shot installer (installs wheel, optionally adds bin/ to PATH)
+  install.md               # Complete install and usage guide
   DISTRIBUTION-README.md
   package-manifest.json
   README.md
