@@ -194,7 +194,7 @@ Invoke-Step "Stage distribution tree" {
     $pdbPath = Join-Path $Root "target\release\adobepy.pdb"
     if (Test-Path -LiteralPath $pdbPath) { Copy-File $pdbPath (Join-Path $stageRoot "bin\adobepy.pdb") }
     foreach ($dir in @("python", "bridges", "docs", "generators")) { Copy-Tree $dir (Join-Path $stageRoot $dir) }
-    foreach ($file in @("README.md", "pyproject.toml", "package.json", "package-lock.json", "Cargo.toml", "Cargo.lock")) {
+    foreach ($file in @("README.md", "install.md", "pyproject.toml", "package.json", "package-lock.json", "Cargo.toml", "Cargo.lock")) {
         Copy-File $file (Join-Path $stageRoot $file)
     }
     if ($IncludePortablePython -and (Test-Path -LiteralPath ".adobepy\python")) {
@@ -218,7 +218,7 @@ Invoke-Step "Write package docs and manifest" {
         runtime = $runtimeId
         builtAt = (Get-Date).ToUniversalTime().ToString("o")
         commands = @("vx just package", ".\install.ps1 -Python python -AddToUserPath", ".\bin\adobepy.exe doctor")
-        includes = @("bin/adobepy.exe", "wheels/*.whl", "python/adobe", "bridges/uxp", "bridges/cep", "docs", "generators/ir")
+        includes = @("bin/adobepy.exe", "wheels/*.whl", "python/adobe", "bridges/uxp", "bridges/cep", "docs", "generators/ir", "install.md")
         notes = @("Rust dependencies are linked into the release executable.", "Bridge JavaScript dependencies are bundled into bridges/**/dist.", "The Python SDK has no third-party runtime dependencies.")
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stageRoot "package-manifest.json") -Encoding UTF8
 }

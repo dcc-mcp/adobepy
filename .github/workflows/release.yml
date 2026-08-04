@@ -137,8 +137,7 @@ jobs:
         shell: pwsh
         run: |
           $exe = Join-Path $env:STANDALONE_BUILD_DIR "adobepy-python"
-          & $exe --version
-          & $exe -c "from adobe.photoshop import Photoshop; print('standalone smoke OK')"
+          & $exe -c "import sys; from adobe.photoshop import Photoshop; assert sys.version_info >= (3, 8); print('standalone smoke OK')"
           if ($LASTEXITCODE -ne 0) { throw "standalone interpreter smoke failed" }
       - uses: actions/upload-artifact@v4
         with:
@@ -198,8 +197,7 @@ jobs:
       - name: Smoke test standalone interpreter
         shell: bash
         run: |
-          "$STANDALONE_BUILD_DIR/adobepy-python" --version
-          "$STANDALONE_BUILD_DIR/adobepy-python" -c "from adobe.photoshop import Photoshop; print('standalone smoke OK')"
+          "$STANDALONE_BUILD_DIR/adobepy-python" -c "import sys; from adobe.photoshop import Photoshop; assert sys.version_info >= (3, 8); print('standalone smoke OK')"
       - uses: actions/upload-artifact@v4
         with:
           name: adobepy-standalone-macos
@@ -258,8 +256,7 @@ jobs:
       - name: Smoke test standalone interpreter
         shell: bash
         run: |
-          "$STANDALONE_BUILD_DIR/adobepy-python" --version
-          "$STANDALONE_BUILD_DIR/adobepy-python" -c "from adobe.photoshop import Photoshop; print('standalone smoke OK')"
+          "$STANDALONE_BUILD_DIR/adobepy-python" -c "import sys; from adobe.photoshop import Photoshop; assert sys.version_info >= (3, 8); print('standalone smoke OK')"
       - uses: actions/upload-artifact@v4
         with:
           name: adobepy-standalone-linux

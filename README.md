@@ -27,6 +27,9 @@ npm install
 npm run test:all
 ```
 
+Installation, standalone use, broker startup, bridge loading, and
+troubleshooting are documented in [`install.md`](install.md).
+
 The full test suite type-checks bridge code, builds and exercises UXP/CEP
 bundles with mocked host runtimes, validates IR contracts, checks Python
 coverage, and runs Rust workspace tests.

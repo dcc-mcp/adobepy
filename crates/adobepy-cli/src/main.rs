@@ -5,7 +5,6 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use std::env;
 use std::fs;
-use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -118,8 +117,6 @@ fn doctor(args: DoctorArgs) -> Result<()> {
             args.python.as_deref(),
             args.python_home.as_deref(),
         ),
-        command_check("node", &["--version"]),
-        command_check("npm", &["--version"]),
         json!({"name": "bridge_templates", "ok": repo_root.as_ref().is_some_and(|root| root.join("bridges").is_dir()), "detail": repo_root.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "repository root not found".to_owned())}),
     ];
     if args.json {
@@ -136,38 +133,6 @@ fn doctor(args: DoctorArgs) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn command_check(program: &str, args: &[&str]) -> serde_json::Value {
-    match run_command(program, args) {
-        Ok(output) => {
-            let detail = String::from_utf8_lossy(if output.stdout.is_empty() {
-                &output.stderr
-            } else {
-                &output.stdout
-            })
-            .trim()
-            .to_owned();
-            json!({"name": program, "ok": output.status.success(), "detail": detail})
-        }
-        Err(error) => json!({"name": program, "ok": false, "detail": error.to_string()}),
-    }
-}
-
-fn run_command(program: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
-    let result = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-    if cfg!(windows) && matches!(result, Err(ref error) if error.kind() == ErrorKind::NotFound) {
-        return Command::new(format!("{program}.cmd"))
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-    }
-    result
 }
 
 fn python_runtime_check(
