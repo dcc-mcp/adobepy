@@ -81,8 +81,9 @@ reference entry before facade coverage expands.
 npm run api:coverage
 ```
 
-Coverage matrix report. It prints current MVP vs planned API object families
-for each Adobe host so interface expansion stays measurable.
+Capability matrix report. It prints declared typed facade progress separately
+from complete structured DOM availability, without presenting the registry as a
+percentage of Adobe's version-dependent official API surface.
 
 ```powershell
 npm run abi3:check

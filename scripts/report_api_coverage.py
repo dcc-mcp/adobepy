@@ -26,6 +26,8 @@ def build_rows(registry_path: pathlib.Path) -> List[Dict[str, Any]]:
         targets = source["coverageTargets"]
         mvp = [target for target in targets if target["level"] == "mvp"]
         planned = [target for target in targets if target["level"] == "planned"]
+        ir = load_json(ROOT / source["ir"])
+        structured_dom = any(namespace.get("name") == "dom" for namespace in ir["namespaces"])
         rows.append(
             {
                 "host": source["host"],
@@ -34,6 +36,7 @@ def build_rows(registry_path: pathlib.Path) -> List[Dict[str, Any]]:
                 "planned": len(planned),
                 "total": len(targets),
                 "percent": round((len(mvp) / len(targets)) * 100, 1),
+                "structured_dom": structured_dom,
                 "next": [target["name"] for target in planned],
             }
         )
@@ -42,15 +45,20 @@ def build_rows(registry_path: pathlib.Path) -> List[Dict[str, Any]]:
 
 def render_markdown(rows: List[Dict[str, Any]]) -> str:
     lines = [
-        "| Host | Bridge | MVP targets | Planned targets | Coverage | Next targets |",
-        "| --- | --- | ---: | ---: | ---: | --- |",
+        "Declared target progress measures only registry-listed typed facade families; "
+        "it is not a percentage of Adobe's complete API surface.",
+        "",
+        "| Host | Bridge | Typed facade targets | Planned typed targets | Declared target progress | Structured official DOM | Next typed targets |",
+        "| --- | --- | ---: | ---: | ---: | --- | --- |",
     ]
     for row in rows:
         next_targets = ", ".join(row["next"]) if row["next"] else "none"
+        display = dict(row)
+        display["next_targets"] = next_targets
+        display["structured_dom"] = "yes" if row["structured_dom"] else "no"
         lines.append(
-            "| {host} | {bridge} | {mvp} | {planned} | {percent}% | {next_targets} |".format(
-                next_targets=next_targets,
-                **row,
+            "| {host} | {bridge} | {mvp} | {planned} | {percent}% | {structured_dom} | {next_targets} |".format(
+                **display,
             )
         )
     return "\n".join(lines)
