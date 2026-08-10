@@ -422,6 +422,10 @@ class CapturingClient:
                 return path if args[0] == "Logo Path" else None
             if method == "getLayerItems":
                 return [path] if args[0] in {"layer-1", "Artwork", 0} else []
+            if method in {"setEntirePath", "translate", "resize", "rotate"}:
+                if method == "setEntirePath":
+                    path["pathPointCount"] = len(args[1])
+                return path
         if host == "illustrator" and namespace == "compoundPath":
             compound = {
                 "id": "compound-1",
@@ -1787,12 +1791,27 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(layer.pathItems[0].pathPointCount, 4)
         self.assertEqual(doc.get_path_item_by_name("Logo Path").strokeWidth, 2)
         self.assertEqual(doc.getPathItemByName("Logo Path").fillColor["red"], 255)
-        with self.assertRaises(NotImplementedError):
-            path.set_entire_path([[0, 0], [10, 10]])
-        with self.assertRaises(NotImplementedError):
-            path.setEntirePath([[0, 0], [10, 10]])
-        with self.assertRaises(NotImplementedError):
-            path.translate(10, 20)
+        self.assertIs(path.set_entire_path([[0, 0], [10, 10]], command_name="Set path"), path)
+        self.assertEqual(path.path_point_count, 2)
+        self.assertEqual(illustrator.client.calls[-1]["args"], ["path-1", [[0, 0], [10, 10]]])
+        self.assertEqual(illustrator.client.calls[-1]["options"]["commandName"], "Set path")
+        self.assertIs(path.setEntirePath([[0, 0], [5, 5], [10, 0]], commandName="Set path alias"), path)
+        self.assertEqual(path.pathPointCount, 3)
+        self.assertIs(path.translate(10, 20, transform_fill_patterns=False), path)
+        self.assertEqual(
+            illustrator.client.calls[-1]["args"],
+            ["path-1", {"deltaX": 10, "deltaY": 20, "transformFillPatterns": False}],
+        )
+        self.assertIs(path.resize(125, 80, change_line_widths=100, scale_about="CENTER"), path)
+        self.assertEqual(
+            illustrator.client.calls[-1]["args"],
+            ["path-1", {"scaleX": 125, "scaleY": 80, "changeLineWidths": 100, "scaleAbout": "CENTER"}],
+        )
+        self.assertIs(path.rotate(45, change_positions=True, rotate_about="CENTER"), path)
+        self.assertEqual(
+            illustrator.client.calls[-1]["args"],
+            ["path-1", {"angle": 45, "changePositions": True, "rotateAbout": "CENTER"}],
+        )
         compound = doc.compound_path_items[0]
         self.assertEqual(compound.name, "Compound Logo")
         self.assertEqual(compound.path_item_count, 1)

@@ -39,7 +39,11 @@
         {"name": "getPathItems", "returns": "list[PathItem]"},
         {"name": "getSelected", "returns": "list[PathItem]"},
         {"name": "getByName", "returns": "PathItem | None"},
-        {"name": "getLayerItems", "returns": "list[PathItem]"}
+        {"name": "getLayerItems", "returns": "list[PathItem]"},
+        {"name": "setEntirePath", "returns": "PathItem", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "translate", "returns": "PathItem", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "resize", "returns": "PathItem", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "rotate", "returns": "PathItem", "mutatesState": true, "requiresModalWhenMutating": true}
       ]
     },
     {
@@ -286,10 +290,10 @@
         {"name": "typename", "type": "str | None"}
       ],
       "methods": [
-        {"name": "setEntirePath", "returns": "Any"},
-        {"name": "translate", "returns": "Any"},
-        {"name": "resize", "returns": "Any"},
-        {"name": "rotate", "returns": "Any"}
+        {"name": "setEntirePath", "returns": "PathItem"},
+        {"name": "translate", "returns": "PathItem"},
+        {"name": "resize", "returns": "PathItem"},
+        {"name": "rotate", "returns": "PathItem"}
       ]
     },
     {

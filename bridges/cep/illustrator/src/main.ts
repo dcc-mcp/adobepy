@@ -33,7 +33,7 @@ startCepBridge({
       artboard: ["getArtboards", "getActive", "getActiveIndex"],
       layer: ["getLayers", "getByName", "getChildren"],
       pageItem: ["getPageItems", "getSelected", "getByName", "getLayerItems"],
-      pathItem: ["getPathItems", "getSelected", "getByName", "getLayerItems"],
+      pathItem: ["getPathItems", "getSelected", "getByName", "getLayerItems", "setEntirePath", "translate", "resize", "rotate"],
       compoundPath: ["getCompoundPathItems", "getSelected", "getByName", "getLayerItems", "getPathItems"],
       placedItem: ["getPlacedItems", "getSelected", "getByName", "getLayerItems"],
       rasterItem: ["getRasterItems", "getSelected", "getByName", "getLayerItems"],

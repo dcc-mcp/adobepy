@@ -151,6 +151,12 @@ logo = doc.get_page_item_by_name("Logo")
 for path in doc.path_items:
     print(path.name, path.closed, path.fill_color, path.stroke_width)
 
+logo_path = doc.get_path_item_by_name("Logo Path")
+logo_path.set_entire_path([[0, 0], [100, 0], [100, 100], [0, 100]])
+logo_path.translate(12, 8, transform_fill_patterns=False)
+logo_path.resize(125, 125, change_positions=True, change_line_widths=100)
+logo_path.rotate(15, change_positions=True)
+
 for compound in doc.compound_path_items:
     print(compound.name, compound.path_item_count)
     for child_path in compound.path_items:
@@ -178,12 +184,11 @@ doc.exports.pdf("C:/out/poster.pdf", options={"preserveEditability": False})
 
 Use `adobe.raw.RawSession("illustrator").eval_extendscript(...)` for Illustrator
 APIs outside the typed document/artboard/layer/page-item/path/placed/raster/text/
-swatch/export facade. Geometry mutations such as `PathItem.setEntirePath`, `translate`,
-`resize`, and `rotate` are intentionally deferred in the typed facade until
-their mutation semantics and modal/error behavior are covered by replay or live
-host tests. Advanced text styling, custom color creation, print presets, and
-specialized export option objects remain available through raw ExtendScript
-until they are promoted into typed facades.
+swatch/export facade. `PathItem.setEntirePath`, `translate`, `resize`, and `rotate`
+are available through the typed facade with their official optional parameters.
+Advanced text styling, custom color creation, print presets, and specialized
+export option objects remain available through structured DOM access or raw
+ExtendScript until they are promoted into typed facades.
 
 ## Complete official DOM access
 
