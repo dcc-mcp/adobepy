@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .capabilities import HostCapabilities, normalize_capability_sessions
 from .client import BrokerClient
+from .dom import DomNamespace, DomObject
 from .errors import (
     AdobePythonError,
     BridgeNotInstalledError,
@@ -24,6 +25,8 @@ __all__ = [
     "BrokerClient",
     "BrokerConnectionError",
     "CapabilityError",
+    "DomNamespace",
+    "DomObject",
     "HostCapabilities",
     "HostNotRunningError",
     "HostScriptError",

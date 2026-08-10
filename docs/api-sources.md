@@ -41,6 +41,10 @@ IR, bridge capabilities, Python facade, and Pythonic aliases.
 - UXP hosts should prefer typed DOM APIs over raw script execution. Photoshop
   keeps `action.batchPlay` because Adobe documents it as the advanced escape
   hatch below the DOM model.
+- Structured DOM access makes the installed UXP object model reachable without
+  arbitrary script evaluation, but it does not count as typed facade coverage.
+  Coverage targets move to MVP only when IR, facade, bridge workflow, and tests
+  define the stable Python contract.
 - Photoshop selection and channel coverage should use the typed UXP DOM surface
   first: `document.selection` for pixel selections and `document.channels` /
   `activeChannels` / `componentChannels` for channel access.

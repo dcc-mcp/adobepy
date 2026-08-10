@@ -514,6 +514,7 @@ async function testInDesignBridge() {
   assert.ok(env.sent[0].capabilities.methods.link.includes("relink"));
   assert.ok(env.sent[0].capabilities.methods.export.includes("exportFile"));
   assert.ok(env.sent[0].capabilities.methods.package.includes("packageForPrint"));
+  assert.ok(env.sent[0].capabilities.methods.dom.includes("construct"));
   assert.strictEqual(result(await rpc(env, "indesign", "app", "getVersion")), "19.5.0");
   assert.strictEqual(result(await rpc(env, "indesign", "document", "getActive")).pageCount, 2);
   assert.strictEqual(result(await rpc(env, "indesign", "page", "getPages", [3]))[1].documentOffset, 1);
@@ -553,10 +554,23 @@ async function testInDesignBridge() {
   delete document.packageForPrint;
   assert.strictEqual(error(await rpc(env, "indesign", "package", "packageForPrint", [{ id: 3, path: "C:/out/missing-package" }])).code, -32004);
   document.packageForPrint = packageForPrint;
+  const indesignAppRef = result(await rpc(env, "indesign", "dom", "root", ["app"]));
+  assert.match(error(await rpc(env, "indesign", "dom", "get", [indesignAppRef, "constructor"])).message, /not accessible/i);
+  const indesignDocumentRef = result(await rpc(env, "indesign", "dom", "get", [indesignAppRef, "activeDocument"]));
+  assert.strictEqual(result(await rpc(env, "indesign", "dom", "get", [indesignDocumentRef, "name"])), "layout.indd");
+  assert.strictEqual(
+    result(await rpc(env, "indesign", "dom", "set", [indesignDocumentRef, "name", "layout-renamed.indd"], { commandName: "Rename document" })),
+    "layout-renamed.indd"
+  );
+  assert.strictEqual(result(await rpc(env, "indesign", "dom", "snapshot", [indesignDocumentRef, ["name", "typename"]])).typename, "Document");
+  assert.ok(result(await rpc(env, "indesign", "dom", "keys", [indesignDocumentRef])).includes("name"));
+  assert.strictEqual(result(await rpc(env, "indesign", "dom", "release", [indesignDocumentRef])), true);
+  assert.match(error(await rpc(env, "indesign", "dom", "get", [indesignDocumentRef, "name"])).message, /stale or unknown/i);
   assert.strictEqual(result(await rpc(env, "indesign", "raw", "evalJs", ["40 + 2"])), 42);
   assert.ok(events.some((event) => event.kind === "page.select" && event.existingSelection === "replace"));
   assert.ok(events.some((event) => event.kind === "doScript" && event.commandName === "Text"));
   assert.ok(events.some((event) => event.kind === "doScript" && event.commandName === "Story"));
+  assert.ok(events.some((event) => event.kind === "doScript" && event.commandName === "Rename document"));
   assert.ok(events.some((event) => event.kind === "link.update"));
   assert.ok(events.some((event) => event.kind === "link.relink" && event.file === "file:///C:/assets/hero-new.png"));
   assert.ok(events.some((event) => event.kind === "document.exportFile" && event.format === "PDF_TYPE" && event.using === "Press" && event.showingOptions === true));
@@ -714,6 +728,15 @@ async function testPremiereBridge() {
   const env = await loadBundle("bridges/uxp/premiere/dist/main.js", {
     premierepro: {
       version: "25.6.0",
+      AAFExportOptions: class AAFExportOptions {
+        constructor() {
+          this.embedAudio = false;
+        }
+        setEmbedAudio(value) {
+          this.embedAudio = value;
+          return this;
+        }
+      },
       constants: {
         ExportType: {
           IMMEDIATELY: "IMMEDIATELY",
@@ -780,6 +803,7 @@ async function testPremiereBridge() {
   assert.ok(env.sent[0].capabilities.methods.marker.includes("create"));
   assert.ok(env.sent[0].capabilities.methods.encoder.includes("exportSequence"));
   assert.ok(env.sent[0].capabilities.methods.export.includes("exportFrame"));
+  assert.ok(env.sent[0].capabilities.methods.dom.includes("snapshot"));
   assert.strictEqual(result(await rpc(env, "premiere", "app", "getVersion")), "25.6.0");
   assert.deepStrictEqual(result(await rpc(env, "premiere", "project", "getActive")), {
     id: "project-1",
@@ -845,6 +869,20 @@ async function testPremiereBridge() {
   const frameJob = result(await rpc(env, "premiere", "export", "exportFrame", [{ sequence: "seq-1", outputPath: "C:/out/frame.png", time: 42, width: 1920, height: 1080 }]));
   assert.strictEqual(frameJob.status, "exported");
   assert.strictEqual(error(await rpc(env, "premiere", "encoder", "encodeFile", [{ sourcePath: "C:/media/source.mov" }])).code, -32004);
+  const premiereModuleRef = result(await rpc(env, "premiere", "dom", "root", ["module"]));
+  const projectApiRef = result(await rpc(env, "premiere", "dom", "get", [premiereModuleRef, "Project"]));
+  const premiereProjectRef = result(await rpc(env, "premiere", "dom", "call", [projectApiRef, "getActiveProject", []]));
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "get", [premiereProjectRef, "name"])), "cut.prproj");
+  const projectUtilsRef = result(await rpc(env, "premiere", "dom", "get", [premiereModuleRef, "ProjectUtils"]));
+  const selectedRefs = result(await rpc(env, "premiere", "dom", "call", [projectUtilsRef, "getSelection", [premiereProjectRef]]));
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "get", [selectedRefs[0], "name"])), "shot.mov");
+  const aafOptionsRef = result(await rpc(env, "premiere", "dom", "construct", [premiereModuleRef, "AAFExportOptions", []]));
+  const returnedOptionsRef = result(await rpc(env, "premiere", "dom", "call", [aafOptionsRef, "setEmbedAudio", [true]], { modal: true }));
+  assert.deepStrictEqual(returnedOptionsRef, aafOptionsRef);
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "get", [returnedOptionsRef, "embedAudio"])), true);
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "snapshot", [premiereProjectRef, ["name", "path"]])).path, "C:/edits/intro.prproj");
+  assert.ok(result(await rpc(env, "premiere", "dom", "keys", [premiereProjectRef])).includes("save"));
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "release", [premiereProjectRef])), true);
   assert.strictEqual(result(await rpc(env, "premiere", "raw", "evalJs", ["6 * 7"])), 42);
   assert.ok(events.some((event) => event.kind === "encoder.extension" && event.presetPath === "C:/presets/h264.epr"));
   assert.ok(events.some((event) => event.kind === "encoder.encodeFile" && event.workArea === 0 && event.removeUponCompletion === false));

@@ -1,9 +1,21 @@
 import { methodNotFound, unavailable } from "../../core/src/errors";
+import { DomRuntime } from "../../core/src/dom";
 import type { HostAdapter } from "../../core/src/host-adapter";
 import type { RpcRequest } from "../../core/src/protocol";
 import { asArray, asNumber, asString, evalJavaScript, isObject, maybePromise, optionalRequire, property, toFileUrl } from "../../core/src/runtime";
 
 type Callable = (...args: unknown[]) => unknown;
+
+const domRuntime = new DomRuntime({
+  roots(name) {
+    if (name === "app") return indesignApp();
+    if (name === "module" || name === "indesign") return indesignModule();
+    return undefined;
+  },
+  runMutation(request, commandName, operation) {
+    return withInDesignCommand(request, commandName, operation);
+  }
+});
 
 export const indesignAdapter: HostAdapter = {
   capabilities() {
@@ -12,8 +24,8 @@ export const indesignAdapter: HostAdapter = {
       bridgeKind: "uxp",
       bridgeVersion: "0.1.0",
       hostVersion: indesignVersion(),
-      namespaces: ["app", "document", "page", "spread", "text", "story", "style", "swatch", "link", "export", "package", "raw"],
-      features: ["dom"],
+      namespaces: ["app", "document", "page", "spread", "text", "story", "style", "swatch", "link", "export", "package", "dom", "raw"],
+      features: ["dom", "structuredDom"],
       methods: {
         app: ["getVersion"],
         document: ["getActive"],
@@ -33,11 +45,13 @@ export const indesignAdapter: HostAdapter = {
         link: ["getLinks", "getByName", "update", "relink"],
         export: ["exportFile"],
         package: ["packageForPrint"],
+        dom: ["root", "get", "set", "call", "construct", "keys", "snapshot", "release"],
         raw: ["evalJs"]
       }
     };
   },
   async dispatch(request: RpcRequest) {
+    if (request.namespace === "dom") return domRuntime.dispatch(request);
     if (request.namespace === "app" && request.method === "getVersion") return indesignVersion();
     if (request.namespace === "document" && request.method === "getActive") return serializeDocument(activeDocument());
     if (request.namespace === "page" && request.method === "getPages") return documentPages(request);

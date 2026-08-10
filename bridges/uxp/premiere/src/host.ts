@@ -1,9 +1,18 @@
 import { methodNotFound, unavailable } from "../../core/src/errors";
+import { DomRuntime } from "../../core/src/dom";
 import type { HostAdapter } from "../../core/src/host-adapter";
 import type { RpcRequest } from "../../core/src/protocol";
 import { asArray, asNumber, asString, evalJavaScript, isObject, maybePromise, optionalRequire, property } from "../../core/src/runtime";
 
 type Callable = (...args: unknown[]) => unknown;
+
+const domRuntime = new DomRuntime({
+  roots(name) {
+    if (name === "app" || name === "module" || name === "premierepro") return premiereModule();
+    if (name === "uxp") return uxpModule();
+    return undefined;
+  }
+});
 
 export const premiereAdapter: HostAdapter = {
   capabilities() {
@@ -12,8 +21,8 @@ export const premiereAdapter: HostAdapter = {
       bridgeKind: "uxp",
       bridgeVersion: "0.1.0",
       hostVersion: premiereVersion(),
-      namespaces: ["app", "project", "sequence", "track", "clip", "projectItem", "bin", "marker", "encoder", "export", "raw"],
-      features: ["project", "sequence", "track", "clip", "projectItem", "bin", "marker", "encoder", "export"],
+      namespaces: ["app", "project", "sequence", "track", "clip", "projectItem", "bin", "marker", "encoder", "export", "dom", "raw"],
+      features: ["project", "sequence", "track", "clip", "projectItem", "bin", "marker", "encoder", "export", "structuredDom"],
       methods: {
         app: ["getVersion"],
         project: ["getActive", "getSequences", "getActiveSequence", "getRootItem", "save", "saveAs", "createSequence", "importFiles"],
@@ -25,11 +34,13 @@ export const premiereAdapter: HostAdapter = {
         marker: ["getMarkers", "create"],
         encoder: ["getManager", "getPresets", "getExportFileExtension", "encodeFile", "encodeProjectItem", "exportSequence"],
         export: ["getExporter", "exportFrame"],
+        dom: ["root", "get", "set", "call", "construct", "keys", "snapshot", "release"],
         raw: ["evalJs"]
       }
     };
   },
   async dispatch(request: RpcRequest) {
+    if (request.namespace === "dom") return domRuntime.dispatch(request);
     if (request.namespace === "app" && request.method === "getVersion") return premiereVersion();
     if (request.namespace === "project" && request.method === "getActive") return serializeProject(await activeProject());
     if (request.namespace === "project" && request.method === "getSequences") return serializeSequences(await projectSequences(await activeProject()));
