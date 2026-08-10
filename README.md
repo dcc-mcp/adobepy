@@ -27,6 +27,11 @@ npm install
 npm run test:all
 ```
 
+Bridge bundles under `bridges/**/dist` are generated artifacts and are not
+tracked. `npm run test:all` builds them for local verification; release CI
+rebuilds them before packaging. Run `npm run uxp:build` and `npm run cep:build`
+before using `install-bridge` directly from a source checkout.
+
 Installation, standalone use, broker startup, bridge loading, and
 troubleshooting are documented in [`install.md`](install.md).
 
