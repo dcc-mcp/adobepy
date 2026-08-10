@@ -28,6 +28,7 @@
     "api:coverage": "python scripts/report_api_coverage.py",
     "abi3:check": "python scripts/check_native_abi3_config.py",
     "capabilities:check": "node scripts/check-bridge-capabilities.js",
+    "security:check": "npm audit --audit-level=moderate",
     "smoke:photoshop:live": "python scripts/live_photoshop_smoke.py",
     "smoke:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke_install.ps1",
     "lint:python": "python -m compileall -q python generators scripts && npm run protocol:check && npm run architecture:check && npm run facades:check && npm run stubs:check && npm run api:sources:validate && npm run abi3:check",
@@ -44,8 +45,8 @@
     "test:all": "npm run bridge:check && npm run test:bridges && npm run protocol:check && npm run capabilities:check && npm run architecture:check && npm run facades:check && npm run stubs:check && npm run api:sources:validate && npm run api:coverage && npm run abi3:check && npm run ir:validate && npm run test:coverage && npm run test:rust"
   },
   "devDependencies": {
-    "esbuild": "^0.28.0",
+    "esbuild": "^0.28.2",
     "typescript": "^5.9.3",
-    "ws": "^8.20.1"
+    "ws": "^8.21.3"
   }
 }

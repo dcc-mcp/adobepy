@@ -86,6 +86,13 @@ from complete structured DOM availability, without presenting the registry as a
 percentage of Adobe's version-dependent official API surface.
 
 ```powershell
+npm run security:check
+```
+
+Dependency security gate. It fails CI for moderate, high, or critical npm
+advisories in the bridge build and test toolchain.
+
+```powershell
 npm run abi3:check
 ```
 
