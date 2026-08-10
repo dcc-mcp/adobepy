@@ -16,23 +16,28 @@ IR, bridge capabilities, Python facade, and Pythonic aliases.
 | After Effects | CEP/ExtendScript | `app` | [After Effects scripts](https://helpx.adobe.com/after-effects/using/scripts.html) |
 | Illustrator | CEP/ExtendScript | `app` | [Illustrator JavaScript reference](https://developer.adobe.com/console/servicesandapis) |
 
-## Current Coverage Matrix
+## Current Capability Matrix
 
-| Host | Bridge | MVP targets | Planned targets | Coverage | Next targets |
-| --- | --- | ---: | ---: | ---: | --- |
-| Photoshop | UXP | 8 | 0 | 100.0% | none |
-| InDesign | UXP | 5 | 0 | 100.0% | none |
-| Premiere Pro | UXP | 5 | 0 | 100.0% | none |
-| After Effects | CEP/ExtendScript | 5 | 0 | 100.0% | none |
-| Illustrator | CEP/ExtendScript | 5 | 0 | 100.0% | none |
+Declared target progress measures only registry-listed typed facade families; it
+is not a percentage of Adobe's complete API surface. Structured official DOM
+means APIs exposed by the installed host remain reachable through safe object
+operations even when they do not yet have a handwritten typed facade.
+
+| Host | Bridge | Typed facade targets | Planned typed targets | Declared target progress | Structured official DOM | Next typed targets |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| Photoshop | UXP | 8 | 0 | 100.0% | no | none |
+| InDesign | UXP | 5 | 0 | 100.0% | yes | none |
+| Premiere Pro | UXP | 5 | 0 | 100.0% | yes | none |
+| After Effects | CEP/ExtendScript | 5 | 0 | 100.0% | yes | none |
+| Illustrator | CEP/ExtendScript | 5 | 0 | 100.0% | yes | none |
 
 ## Coverage Rules
 
 - Every `generators/ir/*-mvp.json` host must have exactly one API source entry.
 - Every source entry must include at least one primary Adobe reference and the
   GitHub issue numbers that track facade/API expansion.
-- Every source entry must include `coverageTargets` that separate current MVP
-  object families from planned full-coverage families.
+- Every source entry must include `coverageTargets` that separate current typed
+  object families from planned typed facade families.
 - MVP coverage targets must cite real IR namespaces and facade objects; planned
   targets must stay explicit so gaps remain visible until implemented.
 - IR files should describe proxy classes for runtime facade objects that expose
@@ -96,7 +101,7 @@ After intentionally changing an IR facade/proxy surface, regenerate stubs:
 npm run stubs:write
 ```
 
-Generate the current coverage matrix:
+Generate the current capability matrix:
 
 ```powershell
 npm run api:coverage

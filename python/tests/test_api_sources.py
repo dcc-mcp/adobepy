@@ -1,7 +1,7 @@
 import pathlib
 import unittest
 
-from scripts.report_api_coverage import build_rows
+from scripts.report_api_coverage import build_rows, render_markdown
 from scripts.validate_api_sources import DEFAULT_IR_DIR, DEFAULT_REGISTRY, validate_registry
 
 
@@ -22,12 +22,20 @@ class ApiSourceTests(unittest.TestCase):
         self.assertGreater(by_host["photoshop"]["mvp"], by_host["premiere"]["mvp"])
         self.assertEqual(by_host["photoshop"]["planned"], 0)
         self.assertEqual(by_host["photoshop"]["percent"], 100.0)
+        self.assertFalse(by_host["photoshop"]["structured_dom"])
         self.assertEqual(by_host["premiere"]["mvp"], 5)
         self.assertEqual(by_host["premiere"]["planned"], 0)
         self.assertEqual(by_host["premiere"]["percent"], 100.0)
+        self.assertTrue(by_host["premiere"]["structured_dom"])
+        self.assertTrue(by_host["indesign"]["structured_dom"])
+        self.assertTrue(by_host["after-effects"]["structured_dom"])
+        self.assertTrue(by_host["illustrator"]["structured_dom"])
         self.assertNotIn("Sequences, tracks, clips, and markers", by_host["premiere"]["next"])
         self.assertNotIn("Project items, media import, and bins", by_host["premiere"]["next"])
         self.assertNotIn("Encoder/export workflows", by_host["premiere"]["next"])
+        report = render_markdown(rows)
+        self.assertIn("not a percentage of Adobe's complete API surface", report)
+        self.assertIn("Structured official DOM", report)
 
 
 if __name__ == "__main__":
