@@ -534,6 +534,7 @@ function testExtendScriptDispatchers() {
     layer: aiLayer,
     parent: aiLayer,
   };
+  const aiPathMutations = [];
   const aiPathItem = {
     ...aiPageItem,
     uuid: "path-1",
@@ -560,6 +561,19 @@ function testExtendScriptDispatchers() {
     selectedPathPoints: [{}, {}],
     pixelAligned: true,
     polarity: "Positive",
+    setEntirePath(points) {
+      aiPathMutations.push(["setEntirePath", points]);
+      this.pathPoints = points.map(() => ({}));
+    },
+    translate() {
+      aiPathMutations.push(["translate", Array.prototype.slice.call(arguments)]);
+    },
+    resize() {
+      aiPathMutations.push(["resize", Array.prototype.slice.call(arguments)]);
+    },
+    rotate() {
+      aiPathMutations.push(["rotate", Array.prototype.slice.call(arguments)]);
+    },
   };
   const aiCompoundChildPath = {
     ...aiPathItem,
@@ -765,7 +779,15 @@ function testExtendScriptDispatchers() {
   assert.strictEqual(dispatch(ai, "ai_export_svg", "export", "exportFile", [{ path: "C:/out/poster-svg", format: "svg", options: { coordinatePrecision: 2 } }]).result.format, "svg");
   assert.strictEqual(aiExports[3].exportType, "SVG");
   assert.strictEqual(dispatch(ai, "ai_missing_export_path", "export", "exportFile", [{ format: "png24" }]).error.code, -32004);
-  assert.strictEqual(dispatch(ai, "ai_unsupported_path_mutation", "pathItem", "setEntirePath", ["Logo Path", [[0, 0]]]).error.code, -32601);
+  assert.strictEqual(dispatch(ai, "ai_set_entire_path", "pathItem", "setEntirePath", ["path-1", [[0, 0], [10, 10]]]).result.pathPointCount, 2);
+  assert.deepStrictEqual(aiPathMutations[0], ["setEntirePath", [[0, 0], [10, 10]]]);
+  assert.strictEqual(dispatch(ai, "ai_translate_path", "pathItem", "translate", ["path-1", { deltaX: 10, deltaY: 20, transformFillPatterns: false }]).result.name, "Logo Path");
+  assert.deepStrictEqual(aiPathMutations[1], ["translate", [10, 20, undefined, false]]);
+  assert.strictEqual(dispatch(ai, "ai_resize_path", "pathItem", "resize", ["path-1", { scaleX: 150, scaleY: 125, changePositions: true, changeLineWidths: 50 }]).result.name, "Logo Path");
+  assert.deepStrictEqual(aiPathMutations[2], ["resize", [150, 125, true, undefined, undefined, undefined, 50]]);
+  assert.strictEqual(dispatch(ai, "ai_rotate_path", "pathItem", "rotate", ["path-1", { angle: 45, changePositions: true, rotateAbout: "Transformation.CENTER" }]).result.name, "Logo Path");
+  assert.deepStrictEqual(aiPathMutations[3], ["rotate", [45, true, undefined, undefined, undefined, "Transformation.CENTER"]]);
+  assert.strictEqual(dispatch(ai, "ai_missing_path", "pathItem", "translate", ["missing", { deltaX: 1 }]).error.code, -32004);
   assert.strictEqual(dispatch(ai, "ai_raw", "raw", "evalExtendScript", ["app.version"]).result, "28.2.0");
 
   const aiDocumentRef = dispatch(ai, "ai_dom_document", "dom", "root", ["document"]).result;

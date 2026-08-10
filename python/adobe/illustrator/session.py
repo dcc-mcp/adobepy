@@ -226,7 +226,7 @@ class DocumentProxy:
     @property
     def path_items(self) -> list["PathItemProxy"]:
         payload = self._session.invoke("pathItem", "getPathItems")
-        return [PathItemProxy(item) for item in payload or []]
+        return [PathItemProxy(self._session, item) for item in payload or []]
 
     @property
     def pathItems(self) -> list["PathItemProxy"]:
@@ -235,7 +235,7 @@ class DocumentProxy:
     @property
     def selected_path_items(self) -> list["PathItemProxy"]:
         payload = self._session.invoke("pathItem", "getSelected")
-        return [PathItemProxy(item) for item in payload or []]
+        return [PathItemProxy(self._session, item) for item in payload or []]
 
     @property
     def selectedPathItems(self) -> list["PathItemProxy"]:
@@ -347,7 +347,7 @@ class DocumentProxy:
 
     def get_path_item_by_name(self, name: str) -> "PathItemProxy | None":
         payload = self._session.invoke("pathItem", "getByName", name)
-        return PathItemProxy(payload) if payload else None
+        return PathItemProxy(self._session, payload) if payload else None
 
     def getPathItemByName(self, name: str) -> "PathItemProxy | None":
         return self.get_path_item_by_name(name)
@@ -661,7 +661,7 @@ class LayerProxy:
     @property
     def path_items(self) -> list["PathItemProxy"]:
         payload = self._session.invoke("pathItem", "getLayerItems", self._layer_key)
-        return [PathItemProxy(item) for item in payload or []]
+        return [PathItemProxy(self._session, item) for item in payload or []]
 
     @property
     def pathItems(self) -> list["PathItemProxy"]:
@@ -826,6 +826,7 @@ class PageItemProxy:
 
 @dataclass
 class PathItemProxy:
+    _session: IllustratorSession
     _payload: dict[str, Any]
 
     @property
@@ -1084,20 +1085,157 @@ class PathItemProxy:
     def typename(self) -> str | None:
         return self._payload.get("typename")
 
-    def set_entire_path(self, *args: Any, **kwargs: Any) -> Any:
-        _unsupported_geometry_mutation("PathItem.setEntirePath")
+    def set_entire_path(
+        self,
+        path_points: list[list[float]],
+        *,
+        modal: bool | None = None,
+        command_name: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> "PathItemProxy":
+        return self._mutate(
+            "setEntirePath",
+            path_points,
+            modal=modal,
+            command_name=command_name,
+            default_command_name="Set Illustrator path geometry",
+            timeout_ms=timeout_ms,
+        )
 
-    def setEntirePath(self, *args: Any, **kwargs: Any) -> Any:
-        return self.set_entire_path(*args, **kwargs)
+    def setEntirePath(
+        self,
+        pathPoints: list[list[float]],
+        *,
+        modal: bool | None = None,
+        commandName: str | None = None,
+        timeoutMs: int | None = None,
+    ) -> "PathItemProxy":
+        return self.set_entire_path(
+            pathPoints,
+            modal=modal,
+            command_name=commandName,
+            timeout_ms=timeoutMs,
+        )
 
-    def translate(self, *args: Any, **kwargs: Any) -> Any:
-        _unsupported_geometry_mutation("PathItem.translate")
+    def translate(
+        self,
+        delta_x: float | None = None,
+        delta_y: float | None = None,
+        *,
+        transform_objects: bool | None = None,
+        transform_fill_patterns: bool | None = None,
+        transform_fill_gradients: bool | None = None,
+        transform_stroke_patterns: bool | None = None,
+        modal: bool | None = None,
+        command_name: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> "PathItemProxy":
+        return self._mutate(
+            "translate",
+            _defined_arguments(
+                deltaX=delta_x,
+                deltaY=delta_y,
+                transformObjects=transform_objects,
+                transformFillPatterns=transform_fill_patterns,
+                transformFillGradients=transform_fill_gradients,
+                transformStrokePatterns=transform_stroke_patterns,
+            ),
+            modal=modal,
+            command_name=command_name,
+            default_command_name="Translate Illustrator path",
+            timeout_ms=timeout_ms,
+        )
 
-    def resize(self, *args: Any, **kwargs: Any) -> Any:
-        _unsupported_geometry_mutation("PathItem.resize")
+    def resize(
+        self,
+        scale_x: float,
+        scale_y: float,
+        *,
+        change_positions: bool | None = None,
+        change_fill_patterns: bool | None = None,
+        change_fill_gradients: bool | None = None,
+        change_stroke_pattern: bool | None = None,
+        change_line_widths: float | None = None,
+        scale_about: Any = None,
+        modal: bool | None = None,
+        command_name: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> "PathItemProxy":
+        return self._mutate(
+            "resize",
+            _defined_arguments(
+                scaleX=scale_x,
+                scaleY=scale_y,
+                changePositions=change_positions,
+                changeFillPatterns=change_fill_patterns,
+                changeFillGradients=change_fill_gradients,
+                changeStrokePattern=change_stroke_pattern,
+                changeLineWidths=change_line_widths,
+                scaleAbout=scale_about,
+            ),
+            modal=modal,
+            command_name=command_name,
+            default_command_name="Resize Illustrator path",
+            timeout_ms=timeout_ms,
+        )
 
-    def rotate(self, *args: Any, **kwargs: Any) -> Any:
-        _unsupported_geometry_mutation("PathItem.rotate")
+    def rotate(
+        self,
+        angle: float,
+        *,
+        change_positions: bool | None = None,
+        change_fill_patterns: bool | None = None,
+        change_fill_gradients: bool | None = None,
+        change_stroke_pattern: bool | None = None,
+        rotate_about: Any = None,
+        modal: bool | None = None,
+        command_name: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> "PathItemProxy":
+        return self._mutate(
+            "rotate",
+            _defined_arguments(
+                angle=angle,
+                changePositions=change_positions,
+                changeFillPatterns=change_fill_patterns,
+                changeFillGradients=change_fill_gradients,
+                changeStrokePattern=change_stroke_pattern,
+                rotateAbout=rotate_about,
+            ),
+            modal=modal,
+            command_name=command_name,
+            default_command_name="Rotate Illustrator path",
+            timeout_ms=timeout_ms,
+        )
+
+    def _mutate(
+        self,
+        method: str,
+        arguments: Any,
+        *,
+        modal: bool | None,
+        command_name: str | None,
+        default_command_name: str,
+        timeout_ms: int | None,
+    ) -> "PathItemProxy":
+        key = _identity_key(self._payload)
+        if key is None:
+            raise ValueError(f"PathItem.{method} requires an id, name, or index")
+        payload = self._session.invoke(
+            "pathItem",
+            method,
+            key,
+            arguments,
+            options=self._session.modal_options(
+                modal=modal,
+                command_name=command_name,
+                default_command_name=default_command_name,
+                timeout_ms=timeout_ms,
+            ),
+        )
+        if payload:
+            self._payload = payload
+        return self
 
 
 @dataclass
@@ -1228,7 +1366,7 @@ class CompoundPathItemProxy:
     @property
     def path_items(self) -> list["PathItemProxy"]:
         payload = self._session.invoke("compoundPath", "getPathItems", self._compound_path_key)
-        return [PathItemProxy(item) for item in payload or []]
+        return [PathItemProxy(self._session, item) for item in payload or []]
 
     @property
     def pathItems(self) -> list["PathItemProxy"]:
@@ -2020,8 +2158,5 @@ def _identity_key(payload: dict[str, Any]) -> Any:
     return None
 
 
-def _unsupported_geometry_mutation(method: str) -> None:
-    raise NotImplementedError(
-        f"{method} is intentionally deferred in the typed Illustrator facade; "
-        "use adobe.raw.RawSession('illustrator').eval_extendscript(...) for host-specific geometry mutations."
-    )
+def _defined_arguments(**values: Any) -> dict[str, Any]:
+    return {key: value for key, value in values.items() if value is not None}

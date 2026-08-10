@@ -49,6 +49,22 @@ function adobepyDispatch(payload) {
     if (request.namespace === "pathItem" && request.method === "getLayerItems") {
       return adobepyResult(request.id, adobepyIllustratorLayerPathItems(adobepyIllustratorActiveDocument(), (request.args || [])[0]));
     }
+    if (request.namespace === "pathItem" && request.method === "setEntirePath") {
+      var setPathArgs = request.args || [];
+      return adobepyResult(request.id, adobepyIllustratorMutatePathItem(adobepyIllustratorActiveDocument(), setPathArgs[0], "setEntirePath", [setPathArgs[1]]));
+    }
+    if (request.namespace === "pathItem" && request.method === "translate") {
+      var translateArgs = request.args || [];
+      return adobepyResult(request.id, adobepyIllustratorMutatePathItem(adobepyIllustratorActiveDocument(), translateArgs[0], "translate", adobepyIllustratorOptionalArguments(translateArgs[1], ["deltaX", "deltaY", "transformObjects", "transformFillPatterns", "transformFillGradients", "transformStrokePatterns"])));
+    }
+    if (request.namespace === "pathItem" && request.method === "resize") {
+      var resizeArgs = request.args || [];
+      return adobepyResult(request.id, adobepyIllustratorMutatePathItem(adobepyIllustratorActiveDocument(), resizeArgs[0], "resize", adobepyIllustratorOptionalArguments(resizeArgs[1], ["scaleX", "scaleY", "changePositions", "changeFillPatterns", "changeFillGradients", "changeStrokePattern", "changeLineWidths", "scaleAbout"])));
+    }
+    if (request.namespace === "pathItem" && request.method === "rotate") {
+      var rotateArgs = request.args || [];
+      return adobepyResult(request.id, adobepyIllustratorMutatePathItem(adobepyIllustratorActiveDocument(), rotateArgs[0], "rotate", adobepyIllustratorOptionalArguments(rotateArgs[1], ["angle", "changePositions", "changeFillPatterns", "changeFillGradients", "changeStrokePattern", "rotateAbout"])));
+    }
     if (request.namespace === "compoundPath" && request.method === "getCompoundPathItems") {
       return adobepyResult(request.id, adobepyIllustratorCompoundPathItems(adobepyIllustratorActiveDocument()));
     }
@@ -358,6 +374,40 @@ function adobepyIllustratorLayerPathItems(document, layerKey) {
 
 function adobepyIllustratorPathItemByName(document, name) {
   return adobepyIllustratorFindSerializedByName(adobepyIllustratorPathItems(document), name);
+}
+
+function adobepyIllustratorFindPathItem(document, key) {
+  var items = document ? document.pathItems : null;
+  var count = adobepyCollectionLength(items);
+  for (var index = 0; index < count; index += 1) {
+    var item = adobepyCollectionItem(items, index);
+    if (adobepyIllustratorMatchesItemKey(item, key, index)) return item;
+  }
+  return null;
+}
+
+function adobepyIllustratorMutatePathItem(document, key, method, args) {
+  var item = adobepyIllustratorFindPathItem(document, key);
+  if (!item) throw new Error("Illustrator PathItem not found: " + key);
+  if (typeof item[method] !== "function") throw new Error("Illustrator PathItem." + method + " unavailable");
+  item[method].apply(item, args || []);
+  return adobepyIllustratorPathItem(item, null);
+}
+
+function adobepyIllustratorOptionalArguments(options, names) {
+  options = options || {};
+  var result = [];
+  var lastDefined = -1;
+  for (var index = 0; index < names.length; index += 1) {
+    var name = names[index];
+    if (Object.prototype.hasOwnProperty.call(options, name)) {
+      result[index] = options[name];
+      lastDefined = index;
+    } else {
+      result[index] = undefined;
+    }
+  }
+  return lastDefined >= 0 ? result.slice(0, lastDefined + 1) : [];
 }
 
 function adobepyIllustratorPathItemCollection(items) {
