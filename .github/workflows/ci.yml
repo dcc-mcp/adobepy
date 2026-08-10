@@ -65,6 +65,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: npm ci
+      - run: npm run security:check
       - run: npm run lint
 
   package:
