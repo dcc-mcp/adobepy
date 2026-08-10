@@ -183,6 +183,7 @@ fn install_bridge(args: InstallBridgeArgs) -> Result<()> {
         BridgeInstallKind::Uxp => root.join("bridges").join("uxp").join(host.as_str()),
         BridgeInstallKind::Cep => root.join("bridges").join("cep").join(host.as_str()),
     };
+    ensure_bridge_bundle(&source, kind)?;
     copy_dir_all(&source, &args.dest)?;
     write_bridge_config(
         &args.dest,
@@ -372,6 +373,22 @@ fn copy_dir_all(source: &Path, dest: &Path) -> Result<()> {
     copy_dir_all_inner(&source_root, dest)
 }
 
+fn ensure_bridge_bundle(source: &Path, kind: BridgeInstallKind) -> Result<()> {
+    let bundle = source.join("dist").join("main.js");
+    if bundle.is_file() {
+        return Ok(());
+    }
+    let build_command = match kind {
+        BridgeInstallKind::Uxp => "npm run uxp:build",
+        BridgeInstallKind::Cep => "npm run cep:build",
+        BridgeInstallKind::Auto => unreachable!(),
+    };
+    bail!(
+        "bridge bundle is missing at {}; source checkouts must run `npm ci` and `{build_command}` before install-bridge",
+        bundle.display()
+    )
+}
+
 fn resolve_destination_root(dest: &Path) -> Result<PathBuf> {
     let mut current = dest;
     let mut missing = Vec::new();
@@ -427,5 +444,18 @@ mod tests {
                 .unwrap()
                 .contains("__ADOBEPY_TARGET")
         );
+    }
+
+    #[test]
+    fn bridge_install_requires_a_built_bundle() {
+        let source = env::temp_dir().join(format!("adobepy-bridge-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(source.join("dist")).unwrap();
+
+        let error = ensure_bridge_bundle(&source, BridgeInstallKind::Uxp).unwrap_err();
+        assert!(error.to_string().contains("npm run uxp:build"));
+
+        fs::write(source.join("dist").join("main.js"), "bundle").unwrap();
+        ensure_bridge_bundle(&source, BridgeInstallKind::Uxp).unwrap();
+        fs::remove_dir_all(source).unwrap();
     }
 }
