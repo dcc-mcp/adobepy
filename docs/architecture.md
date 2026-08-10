@@ -17,7 +17,7 @@ The stable adapter-facing wire contract is documented in
 | `python/adobe/raw` | Explicit raw JavaScript/ExtendScript escape hatches | Typed host facade behavior |
 | `python/adobe/dcc_mcp` | Optional DCC MCP skill-result compatibility helpers and adobepy error mapping | MCP server lifecycle or host-specific behavior |
 | `python/adobe/<host>` | Python facade and Pythonic aliases for one Adobe host | Sibling host facades or transport implementation |
-| `bridges/uxp/core` | Generic UXP bridge transport and protocol handling | Host-specific UXP module names or DOM dispatch |
+| `bridges/uxp/core` | Generic UXP bridge transport, protocol handling, and structured DOM object-reference lifecycle | Host-specific UXP module names or typed host workflows |
 | `bridges/cep/core` | Generic CEP/WebSocket transport and ExtendScript dispatch wrapper | After Effects or Illustrator business logic |
 | `bridges/*/<host>/src/host.ts` | Host adapter, host capabilities, DOM serialization | Broker routing, Python naming conventions |
 | `generators/ir` | Host capability shape, facade generation input, aliases, and source mappings | Runtime bridge state |
@@ -73,6 +73,8 @@ Alias rules are deterministic:
 - Host packages do not import sibling host packages.
 - Bridge core code has no host-specific names.
 - UXP hosts prefer typed DOM calls before raw eval or `batchPlay`.
+- Structured DOM access must use opaque bridge-owned references and direct member operations; it must not evaluate caller-provided source text.
+- Structured DOM references must remain host-session scoped, explicitly releasable, and reject prototype/constructor traversal.
 - CEP hosts keep `evalExtendScript` separated from typed facade methods.
 - Raw payloads are only used at `adobe.raw` or clearly marked escape hatches.
 - DCC MCP helpers remain optional and do not make `dcc-mcp-core` a runtime

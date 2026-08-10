@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
-from adobe.core import BrokerClient, BrokerConnectionError, HostSession, UnauthorizedError, connect
+from adobe.core import BrokerClient, BrokerConnectionError, DomObject, HostSession, UnauthorizedError, connect
 from adobe.photoshop import Photoshop
 from adobe.core.errors import BridgeNotInstalledError, CapabilityError, HostScriptError, MethodNotFoundError, error_from_rpc
 
@@ -58,6 +58,33 @@ class CapturingClient:
                 },
             }
         ]
+
+
+class DomCapturingClient(CapturingClient):
+    def call(self, host, namespace, method, args=None, options=None, target=None):
+        args = list(args or [])
+        self.calls.append((host, namespace, method, args, options or {}, target))
+        if method == "root":
+            return {"$adobepyRef": "root-1", "$adobepyType": "premierepro"}
+        if method == "get":
+            return {"$adobepyRef": "project-1", "$adobepyType": "Project"}
+        if method == "set":
+            return args[2]
+        if method == "call":
+            return [{"$adobepyRef": "item-1", "$adobepyType": "ProjectItem"}]
+        if method == "construct":
+            return {"$adobepyRef": "options-1", "$adobepyType": "AAFExportOptions"}
+        if method == "keys":
+            return ["name", "save"]
+        if method == "snapshot":
+            return {"name": "demo", "child": {"$adobepyRef": "child-1", "$adobepyType": "FolderItem"}}
+        if method == "release":
+            return True
+        return None
+
+    async def call_async(self, host, namespace, method, args=None, options=None, target=None):
+        self.async_calls.append((host, namespace, method, list(args or []), options or {}, target))
+        return self.call(host, namespace, method, args=args, options=options, target=target)
 
 
 class CoreTests(unittest.TestCase):
@@ -150,6 +177,38 @@ class CoreTests(unittest.TestCase):
         session.raw.batch_play([{"_obj": "hide"}])
         self.assertEqual(client.calls[-1][1], "action")
 
+    def test_structured_dom_references_and_arguments(self):
+        client = DomCapturingClient()
+        dom = HostSession("premiere", client).dom
+        module = dom.root("module")
+        self.assertIsInstance(module, DomObject)
+        self.assertEqual(module.reference, "root-1")
+        self.assertEqual(module.type_name, "premierepro")
+
+        project = module.get("Project")
+        self.assertIsInstance(project, DomObject)
+        self.assertEqual(project.reference, "project-1")
+        project.set("name", "cut", command_name="Rename project", timeout_ms=1000)
+        self.assertEqual(client.calls[-1][4], {"timeoutMs": 1000, "commandName": "Rename project", "modal": True})
+
+        items = project.call("findItems", project, {"nested": [module]}, mutating=True)
+        self.assertIsInstance(items[0], DomObject)
+        wire_args = client.calls[-1][3][2]
+        self.assertEqual(wire_args[0]["$adobepyRef"], "project-1")
+        self.assertEqual(wire_args[1]["nested"][0]["$adobepyRef"], "root-1")
+        self.assertTrue(client.calls[-1][4]["modal"])
+
+        options = module.construct("AAFExportOptions")
+        self.assertEqual(options.type_name, "AAFExportOptions")
+        self.assertEqual(project.keys(), ["name", "save"])
+        snapshot = project.snapshot("name", "child")
+        self.assertEqual(snapshot["name"], "demo")
+        self.assertIsInstance(snapshot["child"], DomObject)
+        self.assertTrue(project.release())
+        foreign = HostSession("indesign", DomCapturingClient()).dom.root("module")
+        with self.assertRaisesRegex(ValueError, "different host session"):
+            project.call("accept", foreign)
+
     def test_errors_and_connect(self):
         err = error_from_rpc({"code": -32004, "message": "boom"}, {"diagnostics": {"traceId": "t"}})
         self.assertIsInstance(err, HostScriptError)
@@ -165,6 +224,15 @@ class CoreAsyncTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(broker, "call", return_value=1), mock.patch.object(broker, "capabilities", return_value=[]):
             self.assertEqual(await broker.call_async("photoshop", "app", "getVersion"), 1)
             self.assertEqual(await broker.capabilities_async(), [])
+
+    async def test_async_structured_dom(self):
+        client = DomCapturingClient()
+        dom = HostSession("indesign", client).dom
+        module = await dom.root_async("module")
+        project = await module.get_async("app")
+        self.assertIsInstance(project, DomObject)
+        self.assertEqual(await project.keys_async(), ["name", "save"])
+        self.assertTrue(await project.release_async())
 
 
 if __name__ == "__main__":

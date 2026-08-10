@@ -4,6 +4,7 @@ from typing import Any
 
 from .capabilities import HostCapabilities, normalize_capability_sessions
 from .client import BrokerClient
+from .dom import DomNamespace
 from .errors import CapabilityError
 
 
@@ -11,6 +12,7 @@ class HostSession:
     def __init__(self, host: str, client: BrokerClient | None = None) -> None:
         self.host = host
         self.client = client or BrokerClient()
+        self.dom = DomNamespace(self)
         self.raw = RawNamespace(self)
 
     def capabilities(self) -> HostCapabilities | None:

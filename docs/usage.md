@@ -185,6 +185,58 @@ host tests. Advanced text styling, custom color creation, print presets, and
 specialized export option objects remain available through raw ExtendScript
 until they are promoted into typed facades.
 
+## Complete official UXP DOM access
+
+InDesign and Premiere expose their complete installed official object model through
+structured `DomObject` references. This layer is for Adobe APIs that have not yet
+been promoted into the handwritten high-frequency facades above. Unlike `eval_js`,
+it does not execute caller-provided JavaScript: every operation is a root lookup,
+property read/write, method call, constructor call, key listing, or snapshot over
+an object owned by the connected bridge.
+
+Premiere's official static APIs can be traversed exactly as they appear in Adobe's
+JavaScript documentation:
+
+```python
+from adobe.premiere import Premiere
+
+premiere = Premiere()
+module = premiere.dom.root("module")
+project_api = module.get("Project")
+project = project_api.call("getActiveProject")
+
+print(project.snapshot("name", "path"))
+root_item = project.call("getRootItem")
+print(root_item.keys())
+
+# Returned host objects can be passed back as arguments without serialization loss.
+project_utils = module.get("ProjectUtils")
+selected_items = project_utils.call("getSelection", project)
+
+# Mark writes so host command/undo boundaries can be applied where supported.
+project.call("save", mutating=True, command_name="Save Premiere project")
+
+project.release()
+```
+
+InDesign exposes both the `indesign` module and its `app` object:
+
+```python
+from adobe.indesign import InDesign
+
+indesign = InDesign()
+app = indesign.dom.root("app")
+document = app.get("activeDocument")
+print(document.snapshot("name", "fullName"))
+document.set("label", "Automated", command_name="Label document")
+```
+
+Available operations are `root`, `get`, `set`, `call`, `construct`, `keys`,
+`snapshot`, and `release`, with async siblings such as `root_async` and
+`call_async`. References are scoped to the live bridge connection and become
+invalid after release or host/bridge restart. The installed Adobe host version is
+still authoritative: a member absent from that version returns a host-script error.
+
 ## Bridges
 
 ```powershell

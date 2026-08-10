@@ -72,6 +72,19 @@
         {"name": "exportFrame", "returns": "ExportJob", "mutates": true, "modal": true}
       ]
     },
+    {
+      "name": "dom",
+      "methods": [
+        {"name": "root", "returns": "DomObject"},
+        {"name": "get", "returns": "Any"},
+        {"name": "set", "returns": "Any", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "call", "returns": "Any"},
+        {"name": "construct", "returns": "DomObject", "mutatesState": true, "requiresModalWhenMutating": true},
+        {"name": "keys", "returns": "list[str]"},
+        {"name": "snapshot", "returns": "dict[str, Any]"},
+        {"name": "release", "returns": "bool"}
+      ]
+    },
     {"name": "raw", "methods": [{"name": "evalJs", "returns": "Any", "raw": true}]}
   ],
   "proxies": [
