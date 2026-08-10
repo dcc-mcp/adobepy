@@ -19,6 +19,7 @@ async function main() {
   assert.ok(fs.existsSync(bundlePath), `missing CEP bundle: ${bundlePath}`);
   const sent = [];
   const evalScripts = [];
+  const loadedScripts = [];
   let socketInstance = null;
 
   class FakeWebSocket {
@@ -45,7 +46,7 @@ async function main() {
   const fakeCep = {
     getSystemPath() { return "C:/extension"; },
     evalScript(script, callback) {
-      if (script.startsWith("$.evalFile(")) { callback("true"); return; }
+      if (script.startsWith("$.evalFile(")) { loadedScripts.push(script); callback("true"); return; }
       evalScripts.push(script);
       const match = script.match(/^adobepyDispatch\(decodeURIComponent\('([^']*)'\)\)$/);
       assert.ok(match, `unexpected evalScript payload: ${script}`);
@@ -77,8 +78,11 @@ async function main() {
   await waitForMicrotasks();
 
   assert.ok(socketInstance);
+  assert.ok(loadedScripts[0].includes("/dist/dom.jsx"));
+  assert.ok(loadedScripts[1].includes("/host/dispatcher.jsx"));
   assert.strictEqual(sent[0].type, "hello");
   assert.strictEqual(sent[0].capabilities.host, "after-effects");
+  assert.ok(sent[0].capabilities.methods.dom.includes("snapshot"));
   assert.deepStrictEqual(sent[0].capabilities.methods.raw, ["evalExtendScript"]);
 
   socketInstance.emit("message", { data: JSON.stringify({ type: "request", request: { jsonrpc: "2.0", id: "broker_1", host: "after-effects", namespace: "app", method: "getVersion", args: ["quote '"] } }) });
@@ -389,7 +393,14 @@ function testExtendScriptDispatchers() {
       aeProject.file = file;
       return aeProject;
     },
+    beginUndoGroup(name) {
+      aeUndoGroups.push(["begin", name]);
+    },
+    endUndoGroup() {
+      aeUndoGroups.push(["end"]);
+    },
   };
+  const aeUndoGroups = [];
   const ae = loadDispatcher(afterEffectsDispatcherPath, {
     app: aeApp,
     File: function File(filePath) {
@@ -458,6 +469,24 @@ function testExtendScriptDispatchers() {
   assert.strictEqual(dispatch(ae, "ae_queue_notify", "renderQueue", "setQueueNotify", [true]).result.queueNotify, true);
   assert.strictEqual(dispatch(ae, "ae_raw", "raw", "evalExtendScript", ["app.version"]).result, "24.4.1");
   assert.strictEqual(dispatch(ae, "ae_missing", "layer", "getActive").error.code, -32601);
+
+  const aeAppRef = dispatch(ae, "ae_dom_app", "dom", "root", ["app"]).result;
+  const aeProjectRef = dispatch(ae, "ae_dom_project", "dom", "root", ["project"]).result;
+  assert.strictEqual(dispatch(ae, "ae_dom_get_project", "dom", "get", [aeAppRef, "project"]).result.$adobepyRef, aeProjectRef.$adobepyRef);
+  assert.ok(dispatch(ae, "ae_dom_project_keys", "dom", "keys", [aeProjectRef]).result.includes("importFile"));
+  assert.strictEqual(dispatch(ae, "ae_dom_snapshot", "dom", "snapshot", [aeProjectRef, ["numItems"]]).result.numItems, aeProject.numItems);
+  assert.strictEqual(dispatch(ae, "ae_dom_set", "dom", "set", [aeProjectRef, "label", "Automated"], { commandName: "Label project", modal: true }).result, "Automated");
+
+  const aeGlobalRef = dispatch(ae, "ae_dom_global", "dom", "root", ["global"]).result;
+  const aeFileRef = dispatch(ae, "ae_dom_file", "dom", "construct", [aeGlobalRef, "File", ["C:/media/dom.png"]]).result;
+  const aeImportOptionsRef = dispatch(ae, "ae_dom_import_options", "dom", "construct", [aeGlobalRef, "ImportOptions", [aeFileRef]]).result;
+  const aeImportedRef = dispatch(ae, "ae_dom_import", "dom", "call", [aeProjectRef, "importFile", [aeImportOptionsRef]], { commandName: "Import via DOM", modal: true }).result;
+  assert.strictEqual(dispatch(ae, "ae_dom_imported", "dom", "snapshot", [aeImportedRef, ["name"]]).result.name, "dom.png");
+  assert.ok(aeUndoGroups.some((entry) => entry[0] === "begin" && entry[1] === "Import via DOM"));
+  assert.strictEqual(dispatch(ae, "ae_dom_blocked", "dom", "get", [aeGlobalRef, "Function"]).error.code, -32004);
+  assert.strictEqual(dispatch(ae, "ae_dom_release", "dom", "release", [aeFileRef]).result, true);
+  assert.strictEqual(dispatch(ae, "ae_dom_stale", "dom", "get", [aeFileRef, "fullName"]).error.code, -32004);
+  assert.strictEqual(dispatch(ae, "ae_dom_missing", "dom", "missing", []).error.code, -32601);
 
   const aiArtboards = [
     { name: "Artboard 1", artboardRect: [0, 500, 500, 0], rulerOrigin: [0, 0], rulerPAR: 1, showCenter: true, showCrossHairs: false, showSafeAreas: false },
@@ -739,19 +768,36 @@ function testExtendScriptDispatchers() {
   assert.strictEqual(dispatch(ai, "ai_unsupported_path_mutation", "pathItem", "setEntirePath", ["Logo Path", [[0, 0]]]).error.code, -32601);
   assert.strictEqual(dispatch(ai, "ai_raw", "raw", "evalExtendScript", ["app.version"]).result, "28.2.0");
 
+  const aiDocumentRef = dispatch(ai, "ai_dom_document", "dom", "root", ["document"]).result;
+  assert.strictEqual(aiDocumentRef.$adobepyType, "Document");
+  const aiPaths = dispatch(ai, "ai_dom_paths", "dom", "get", [aiDocumentRef, "pathItems"]).result;
+  assert.strictEqual(dispatch(ai, "ai_dom_path", "dom", "snapshot", [aiPaths[0], ["name", "strokeWidth"]]).result.name, "Logo Path");
+  assert.strictEqual(dispatch(ai, "ai_dom_set", "dom", "set", [aiDocumentRef, "label", "Automated"]).result, "Automated");
+  assert.strictEqual(dispatch(ai, "ai_dom_save", "dom", "call", [aiDocumentRef, "save", []], { modal: true, commandName: "Save document" }).result, null);
+  const aiGlobalRef = dispatch(ai, "ai_dom_global", "dom", "root", ["global"]).result;
+  const aiOptionsRef = dispatch(ai, "ai_dom_options", "dom", "construct", [aiGlobalRef, "PDFSaveOptions", []]).result;
+  assert.ok(aiOptionsRef.$adobepyRef);
+  assert.strictEqual(dispatch(ai, "ai_dom_blocked", "dom", "get", [aiGlobalRef, "eval"]).error.code, -32004);
+  assert.strictEqual(dispatch(ai, "ai_dom_release", "dom", "release", [aiDocumentRef]).result, true);
+  assert.strictEqual(dispatch(ai, "ai_dom_stale", "dom", "keys", [aiDocumentRef]).error.code, -32004);
+
   const aiNoDocument = loadDispatcher(illustratorDispatcherPath, { app: { version: "28.2.0", documents: { length: 0 } } });
   assert.strictEqual(dispatch(aiNoDocument, "ai_none", "document", "getActive").result, null);
+  assert.strictEqual(dispatch(aiNoDocument, "ai_dom_none", "dom", "root", ["document"]).error.code, -32004);
 }
 
 function loadDispatcher(file, globals) {
   const context = { ...globals, JSON, String, Number };
+  const domRuntime = path.join(path.dirname(file), "..", "dist", "dom.jsx");
+  assert.ok(fs.existsSync(domRuntime), `missing CEP DOM runtime: ${domRuntime}`);
+  vm.runInNewContext(fs.readFileSync(domRuntime, "utf8"), context, { filename: domRuntime });
   vm.runInNewContext(fs.readFileSync(file, "utf8"), context, { filename: file });
   assert.strictEqual(typeof context.adobepyDispatch, "function");
   return context;
 }
 
-function dispatch(context, id, namespace, method, args = []) {
-  return JSON.parse(context.adobepyDispatch(JSON.stringify({ jsonrpc: "2.0", id, namespace, method, args })));
+function dispatch(context, id, namespace, method, args = [], options = undefined) {
+  return JSON.parse(context.adobepyDispatch(JSON.stringify({ jsonrpc: "2.0", id, namespace, method, args, options })));
 }
 
 main().catch((error) => {

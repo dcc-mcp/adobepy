@@ -91,6 +91,25 @@ print('SDK import smoke passed')
         Write-Host "  [$status] $($_.name): $($_.detail)"
     }
 
+    Write-Host "Installing a CEP bridge template..."
+    $bridgeDestination = Join-Path $tempDir "after-effects-bridge"
+    Push-Location $extractedRoot.FullName
+    try {
+        & $doctorExe install-bridge after-effects --dest $bridgeDestination --token "smoke-token" --json | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "adobepy install-bridge failed ($LASTEXITCODE)"
+        }
+    }
+    finally {
+        Pop-Location
+    }
+    foreach ($relativePath in @("dist\main.js", "dist\dom.jsx", "host\dispatcher.jsx", "adobepy.config.js")) {
+        $installedPath = Join-Path $bridgeDestination $relativePath
+        if (-not (Test-Path -LiteralPath $installedPath)) {
+            throw "installed CEP bridge artifact not found: $installedPath"
+        }
+    }
+
     Write-Host "Install smoke test passed"
 }
 finally {

@@ -18,7 +18,7 @@ export function startCepBridge(config: CepConfig): void {
     throw new Error("ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
   }
   const extensionPath = cep.getSystemPath("extension").replace(/\\/g, "/");
-  cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/host/dispatcher.jsx`)})`, () => {
+  const connect = () => {
     const socket = new WebSocket(config.brokerUrl);
     let greeted = false;
     const greet = () => {
@@ -52,7 +52,11 @@ export function startCepBridge(config: CepConfig): void {
         socket.send(JSON.stringify({ type: "error", error: hostScriptError(request.id, error) }));
       }
     };
-  });
+  };
+  const loadDispatcher = () => {
+    cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/host/dispatcher.jsx`)})`, connect);
+  };
+  cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/dist/dom.jsx`)})`, loadDispatcher);
 }
 
 function hostScriptError(id: string | number, error: any) {

@@ -2,6 +2,7 @@
 "use strict";
 
 const esbuild = require("esbuild");
+const fs = require("fs");
 const path = require("path");
 
 const root = path.resolve(__dirname, "..");
@@ -23,6 +24,10 @@ async function buildTarget(name) {
     sourcemap: true,
     logLevel: "silent",
   });
+  fs.copyFileSync(
+    path.join(root, "bridges/cep/core/host/dom.jsx"),
+    path.join(path.dirname(path.join(root, target.outfile)), "dom.jsx"),
+  );
   console.log(`built ${name}: ${target.outfile}`);
 }
 

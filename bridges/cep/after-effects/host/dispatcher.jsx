@@ -206,6 +206,12 @@ function adobepyDispatch(payload) {
       var outputSaveArgs = request.args || [];
       return adobepyResult(request.id, adobepyAfterEffectsSaveOutputModuleTemplate(adobepyAfterEffectsRequireRenderQueue(app.project), outputSaveArgs[0], outputSaveArgs[1], String(outputSaveArgs[2] || "")));
     }
+    if (request.namespace === "dom") {
+      if (!adobepyDomHasMethod(request.method)) {
+        return adobepyError(request.id, -32601, "unsupported method dom." + request.method);
+      }
+      return adobepyResult(request.id, adobepyDomDispatch(request, adobepyAfterEffectsDomRoots()));
+    }
     if (request.namespace === "raw" && request.method === "evalExtendScript") {
       return adobepyResult(request.id, eval((request.args || [])[0]));
     }
@@ -216,6 +222,10 @@ function adobepyDispatch(payload) {
       source: error && error.source
     });
   }
+}
+
+function adobepyAfterEffectsDomRoots() {
+  return { app: app, project: app.project, global: adobepyDomGlobalObject };
 }
 
 function adobepyAfterEffectsProject(project) {

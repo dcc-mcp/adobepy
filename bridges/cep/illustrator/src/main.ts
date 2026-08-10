@@ -9,7 +9,7 @@ startCepBridge({
     host: "illustrator",
     bridgeKind: "cep",
     bridgeVersion: "0.1.0",
-    namespaces: ["app", "document", "artboard", "layer", "pageItem", "pathItem", "compoundPath", "placedItem", "rasterItem", "textFrame", "story", "swatch", "export", "raw"],
+    namespaces: ["app", "document", "artboard", "layer", "pageItem", "pathItem", "compoundPath", "placedItem", "rasterItem", "textFrame", "story", "swatch", "export", "dom", "raw"],
     features: [
       "extendscript",
       "document",
@@ -24,7 +24,8 @@ startCepBridge({
       "textFrames",
       "stories",
       "swatches",
-      "export"
+      "export",
+      "officialDom"
     ],
     methods: {
       app: ["getVersion"],
@@ -40,6 +41,7 @@ startCepBridge({
       story: ["getStories", "getByName"],
       swatch: ["getSwatches", "getByName"],
       export: ["save", "saveAs", "exportFile"],
+      dom: ["root", "get", "set", "call", "construct", "keys", "snapshot", "release"],
       raw: ["evalExtendScript"]
     }
   }

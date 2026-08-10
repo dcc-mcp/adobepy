@@ -374,19 +374,25 @@ fn copy_dir_all(source: &Path, dest: &Path) -> Result<()> {
 }
 
 fn ensure_bridge_bundle(source: &Path, kind: BridgeInstallKind) -> Result<()> {
-    let bundle = source.join("dist").join("main.js");
-    if bundle.is_file() {
-        return Ok(());
+    let dist = source.join("dist");
+    let mut required = vec![dist.join("main.js")];
+    if matches!(kind, BridgeInstallKind::Cep) {
+        required.push(dist.join("dom.jsx"));
     }
     let build_command = match kind {
         BridgeInstallKind::Uxp => "npm run uxp:build",
         BridgeInstallKind::Cep => "npm run cep:build",
         BridgeInstallKind::Auto => unreachable!(),
     };
-    bail!(
-        "bridge bundle is missing at {}; source checkouts must run `npm ci` and `{build_command}` before install-bridge",
-        bundle.display()
-    )
+    for artifact in required {
+        if !artifact.is_file() {
+            bail!(
+                "bridge artifact is missing at {}; source checkouts must run `npm ci` and `{build_command}` before install-bridge",
+                artifact.display()
+            )
+        }
+    }
+    Ok(())
 }
 
 fn resolve_destination_root(dest: &Path) -> Result<PathBuf> {
@@ -456,6 +462,11 @@ mod tests {
 
         fs::write(source.join("dist").join("main.js"), "bundle").unwrap();
         ensure_bridge_bundle(&source, BridgeInstallKind::Uxp).unwrap();
+
+        let error = ensure_bridge_bundle(&source, BridgeInstallKind::Cep).unwrap_err();
+        assert!(error.to_string().contains("dom.jsx"));
+        fs::write(source.join("dist").join("dom.jsx"), "runtime").unwrap();
+        ensure_bridge_bundle(&source, BridgeInstallKind::Cep).unwrap();
         fs::remove_dir_all(source).unwrap();
     }
 }
