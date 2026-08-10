@@ -185,14 +185,15 @@ host tests. Advanced text styling, custom color creation, print presets, and
 specialized export option objects remain available through raw ExtendScript
 until they are promoted into typed facades.
 
-## Complete official UXP DOM access
+## Complete official DOM access
 
-InDesign and Premiere expose their complete installed official object model through
-structured `DomObject` references. This layer is for Adobe APIs that have not yet
-been promoted into the handwritten high-frequency facades above. Unlike `eval_js`,
-it does not execute caller-provided JavaScript: every operation is a root lookup,
-property read/write, method call, constructor call, key listing, or snapshot over
-an object owned by the connected bridge.
+InDesign, Premiere, After Effects, and Illustrator expose their complete installed
+official object model through structured `DomObject` references. This layer is for
+Adobe APIs that have not yet been promoted into the handwritten high-frequency
+facades above. Unlike `eval_js` or `eval_extendscript`, it does not execute
+caller-provided JavaScript: every operation is a root lookup, property read/write,
+method call, constructor call, key listing, or snapshot over an object owned by the
+connected bridge.
 
 Premiere's official static APIs can be traversed exactly as they appear in Adobe's
 JavaScript documentation:
@@ -229,6 +230,24 @@ app = indesign.dom.root("app")
 document = app.get("activeDocument")
 print(document.snapshot("name", "fullName"))
 document.set("label", "Automated", command_name="Label document")
+```
+
+After Effects and Illustrator expose `app`, `global`, and the current `project` or
+`document`. The `global` root provides official ExtendScript constructors while
+blocking prototype and eval traversal:
+
+```python
+from adobe.after_effects import AfterEffects
+
+after_effects = AfterEffects()
+app = after_effects.dom.root("app")
+project = after_effects.dom.root("project")
+print(project.snapshot("file", "numItems", "activeItem"))
+
+global_object = after_effects.dom.root("global")
+file = global_object.construct("File", "C:/media/plate.exr")
+import_options = global_object.construct("ImportOptions", file)
+project.call("importFile", import_options, mutating=True, command_name="Import plate")
 ```
 
 Available operations are `root`, `get`, `set`, `call`, `construct`, `keys`,

@@ -121,6 +121,12 @@ function adobepyDispatch(payload) {
     if (request.namespace === "export" && request.method === "exportFile") {
       return adobepyResult(request.id, adobepyIllustratorExportFile(adobepyIllustratorActiveDocument(), (request.args || [])[0] || {}));
     }
+    if (request.namespace === "dom") {
+      if (!adobepyDomHasMethod(request.method)) {
+        return adobepyError(request.id, -32601, "unsupported method dom." + request.method);
+      }
+      return adobepyResult(request.id, adobepyDomDispatch(request, adobepyIllustratorDomRoots()));
+    }
     if (request.namespace === "raw" && request.method === "evalExtendScript") {
       return adobepyResult(request.id, eval((request.args || [])[0]));
     }
@@ -131,6 +137,10 @@ function adobepyDispatch(payload) {
       source: error && error.source
     });
   }
+}
+
+function adobepyIllustratorDomRoots() {
+  return { app: app, document: adobepyIllustratorActiveDocument(), global: adobepyDomGlobalObject };
 }
 
 function adobepyIllustratorDocument() {

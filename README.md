@@ -14,7 +14,8 @@ Implemented pieces:
 - Rust `adobepy` CLI with `broker`, `doctor`, `install-bridge`, and `repl`.
 - Local JSON-RPC broker with per-session token, target, timeout, and capability gates.
 - Python SDK under `adobe.core`, `adobe.raw`, `adobe.photoshop`, `adobe.indesign`, `adobe.premiere`, `adobe.after_effects`, and `adobe.illustrator`.
-- Structured, non-eval access to the complete installed InDesign and Premiere UXP object models.
+- Structured, non-eval access to the complete installed InDesign, Premiere,
+  After Effects, and Illustrator object models.
 - Optional DCC MCP result helpers under `adobe.dcc_mcp` for adapter skill code.
 - UXP bridge templates for Photoshop, InDesign, and Premiere that dispatch to host APIs and broker raw JavaScript escape hatches.
 - CEP bridge templates for After Effects and Illustrator.
