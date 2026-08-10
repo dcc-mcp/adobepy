@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.6.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.5.2...adobepy-v0.6.0) (2026-08-10)
+
+
+### Features
+
+* expose complete CEP DOM access ([3fe1ba7](https://github.com/dcc-mcp/adobepy/commit/3fe1ba7fb12b06e1bc2ea3acaf515474e89bd4aa))
+* expose complete UXP DOM access ([47257e8](https://github.com/dcc-mcp/adobepy/commit/47257e8875e5e25380b3a750afa258e180dc3325))
+* support Illustrator path geometry ([#57](https://github.com/dcc-mcp/adobepy/issues/57)) ([98a28e6](https://github.com/dcc-mcp/adobepy/commit/98a28e66fafa327e50a3878ac22f0db65a8e189c))
+
+
+### Bug Fixes
+
+* improve standalone installation ([749b610](https://github.com/dcc-mcp/adobepy/commit/749b6102cba82e13549090dc5f6859df63ddae39))
+* unify bridge authentication token handling ([4fd375f](https://github.com/dcc-mcp/adobepy/commit/4fd375f04bd06e334a9a165a55b24d447ae18c9c))
+
+
+### Documentation
+
+* clarify Adobe capability coverage ([#58](https://github.com/dcc-mcp/adobepy/issues/58)) ([c1f719f](https://github.com/dcc-mcp/adobepy/commit/c1f719f7ed4661478905ca584d5b0e37acc1502d))
+
 ## [0.5.2](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.5.1...adobepy-v0.5.2) (2026-07-15)
 
 
