@@ -1,4 +1,6 @@
 import pathlib
+import shutil
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -41,6 +43,34 @@ class DistributionTests(unittest.TestCase):
             self.assertEqual(root.findtext("./DispatchInfoList/Extension/DispatchInfo/Resources/MainPath"), "./index.html")
             self.assertEqual(root.findtext("./DispatchInfoList/Extension/DispatchInfo/Resources/ScriptPath"), "./host/dispatcher.jsx")
             self.assertEqual(root.find("./DispatchInfoList/Extension").attrib["Id"], extension_id)
+
+    def test_cep_extendscript_receives_explicit_arguments(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is required to execute the CEP dispatcher contract")
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+const response = JSON.parse(adobepyDispatch(JSON.stringify({
+  jsonrpc: "2.0",
+  id: "arguments-contract",
+  namespace: "raw",
+  method: "evalExtendScript",
+  args: ["arguments[0] + arguments[1]", 2, 3]
+})));
+if (response.result !== 5) {
+  throw new Error(`expected explicit arguments to produce 5, got ${JSON.stringify(response.result)}`);
+}
+"""
+        for host in ("after-effects", "illustrator"):
+            dispatcher = REPO_ROOT / "bridges" / "cep" / host / "host" / "dispatcher.jsx"
+            subprocess.run(
+                [node, "-e", script, str(dispatcher)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
     def test_wheel_tags_accept_pure_python_and_abi3_py38(self):
         assert_compatible_wheel_name("adobepy-0.1.0-py3-none-any.whl")
