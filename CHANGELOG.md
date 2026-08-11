@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.6.1...adobepy-v0.6.2) (2026-08-11)
+
+
+### Bug Fixes
+
+* pass ExtendScript arguments ([#62](https://github.com/dcc-mcp/adobepy/issues/62)) ([094cc08](https://github.com/dcc-mcp/adobepy/commit/094cc08f4d67c37f37e417724621474c3ee3b54a))
+
 ## [0.6.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.6.0...adobepy-v0.6.1) (2026-08-11)
 
 
