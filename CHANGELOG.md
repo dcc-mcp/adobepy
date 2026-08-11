@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.6.0...adobepy-v0.6.1) (2026-08-11)
+
+
+### Bug Fixes
+
+* harden CEP runtime and release artifacts ([#60](https://github.com/dcc-mcp/adobepy/issues/60)) ([906bcb0](https://github.com/dcc-mcp/adobepy/commit/906bcb0c6154d5c3619aebc827e9db57f59a6a88))
+
 ## [0.6.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.5.2...adobepy-v0.6.0) (2026-08-10)
 
 
