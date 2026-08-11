@@ -10,6 +10,7 @@ const root = path.resolve(__dirname, "..");
 const bundlePath = path.join(root, "bridges", "cep", "after-effects", "dist", "main.js");
 const afterEffectsDispatcherPath = path.join(root, "bridges", "cep", "after-effects", "host", "dispatcher.jsx");
 const illustratorDispatcherPath = path.join(root, "bridges", "cep", "illustrator", "host", "dispatcher.jsx");
+const illustratorManifestPath = path.join(root, "bridges", "cep", "illustrator", "CSXS", "manifest.xml");
 
 function waitForMicrotasks() {
   return new Promise((resolve) => setImmediate(resolve));
@@ -20,6 +21,7 @@ async function main() {
   const sent = [];
   const evalScripts = [];
   const loadedScripts = [];
+  const runtimeChecks = [];
   let socketInstance = null;
 
   class FakeWebSocket {
@@ -47,10 +49,19 @@ async function main() {
     getSystemPath() { return "C:/extension"; },
     evalScript(script, callback) {
       if (script.startsWith("$.evalFile(")) { loadedScripts.push(script); callback("true"); return; }
+      if (script.includes("typeof adobepyDispatch")) { runtimeChecks.push(script); callback("ready"); return; }
       evalScripts.push(script);
-      const match = script.match(/^adobepyDispatch\(decodeURIComponent\('([^']*)'\)\)$/);
+      const match = script.match(/^adobepyDispatch\((.*)\)$/);
       assert.ok(match, `unexpected evalScript payload: ${script}`);
-      const request = JSON.parse(decodeURIComponent(match[1]));
+      const request = JSON.parse(JSON.parse(match[1]));
+      if (request.namespace === "empty") {
+        callback("");
+        return;
+      }
+      if (request.namespace === "eval-error") {
+        callback("EvalScript error.");
+        return;
+      }
       if (request.namespace === "bad") {
         callback(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "unsupported" } }));
         return;
@@ -78,17 +89,23 @@ async function main() {
   await waitForMicrotasks();
 
   assert.ok(socketInstance);
-  assert.ok(loadedScripts[0].includes("/dist/dom.jsx"));
-  assert.ok(loadedScripts[1].includes("/host/dispatcher.jsx"));
+  assert.ok(loadedScripts[0].includes("/dist/json.jsx"));
+  assert.ok(loadedScripts[1].includes("/dist/dom.jsx"));
+  assert.ok(loadedScripts[2].includes("/host/dispatcher.jsx"));
+  assert.strictEqual(runtimeChecks.length, 1);
+  assert.ok(runtimeChecks[0].includes("typeof adobepyDomHasMethod"));
   assert.strictEqual(sent[0].type, "hello");
   assert.strictEqual(sent[0].capabilities.host, "after-effects");
   assert.ok(sent[0].capabilities.methods.dom.includes("snapshot"));
   assert.deepStrictEqual(sent[0].capabilities.methods.raw, ["evalExtendScript"]);
+  testIllustratorBackgroundLifecycle();
 
-  socketInstance.emit("message", { data: JSON.stringify({ type: "request", request: { jsonrpc: "2.0", id: "broker_1", host: "after-effects", namespace: "app", method: "getVersion", args: ["quote '"] } }) });
+  const edgeCaseArgument = `quote ' " ${String.fromCharCode(0x2028)}`;
+  socketInstance.emit("message", { data: JSON.stringify({ type: "request", request: { jsonrpc: "2.0", id: "broker_1", host: "after-effects", namespace: "app", method: "getVersion", args: [edgeCaseArgument] } }) });
   await waitForMicrotasks();
   assert.strictEqual(sent[1].response.id, "broker_1");
-  assert.ok(evalScripts[0].includes("%27"));
+  assert.ok(evalScripts[0].includes("adobepyDispatch("));
+  assert.ok(!evalScripts[0].includes("decodeURIComponent"));
 
   socketInstance.emit("message", { data: JSON.stringify({ type: "request", request: { jsonrpc: "2.0", id: "broker_2", host: "after-effects", namespace: "raw", method: "evalExtendScript", args: ["undefined"] } }) });
   await waitForMicrotasks();
@@ -99,8 +116,27 @@ async function main() {
   assert.strictEqual(sent[3].type, "error");
   assert.strictEqual(sent[3].error.error.code, -32601);
 
+  socketInstance.emit("message", { data: JSON.stringify({ type: "request", request: { jsonrpc: "2.0", id: "broker_4", host: "after-effects", namespace: "empty", method: "missingResult", args: [] } }) });
+  await waitForMicrotasks();
+  assert.strictEqual(sent[4].type, "error");
+  assert.strictEqual(sent[4].error.error.code, -32004);
+
+  socketInstance.emit("message", { data: JSON.stringify({ type: "request", request: { jsonrpc: "2.0", id: "broker_5", host: "after-effects", namespace: "eval-error", method: "fails", args: [] } }) });
+  await waitForMicrotasks();
+  assert.strictEqual(sent[5].type, "error");
+  assert.strictEqual(sent[5].error.error.code, -32004);
+
   testExtendScriptDispatchers();
   console.log("CEP bridge protocol test passed");
+}
+
+function testIllustratorBackgroundLifecycle() {
+  const manifest = fs.readFileSync(illustratorManifestPath, "utf8");
+  assert.match(manifest, /<AutoVisible>false<\/AutoVisible>/);
+  assert.match(manifest, /<Type>Custom<\/Type>/);
+  assert.match(manifest, /<StartOn>[\s\S]*<Event>applicationActivate<\/Event>/);
+  assert.match(manifest, /<StartOn>[\s\S]*<Event>com\.adobe\.csxs\.events\.ApplicationActivate<\/Event>/);
+  assert.ok(!manifest.includes("<Menu>"));
 }
 
 function testExtendScriptDispatchers() {
@@ -438,14 +474,14 @@ function testExtendScriptDispatchers() {
   assert.strictEqual(dispatch(ae, "ae_create_solid", "layer", "createSolid", [1, { name: "Background", color: [0.1, 0.2, 0.3] }]).result.name, "Background");
   assert.strictEqual(dispatch(ae, "ae_create_footage", "layer", "createFootage", [1, { item: 2 }]).result.sourceId, 2);
   assert.strictEqual(dispatch(ae, "ae_transform", "layer", "setTransform", [1, 11, { position: [960, 540], opacity: 80 }]).result.name, "Title");
-  assert.deepStrictEqual(aeTransformValues["ADBE Position"], [960, 540]);
+  assert.deepStrictEqual(normalizeVmValue(aeTransformValues["ADBE Position"]), [960, 540]);
   assert.strictEqual(dispatch(ae, "ae_keyframes", "layer", "setKeyframes", [1, 11, { property: "scale", keyframes: [{ time: 0, value: [0, 0] }, { time: 1, value: [100, 100] }] }]).result.name, "Title");
   assert.strictEqual(dispatch(ae, "ae_move_beginning", "layer", "moveToBeginning", [1, 11]).result.name, "Title");
   assert.strictEqual(dispatch(ae, "ae_move_end", "layer", "moveToEnd", [1, 11]).result.name, "Title");
   assert.strictEqual(dispatch(ae, "ae_move_before", "layer", "moveBefore", [1, 11, 12]).result.name, "Title");
   assert.strictEqual(dispatch(ae, "ae_move_after", "layer", "moveAfter", [1, 11, 12]).result.name, "Title");
   assert.deepStrictEqual(aeLayerMoves, [["moveToBeginning", 11], ["moveToEnd", 11], ["moveBefore", 11, 12], ["moveAfter", 11, 12]]);
-  assert.deepStrictEqual(aeTransformKeyframes["ADBE Scale"], [{ time: 0, value: [0, 0] }, { time: 1, value: [100, 100] }]);
+  assert.deepStrictEqual(normalizeVmValue(aeTransformKeyframes["ADBE Scale"]), [{ time: 0, value: [0, 0] }, { time: 1, value: [100, 100] }]);
   assert.strictEqual(dispatch(ae, "ae_render_queue", "renderQueue", "get").result.numItems, 1);
   assert.strictEqual(dispatch(ae, "ae_render_items", "renderQueue", "getItems").result[0].compName, "Main Comp");
   assert.strictEqual(dispatch(ae, "ae_render_item", "renderQueue", "getItemByIndex", [1]).result.status, "QUEUED");
@@ -780,13 +816,13 @@ function testExtendScriptDispatchers() {
   assert.strictEqual(aiExports[3].exportType, "SVG");
   assert.strictEqual(dispatch(ai, "ai_missing_export_path", "export", "exportFile", [{ format: "png24" }]).error.code, -32004);
   assert.strictEqual(dispatch(ai, "ai_set_entire_path", "pathItem", "setEntirePath", ["path-1", [[0, 0], [10, 10]]]).result.pathPointCount, 2);
-  assert.deepStrictEqual(aiPathMutations[0], ["setEntirePath", [[0, 0], [10, 10]]]);
+  assert.deepStrictEqual(normalizeVmValue(aiPathMutations[0]), ["setEntirePath", [[0, 0], [10, 10]]]);
   assert.strictEqual(dispatch(ai, "ai_translate_path", "pathItem", "translate", ["path-1", { deltaX: 10, deltaY: 20, transformFillPatterns: false }]).result.name, "Logo Path");
-  assert.deepStrictEqual(aiPathMutations[1], ["translate", [10, 20, undefined, false]]);
+  assert.deepStrictEqual(normalizeVmValue(aiPathMutations[1]), ["translate", [10, 20, undefined, false]]);
   assert.strictEqual(dispatch(ai, "ai_resize_path", "pathItem", "resize", ["path-1", { scaleX: 150, scaleY: 125, changePositions: true, changeLineWidths: 50 }]).result.name, "Logo Path");
-  assert.deepStrictEqual(aiPathMutations[2], ["resize", [150, 125, true, undefined, undefined, undefined, 50]]);
+  assert.deepStrictEqual(normalizeVmValue(aiPathMutations[2]), ["resize", [150, 125, true, undefined, undefined, undefined, 50]]);
   assert.strictEqual(dispatch(ai, "ai_rotate_path", "pathItem", "rotate", ["path-1", { angle: 45, changePositions: true, rotateAbout: "Transformation.CENTER" }]).result.name, "Logo Path");
-  assert.deepStrictEqual(aiPathMutations[3], ["rotate", [45, true, undefined, undefined, undefined, "Transformation.CENTER"]]);
+  assert.deepStrictEqual(normalizeVmValue(aiPathMutations[3]), ["rotate", [45, true, undefined, undefined, undefined, "Transformation.CENTER"]]);
   assert.strictEqual(dispatch(ai, "ai_missing_path", "pathItem", "translate", ["missing", { deltaX: 1 }]).error.code, -32004);
   assert.strictEqual(dispatch(ai, "ai_raw", "raw", "evalExtendScript", ["app.version"]).result, "28.2.0");
 
@@ -809,9 +845,12 @@ function testExtendScriptDispatchers() {
 }
 
 function loadDispatcher(file, globals) {
-  const context = { ...globals, JSON, String, Number };
+  const context = { ...globals, JSON: undefined, String, Number };
+  const jsonRuntime = path.join(path.dirname(file), "..", "dist", "json.jsx");
   const domRuntime = path.join(path.dirname(file), "..", "dist", "dom.jsx");
+  assert.ok(fs.existsSync(jsonRuntime), `missing CEP JSON runtime: ${jsonRuntime}`);
   assert.ok(fs.existsSync(domRuntime), `missing CEP DOM runtime: ${domRuntime}`);
+  vm.runInNewContext(fs.readFileSync(jsonRuntime, "utf8"), context, { filename: jsonRuntime });
   vm.runInNewContext(fs.readFileSync(domRuntime, "utf8"), context, { filename: domRuntime });
   vm.runInNewContext(fs.readFileSync(file, "utf8"), context, { filename: file });
   assert.strictEqual(typeof context.adobepyDispatch, "function");
@@ -820,6 +859,14 @@ function loadDispatcher(file, globals) {
 
 function dispatch(context, id, namespace, method, args = [], options = undefined) {
   return JSON.parse(context.adobepyDispatch(JSON.stringify({ jsonrpc: "2.0", id, namespace, method, args, options })));
+}
+
+function normalizeVmValue(value) {
+  if (Array.isArray(value)) return Array.from(value, normalizeVmValue);
+  if (!value || typeof value !== "object") return value;
+  const normalized = {};
+  for (const key of Object.keys(value)) normalized[key] = normalizeVmValue(value[key]);
+  return normalized;
 }
 
 main().catch((error) => {

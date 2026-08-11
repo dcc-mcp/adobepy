@@ -15,11 +15,16 @@
           <MainPath>./index.html</MainPath>
           <ScriptPath>./host/dispatcher.jsx</ScriptPath>
         </Resources>
-        <Lifecycle><AutoVisible>true</AutoVisible></Lifecycle>
+        <Lifecycle>
+          <AutoVisible>false</AutoVisible>
+          <StartOn>
+            <Event>applicationActivate</Event>
+            <Event>com.adobe.csxs.events.ApplicationActivate</Event>
+          </StartOn>
+        </Lifecycle>
         <UI>
-          <Type>Panel</Type>
-          <Menu>adobepy Bridge</Menu>
-          <Geometry><Size><Height>120</Height><Width>280</Width></Size></Geometry>
+          <Type>Custom</Type>
+          <Geometry><Size><Height>1</Height><Width>1</Width></Size></Geometry>
         </UI>
       </DispatchInfo>
     </Extension>
