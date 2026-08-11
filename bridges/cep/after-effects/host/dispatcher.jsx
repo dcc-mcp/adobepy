@@ -213,7 +213,8 @@ function adobepyDispatch(payload) {
       return adobepyResult(request.id, adobepyDomDispatch(request, adobepyAfterEffectsDomRoots()));
     }
     if (request.namespace === "raw" && request.method === "evalExtendScript") {
-      return adobepyResult(request.id, eval((request.args || [])[0]));
+      var rawArgs = request.args || [];
+      return adobepyResult(request.id, adobepyEvalExtendScript(rawArgs[0], rawArgs.slice(1)));
     }
     return adobepyError(request.id, -32601, "unsupported method " + request.namespace + "." + request.method);
   } catch (error) {
@@ -222,6 +223,12 @@ function adobepyDispatch(payload) {
       source: error && error.source
     });
   }
+}
+
+function adobepyEvalExtendScript(source, args) {
+  return (function () {
+    return eval(source);
+  }).apply(null, args || []);
 }
 
 function adobepyAfterEffectsDomRoots() {
