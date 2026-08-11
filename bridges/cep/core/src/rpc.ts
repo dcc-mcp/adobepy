@@ -33,11 +33,19 @@ export function startCepBridge(config: CepConfig): void {
       const message = JSON.parse(event.data);
       if (message.type !== "request") return;
       const request = message.request as RpcRequest;
-      const encoded = encodeURIComponent(JSON.stringify(request)).replace(/'/g, "%27");
+      const requestLiteral = JSON.stringify(JSON.stringify(request))
+        .replace(/\u2028/g, "\\u2028")
+        .replace(/\u2029/g, "\\u2029");
       try {
-        cep.evalScript(`adobepyDispatch(decodeURIComponent('${encoded}'))`, (raw: string) => {
+        cep.evalScript(`adobepyDispatch(${requestLiteral})`, (raw: string) => {
           try {
-            const parsed = raw ? JSON.parse(raw) : { jsonrpc: "2.0", id: request.id, result: null };
+            if (typeof raw !== "string" || raw.trim() === "") {
+              throw new Error("Adobe CEP evalScript returned no JSON response");
+            }
+            if (raw.trim() === "EvalScript error.") {
+              throw new Error("Adobe CEP evalScript failed");
+            }
+            const parsed = JSON.parse(raw);
             if (parsed.error) {
               socket.send(JSON.stringify({ type: "error", error: { ...parsed, id: parsed.id ?? request.id } }));
               return;
@@ -53,10 +61,26 @@ export function startCepBridge(config: CepConfig): void {
       }
     };
   };
-  const loadDispatcher = () => {
-    cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/host/dispatcher.jsx`)})`, connect);
+  const verifyRuntime = () => {
+    const probe = [
+      'typeof adobepyDispatch === "function"',
+      'typeof adobepyDomHasMethod === "function"',
+      'typeof JSON === "object"',
+      'typeof JSON.parse === "function"',
+      'typeof JSON.stringify === "function"',
+    ].join(" && ");
+    cep.evalScript(`${probe} ? "ready" : "missing"`, (status: string) => {
+      if (status === "ready") connect();
+      else console.error("adobepy CEP host runtime failed to initialize", status);
+    });
   };
-  cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/dist/dom.jsx`)})`, loadDispatcher);
+  const loadDispatcher = () => {
+    cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/host/dispatcher.jsx`)})`, verifyRuntime);
+  };
+  const loadDomRuntime = () => {
+    cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/dist/dom.jsx`)})`, loadDispatcher);
+  };
+  cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/dist/json.jsx`)})`, loadDomRuntime);
 }
 
 function hostScriptError(id: string | number, error: any) {

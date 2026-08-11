@@ -83,6 +83,43 @@ function Get-Sha256 {
     finally { $stream.Dispose() }
 }
 
+function Invoke-RemappedCargoReleaseBuild {
+    $separator = [char]0x1f
+    $previousFlags = $env:CARGO_ENCODED_RUSTFLAGS
+    $flags = @()
+    if ($previousFlags) { $flags += $previousFlags -split [string]$separator }
+    $flags += "--remap-path-prefix=$Root=/workspace"
+    if ($env:USERPROFILE) { $flags += "--remap-path-prefix=$($env:USERPROFILE)=/user" }
+    $env:CARGO_ENCODED_RUSTFLAGS = $flags -join $separator
+    try {
+        Invoke-External "cargo" @("build", "--release", "-p", "adobepy-cli", "--bin", "adobepy")
+    }
+    finally {
+        $env:CARGO_ENCODED_RUSTFLAGS = $previousFlags
+    }
+}
+
+function Assert-NoLocalBuildPaths {
+    param([string]$BasePath)
+    $needles = @($Root, ($Root -replace "\\", "/"))
+    if ($env:USERPROFILE) {
+        $needles += $env:USERPROFILE
+        $needles += ($env:USERPROFILE -replace "\\", "/")
+    }
+    foreach ($file in Get-ChildItem -LiteralPath $BasePath -Recurse -File -Force) {
+        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+        $encodings = @([System.Text.Encoding]::UTF8, [System.Text.Encoding]::Unicode)
+        foreach ($encoding in $encodings) {
+            $text = $encoding.GetString($bytes)
+            foreach ($needle in $needles) {
+                if ($needle -and $text.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    throw "release artifact contains a local build path: $($file.Name)"
+                }
+            }
+        }
+    }
+}
+
 function Write-Installer {
     param([string]$Destination)
     @'
@@ -176,7 +213,7 @@ if (-not $SkipTests) {
 }
 
 Invoke-Step "Build release CLI" {
-    Invoke-External "cargo" @("build", "--release", "-p", "adobepy-cli", "--bin", "adobepy")
+    Invoke-RemappedCargoReleaseBuild
 }
 
 Invoke-Step "Build bridge bundles" {
@@ -191,8 +228,6 @@ Invoke-Step "Stage distribution tree" {
     New-Item -ItemType Directory -Force -Path (Join-Path $stageRoot "bin") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $stageRoot "wheels") | Out-Null
     Copy-File (Join-Path $Root "target\release\adobepy.exe") (Join-Path $stageRoot "bin\adobepy.exe")
-    $pdbPath = Join-Path $Root "target\release\adobepy.pdb"
-    if (Test-Path -LiteralPath $pdbPath) { Copy-File $pdbPath (Join-Path $stageRoot "bin\adobepy.pdb") }
     foreach ($dir in @("python", "bridges", "docs", "generators")) { Copy-Tree $dir (Join-Path $stageRoot $dir) }
     foreach ($file in @("README.md", "install.md", "pyproject.toml", "package.json", "package-lock.json", "Cargo.toml", "Cargo.lock")) {
         Copy-File $file (Join-Path $stageRoot $file)
@@ -222,6 +257,8 @@ Invoke-Step "Write package docs and manifest" {
         notes = @("Rust dependencies are linked into the release executable.", "Bridge JavaScript dependencies are bundled into bridges/**/dist.", "The Python SDK has no third-party runtime dependencies.")
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stageRoot "package-manifest.json") -Encoding UTF8
 }
+
+Invoke-Step "Verify release privacy" { Assert-NoLocalBuildPaths $stageRoot }
 
 Invoke-Step "Create archive and checksum" {
     Remove-TransientBuildArtifacts $stageRoot

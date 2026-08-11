@@ -121,7 +121,11 @@ async function captureCapabilities(entry) {
 
   const fakeCep = {
     getSystemPath() { return "C:/extension"; },
-    evalScript(_script, callback) {
+    evalScript(script, callback) {
+      if (script.includes("typeof adobepyDispatch")) {
+        callback("ready");
+        return;
+      }
       callback(JSON.stringify({ jsonrpc: "2.0", id: "unused", result: null }));
     }
   };

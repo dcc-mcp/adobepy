@@ -25,6 +25,10 @@ async function buildTarget(name) {
     logLevel: "silent",
   });
   fs.copyFileSync(
+    path.join(root, "bridges/cep/core/host/json.jsx"),
+    path.join(path.dirname(path.join(root, target.outfile)), "json.jsx"),
+  );
+  fs.copyFileSync(
     path.join(root, "bridges/cep/core/host/dom.jsx"),
     path.join(path.dirname(path.join(root, target.outfile)), "dom.jsx"),
   );
