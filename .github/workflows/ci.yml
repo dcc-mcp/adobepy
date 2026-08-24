@@ -103,6 +103,11 @@ jobs:
           $zip = Get-ChildItem dist -Filter "adobepy-*-windows-x64.zip" | Select-Object -First 1
           if (-not $zip) { throw "package zip was not created" }
           if (-not (Test-Path "$($zip.FullName).sha256")) { throw "package checksum was not created" }
+          $expanded = Join-Path $env:RUNNER_TEMP "adobepy-package-version-check"
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $expanded
+          $packageRoot = Get-ChildItem -LiteralPath $expanded -Directory | Select-Object -First 1
+          if (-not $packageRoot) { throw "package zip has no root directory" }
+          node scripts/check-release-versions.js --root $packageRoot.FullName
       - name: Install smoke test
         shell: pwsh
         run: |

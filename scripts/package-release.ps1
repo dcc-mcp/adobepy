@@ -190,6 +190,10 @@ $stageRoot = [System.IO.Path]::GetFullPath((Join-Path $distRoot $packageName))
 $zipPath = Join-Path $distRoot "$packageName.zip"
 $hashPath = "$zipPath.sha256"
 
+Invoke-Step "Verify release version projection" {
+    Invoke-External "node" @("scripts\check-release-versions.js", "--root", $Root, "--expected", $Version)
+}
+
 Assert-ChildPath -Parent $distRoot -Child $stageRoot
 New-Item -ItemType Directory -Force -Path $distRoot | Out-Null
 if (Test-Path -LiteralPath $stageRoot) {
@@ -256,6 +260,10 @@ Invoke-Step "Write package docs and manifest" {
         includes = @("bin/adobepy.exe", "wheels/*.whl", "python/adobe", "bridges/uxp", "bridges/cep", "docs", "generators/ir", "install.md")
         notes = @("Rust dependencies are linked into the release executable.", "Bridge JavaScript dependencies are bundled into bridges/**/dist.", "The Python SDK has no third-party runtime dependencies.")
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stageRoot "package-manifest.json") -Encoding UTF8
+}
+
+Invoke-Step "Verify staged release version projection" {
+    Invoke-External "node" @("scripts\check-release-versions.js", "--root", $stageRoot, "--expected", $Version)
 }
 
 Invoke-Step "Verify release privacy" { Assert-NoLocalBuildPaths $stageRoot }
