@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.6.2...adobepy-v0.7.0) (2026-08-24)
+
+
+### Features
+
+* attest Adobe runtime identity ([#66](https://github.com/dcc-mcp/adobepy/issues/66)) ([38982d0](https://github.com/dcc-mcp/adobepy/commit/38982d05cefa57a8ba8bb70ba119dfd9ef294735))
+
+
+### Bug Fixes
+
+* keep release versions in sync ([#69](https://github.com/dcc-mcp/adobepy/issues/69)) ([2a8eec3](https://github.com/dcc-mcp/adobepy/commit/2a8eec3745602f872f0d901eef6467cefbef7ea8))
+
 ## [0.6.2](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.6.1...adobepy-v0.6.2) (2026-08-11)
 
 
