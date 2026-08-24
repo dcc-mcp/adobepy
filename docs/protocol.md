@@ -125,6 +125,35 @@ unavailable error, and an omitted target with multiple matching sessions
 returns an ambiguous error. All identity fields are bounded and malformed
 claims are rejected before registration.
 
+## Bounded Photoshop bootstrap
+
+An adapter that has already authenticated an exact Photoshop executable and
+installed DCC-MCP UXP bridge can request the fixed bootstrap operation through
+`BrokerClient.bootstrap_photoshop_uxp()`. The typed request includes the target,
+timeout, host byte identity/version/profile, and the exact manifest, entry page,
+and bridge-module byte identities. The broker accepts only the fixed Photoshop
+bridge manifest and `dist/main.js`; it cannot load another plug-in, run
+JavaScript, invoke a generic command, or fall back to UI automation.
+
+When no matching session exists, the broker writes the bounded local bridge
+configuration transactionally, launches only the selected Photoshop product,
+and binds the first bridge connection to a one-time nonce plus the observed
+process PID/start/executable. A mismatch, stale process, foreign module/profile,
+ambiguous concurrent request, launch failure, or timeout fails closed and
+restores the prior configuration. Repeating the same request for the same live
+identity is idempotent.
+
+The successful result omits tokens and local paths while binding broker,
+Photoshop, and plug-in identities through digests and an identity fingerprint.
+Its only continuation is the authenticated
+`POST /v1/photoshop/bootstrap/verify` receipt check. The Python client rejects a
+well-shaped response when its host/profile/module identity differs from the
+request or when verification returns a different receipt.
+
+This contract does not prove live UXP loading on its own. Adapters must retain a
+not-ready result until the returned continuation succeeds against the same
+process and bridge connection.
+
 ## Responses
 
 Successful bridge responses preserve the client-visible request id:

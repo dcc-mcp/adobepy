@@ -11,9 +11,9 @@ import tempfile
 import venv
 from typing import Iterable, Sequence
 
-
 SMOKE_SOURCE = """
 from adobe.photoshop import Photoshop
+from adobe.core import PhotoshopBootstrapRequest, PhotoshopBootstrapResult
 from adobe.indesign import InDesign
 from adobe.premiere import Premiere
 from adobe.after_effects import AfterEffects
@@ -23,6 +23,8 @@ from adobe.raw import RawSession
 from adobe.dcc_mcp import adobe_success
 
 assert Photoshop.__name__ == "Photoshop"
+assert PhotoshopBootstrapRequest.__name__ == "PhotoshopBootstrapRequest"
+assert PhotoshopBootstrapResult.__name__ == "PhotoshopBootstrapResult"
 assert InDesign.__name__ == "InDesign"
 assert Premiere.__name__ == "Premiere"
 assert AfterEffects.__name__ == "AfterEffects"
@@ -61,13 +63,19 @@ def smoke_wheel(wheel: pathlib.Path) -> None:
         venv_dir = tmp_path / ".venv"
         venv.EnvBuilder(with_pip=True).create(venv_dir)
         python = venv_python(venv_dir)
-        run([str(python), "-m", "pip", "install", "--no-deps", str(wheel)], cwd=tmp_path)
+        run(
+            [str(python), "-m", "pip", "install", "--no-deps", str(wheel)], cwd=tmp_path
+        )
         run([str(python), "-c", SMOKE_SOURCE], cwd=tmp_path)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Smoke-test built adobepy wheels in a temporary venv")
-    parser.add_argument("paths", nargs="+", type=pathlib.Path, help="Wheel files or directories")
+    parser = argparse.ArgumentParser(
+        description="Smoke-test built adobepy wheels in a temporary venv"
+    )
+    parser.add_argument(
+        "paths", nargs="+", type=pathlib.Path, help="Wheel files or directories"
+    )
     args = parser.parse_args(argv)
 
     wheels = list(iter_wheels(args.paths))

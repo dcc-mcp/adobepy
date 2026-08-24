@@ -28,6 +28,13 @@ from .runtime_identity import (
     HostRuntimeIdentity,
     RuntimeIdentityAttestation,
 )
+from .photoshop_bootstrap import (
+    PhotoshopBootstrapContinuation,
+    PhotoshopBootstrapRequest,
+    PhotoshopBootstrapResult,
+    PhotoshopHostTarget,
+    PhotoshopPluginTarget,
+)
 
 __all__ = [
     "AdobePythonError",
@@ -55,6 +62,11 @@ __all__ = [
     "BrokerRuntimeIdentity",
     "HostRuntimeIdentity",
     "RuntimeIdentityAttestation",
+    "PhotoshopBootstrapContinuation",
+    "PhotoshopBootstrapRequest",
+    "PhotoshopBootstrapResult",
+    "PhotoshopHostTarget",
+    "PhotoshopPluginTarget",
     "connect",
     "normalize_capability_sessions",
 ]
