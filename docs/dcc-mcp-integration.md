@@ -43,6 +43,22 @@ Recommended lifecycle:
    `connect("photoshop")`.
 5. Skill scripts return DCC MCP results through `adobe.dcc_mcp`.
 
+Before step 4 is treated as exact-instance readiness, the adapter must bind the
+selected broker and Photoshop process to the owned install receipt:
+
+```python
+from adobe.photoshop import Photoshop
+
+live = Photoshop().runtime_identity(expected=receipt_identity)
+```
+
+`receipt_identity` must be assembled from independently observed broker and
+Photoshop PID/start/executable facts plus the previously recorded profile,
+target, bridge instance, connection epoch, plug-in root, and module origin. A
+capability match alone is not sufficient. Identity errors are stable typed
+exceptions and must remain fail-closed; do not add arbitrary JavaScript/Python
+execution or UI automation as a discovery fallback.
+
 The broker port is separate from the MCP server port. The MCP server should not
 proxy raw WebSocket messages; it should call the Python facade.
 

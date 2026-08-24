@@ -13,6 +13,8 @@ Implemented pieces:
 
 - Rust `adobepy` CLI with `broker`, `doctor`, `install-bridge`, and `repl`.
 - Local JSON-RPC broker with per-session token, target, timeout, and capability gates.
+- Authenticated, typed broker/host/bridge runtime identity attestation for
+  exact-instance checks by DCC MCP adapters.
 - Python SDK under `adobe.core`, `adobe.raw`, `adobe.photoshop`, `adobe.indesign`, `adobe.premiere`, `adobe.after_effects`, and `adobe.illustrator`.
 - Structured, non-eval access to the complete installed InDesign, Premiere,
   After Effects, and Illustrator object models.

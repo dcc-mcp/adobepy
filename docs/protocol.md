@@ -59,6 +59,20 @@ Every bridge must send a first WebSocket message:
     "methods": {
       "document": ["getActive", "getActiveLayers"]
     }
+  },
+  "identity": {
+    "host": {
+      "pid": 4200,
+      "processStartIdentity": "windows:133700000000000100",
+      "executablePath": "C:/Adobe/Photoshop.exe",
+      "hostVersion": "26.0",
+      "profileId": "profile-production"
+    },
+    "bridge": {
+      "instanceId": "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99",
+      "installedPluginRoot": "C:/UXP/External/com.adobepy.bridge.photoshop",
+      "moduleOrigin": "C:/UXP/External/com.adobepy.bridge.photoshop/dist/main.js"
+    }
   }
 }
 ```
@@ -67,6 +81,49 @@ The broker registers sessions by `host:target`, then rejects calls whose
 namespace or method is not advertised. Capability snapshots for Photoshop,
 InDesign, Premiere, After Effects, and Illustrator are asserted by
 `npm run capabilities:check` against the generated IR and API source registry.
+
+Identity claims are optional for backward-compatible bridge connectivity, but
+an incomplete claim can never produce an exact runtime attestation. The
+Photoshop UXP bridge obtains its host version and installed plug-in/module
+origin from the loaded host and UXP file-system APIs. It accepts PID,
+process-start identity, executable path, and profile ID only from the bounded
+adapter-owned `__ADOBEPY_HOST_IDENTITY` launch context. It does not guess these
+values or use arbitrary execution or UI automation to discover them.
+
+## Runtime Identity Attestation
+
+Adapters request a complete authenticated identity over:
+
+```http
+POST /v1/runtime-identity
+x-adobepy-token: <session token>
+content-type: application/json
+
+{"host":"photoshop","target":"default"}
+```
+
+The response binds the broker PID/start identity/executable/version/instance,
+Photoshop PID/start identity/executable/version/profile, and UXP
+target/kind/version/connection epoch/instance/plugin root/module origin. The
+token is never part of the response. `BrokerClient.runtime_identity()` and
+`Photoshop.runtime_identity()` return a typed `RuntimeIdentityAttestation`.
+
+Install verification should construct an expected attestation from independent
+OS process observations plus the owned install receipt and pass it back to the
+broker:
+
+```python
+from adobe.photoshop import Photoshop
+
+identity = Photoshop().runtime_identity(expected=expected_identity)
+```
+
+The broker compares every field. PID reuse or a changed connection epoch or
+instance returns a stale error. A wrong executable, profile, target, plug-in
+root, or module origin returns a mismatch error. Missing host facts return an
+unavailable error, and an omitted target with multiple matching sessions
+returns an ambiguous error. All identity fields are bounded and malformed
+claims are rejected before registration.
 
 ## Responses
 
@@ -120,6 +177,10 @@ Failures use a JSON-RPC error object and may include diagnostics:
 | `-32007` | `ERROR_TIMEOUT` | Broker timed out while waiting for the bridge response. |
 | `-32008` | `ERROR_SERIALIZATION` | Request or response could not be serialized. |
 | `-32009` | `ERROR_UNAUTHORIZED` | Broker or bridge token is missing or invalid. |
+| `-32010` | `ERROR_IDENTITY_UNAVAILABLE` | A complete runtime identity is unavailable. |
+| `-32011` | `ERROR_IDENTITY_STALE` | PID/start, connection epoch, or instance identity changed. |
+| `-32012` | `ERROR_IDENTITY_AMBIGUOUS` | Multiple sessions match without an exact target. |
+| `-32013` | `ERROR_IDENTITY_MISMATCH` | Runtime identity differs from the expected receipt/OS observation. |
 
 Python maps these codes to typed exceptions in `adobe.core.errors`, so DCC MCP
 adapters can convert failures to their own `skill_error` or `from_exception`

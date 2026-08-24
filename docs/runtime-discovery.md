@@ -128,6 +128,14 @@ Expected response (HTTP 200):
 The adapter polls this endpoint with a 100 ms interval and a total timeout of
 5 seconds before declaring the broker unhealthy.
 
+Health proves only that an HTTP broker is listening. It does not prove that the
+broker is the selected process or that a particular Photoshop/UXP session is
+ready. Before reporting `directly_usable`, the adapter must call the
+authenticated runtime identity endpoint and compare the result with independent
+OS process observations and its owned install receipt. A missing
+`__ADOBEPY_HOST_IDENTITY` launch context therefore remains fail-closed even when
+`/health` and `/v1/capabilities` succeed.
+
 ---
 
 ## 4. Environment Variables for Consumer Handoff

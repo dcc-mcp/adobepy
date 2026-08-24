@@ -10,6 +10,10 @@ from .errors import (
     CapabilityError,
     HostNotRunningError,
     HostScriptError,
+    IdentityAmbiguousError,
+    IdentityMismatchError,
+    IdentityStaleError,
+    IdentityUnavailableError,
     MethodNotFoundError,
     ModalRequiredError,
     PermissionError,
@@ -18,6 +22,12 @@ from .errors import (
     UnauthorizedError,
 )
 from .session import HostSession, connect
+from .runtime_identity import (
+    BridgeRuntimeIdentity,
+    BrokerRuntimeIdentity,
+    HostRuntimeIdentity,
+    RuntimeIdentityAttestation,
+)
 
 __all__ = [
     "AdobePythonError",
@@ -30,6 +40,10 @@ __all__ = [
     "HostCapabilities",
     "HostNotRunningError",
     "HostScriptError",
+    "IdentityAmbiguousError",
+    "IdentityMismatchError",
+    "IdentityStaleError",
+    "IdentityUnavailableError",
     "HostSession",
     "MethodNotFoundError",
     "ModalRequiredError",
@@ -37,6 +51,10 @@ __all__ = [
     "SerializationError",
     "TimeoutError",
     "UnauthorizedError",
+    "BridgeRuntimeIdentity",
+    "BrokerRuntimeIdentity",
+    "HostRuntimeIdentity",
+    "RuntimeIdentityAttestation",
     "connect",
     "normalize_capability_sessions",
 ]
