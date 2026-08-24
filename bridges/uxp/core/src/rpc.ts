@@ -1,10 +1,12 @@
 import type { HostAdapter } from "./host-adapter";
-import type { BridgeRequest, RpcRequest } from "./protocol";
+import type { BridgeIdentityClaim, BridgeRequest, RpcRequest } from "./protocol";
 import { BridgeRpcError, ERROR_HOST_SCRIPT } from "./errors";
 
 declare const WebSocket: any;
 
-export function connectBridge(adapter: HostAdapter): void {
+export type BridgeIdentityProvider = () => Promise<BridgeIdentityClaim | undefined>;
+
+export function connectBridge(adapter: HostAdapter, identityProvider?: BridgeIdentityProvider): void {
   const url = (globalThis as any).__ADOBEPY_BROKER_URL || `ws://127.0.0.1:47391/v1/bridge/${adapter.capabilities().host}/ws`;
   const token = (globalThis as any).__ADOBEPY_TOKEN;
   if (typeof token !== "string" || token.trim() === "") {
@@ -13,8 +15,14 @@ export function connectBridge(adapter: HostAdapter): void {
   }
   const target = (globalThis as any).__ADOBEPY_TARGET || "default";
   const socket = new WebSocket(url);
-  socket.addEventListener("open", () => {
-    socket.send(JSON.stringify({ type: "hello", token, target, capabilities: adapter.capabilities() }));
+  socket.addEventListener("open", async () => {
+    let identity: BridgeIdentityClaim | undefined;
+    try {
+      identity = await identityProvider?.();
+    } catch {
+      console.error("[adobepy] runtime identity is unavailable; exact-instance verification will fail closed.");
+    }
+    socket.send(JSON.stringify({ type: "hello", token, target, capabilities: adapter.capabilities(), ...(identity ? { identity } : {}) }));
   });
   socket.addEventListener("message", async (event: { data: string }) => {
     const message = JSON.parse(event.data) as BridgeRequest;

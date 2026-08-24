@@ -10,6 +10,7 @@ import urllib.request
 from typing import Any, Iterable
 
 from .errors import BrokerConnectionError, error_from_rpc
+from .runtime_identity import RuntimeIdentityAttestation
 
 DEFAULT_BROKER_URL = "http://127.0.0.1:47391"
 
@@ -70,6 +71,30 @@ class BrokerClient:
 
     async def capabilities_async(self) -> list[dict[str, Any]]:
         return await _to_thread(self.capabilities)
+
+    def runtime_identity(
+        self,
+        host: str,
+        *,
+        target: str | None = None,
+        expected: RuntimeIdentityAttestation | None = None,
+    ) -> RuntimeIdentityAttestation:
+        payload: dict[str, Any] = {"host": host, "target": target or self.target}
+        if expected is not None:
+            payload["expected"] = expected.to_wire()
+        data = self._post_json("/v1/runtime-identity", payload)
+        if "error" in data:
+            raise error_from_rpc(data["error"], data)
+        return RuntimeIdentityAttestation.from_broker(data)
+
+    async def runtime_identity_async(
+        self,
+        host: str,
+        *,
+        target: str | None = None,
+        expected: RuntimeIdentityAttestation | None = None,
+    ) -> RuntimeIdentityAttestation:
+        return await _to_thread(self.runtime_identity, host, target=target, expected=expected)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}

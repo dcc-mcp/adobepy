@@ -52,6 +52,22 @@ class UnauthorizedError(AdobePythonError):
     code = -32009
 
 
+class IdentityUnavailableError(AdobePythonError):
+    code = -32010
+
+
+class IdentityStaleError(AdobePythonError):
+    code = -32011
+
+
+class IdentityAmbiguousError(AdobePythonError):
+    code = -32012
+
+
+class IdentityMismatchError(AdobePythonError):
+    code = -32013
+
+
 class MethodNotFoundError(AdobePythonError):
     code = -32601
 
@@ -66,6 +82,10 @@ ERROR_TYPES = {
     TimeoutError.code: TimeoutError,
     SerializationError.code: SerializationError,
     UnauthorizedError.code: UnauthorizedError,
+    IdentityUnavailableError.code: IdentityUnavailableError,
+    IdentityStaleError.code: IdentityStaleError,
+    IdentityAmbiguousError.code: IdentityAmbiguousError,
+    IdentityMismatchError.code: IdentityMismatchError,
     MethodNotFoundError.code: MethodNotFoundError,
 }
 

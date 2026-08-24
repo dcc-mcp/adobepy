@@ -12,7 +12,7 @@ function waitForMicrotasks() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-async function loadBundle(relativeBundlePath, modules) {
+async function loadBundle(relativeBundlePath, modules, globals = {}) {
   const bundlePath = path.join(root, relativeBundlePath);
   assert.ok(fs.existsSync(bundlePath), `missing UXP bundle: ${bundlePath}`);
   const sent = [];
@@ -46,7 +46,11 @@ async function loadBundle(relativeBundlePath, modules) {
       if (Object.prototype.hasOwnProperty.call(modules, name)) return modules[name];
       throw new Error(`missing test module: ${name}`);
     },
-    __ADOBEPY_TOKEN: "test-token"
+    __ADOBEPY_TOKEN: "test-token",
+    crypto: {
+      randomUUID: () => "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99"
+    },
+    ...globals
   };
   context.globalThis = context;
   vm.runInNewContext(fs.readFileSync(bundlePath, "utf8"), context, { filename: bundlePath });
@@ -84,6 +88,7 @@ async function testPhotoshopBridge() {
   let pickerCalled = false;
   const entryRequests = [];
   const localFileSystem = {
+    getPluginFolder: async () => ({ nativePath: "C:/UXP/External/com.adobepy.bridge.photoshop" }),
     createEntryWithUrl: async (url, options) => {
       entryRequests.push({ url, options });
       if (fileAccessFails) throw new Error("full access denied");
@@ -245,14 +250,39 @@ async function testPhotoshopBridge() {
       }
     },
     uxp: {
+      host: { name: "Adobe Photoshop", version: "26.5.1" },
       storage: {
         localFileSystem
       }
     }
+  }, {
+    __ADOBEPY_TARGET: "retouch",
+    __ADOBEPY_HOST_IDENTITY: {
+      pid: 4200,
+      processStartIdentity: "windows:133700000000000100",
+      executablePath: "C:/Adobe/Photoshop.exe",
+      profileId: "profile-production"
+    }
   });
 
   assert.strictEqual(env.sent[0].type, "hello");
+  assert.strictEqual(env.sent[0].target, "retouch");
   assert.strictEqual(env.sent[0].capabilities.hostVersion, "26.5.1");
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(env.sent[0].identity)), {
+    host: {
+      pid: 4200,
+      processStartIdentity: "windows:133700000000000100",
+      executablePath: "C:/Adobe/Photoshop.exe",
+      hostVersion: "26.5.1",
+      profileId: "profile-production"
+    },
+    bridge: {
+      instanceId: "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99",
+      installedPluginRoot: "C:/UXP/External/com.adobepy.bridge.photoshop",
+      moduleOrigin: "C:/UXP/External/com.adobepy.bridge.photoshop/dist/main.js"
+    }
+  });
+  assert.ok(!JSON.stringify(env.sent[0].identity).includes("test-token"));
   assert.ok(env.sent[0].capabilities.methods.document.includes("getLayers"));
   assert.ok(env.sent[0].capabilities.methods.selection.includes("selectRectangle"));
   assert.ok(env.sent[0].capabilities.methods.channel.includes("getChannels"));

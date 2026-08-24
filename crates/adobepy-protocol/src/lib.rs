@@ -18,6 +18,11 @@ pub const ERROR_MODAL_REQUIRED: i32 = -32006;
 pub const ERROR_TIMEOUT: i32 = -32007;
 pub const ERROR_SERIALIZATION: i32 = -32008;
 pub const ERROR_UNAUTHORIZED: i32 = -32009;
+pub const ERROR_IDENTITY_UNAVAILABLE: i32 = -32010;
+pub const ERROR_IDENTITY_STALE: i32 = -32011;
+pub const ERROR_IDENTITY_AMBIGUOUS: i32 = -32012;
+pub const ERROR_IDENTITY_MISMATCH: i32 = -32013;
+pub const RUNTIME_IDENTITY_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HostKind {
@@ -244,6 +249,92 @@ pub struct BridgeSessionInfo {
     pub connected_at_epoch_ms: u128,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostIdentityClaim {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BridgeInstanceClaim {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_plugin_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_origin: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BridgeIdentityClaim {
+    #[serde(default)]
+    pub host: HostIdentityClaim,
+    #[serde(default)]
+    pub bridge: BridgeInstanceClaim,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrokerRuntimeIdentity {
+    pub pid: u32,
+    pub process_start_identity: String,
+    pub executable_path: String,
+    pub runtime_version: String,
+    pub instance_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostRuntimeIdentity {
+    pub pid: u32,
+    pub process_start_identity: String,
+    pub executable_path: String,
+    pub host_version: String,
+    pub profile_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BridgeRuntimeIdentity {
+    pub target: String,
+    pub bridge_kind: BridgeKind,
+    pub bridge_version: String,
+    pub connected_at_epoch_ms: u128,
+    pub instance_id: String,
+    pub installed_plugin_root: String,
+    pub module_origin: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeIdentityAttestation {
+    pub identity_version: u8,
+    pub broker: BrokerRuntimeIdentity,
+    pub host: HostRuntimeIdentity,
+    pub bridge: BridgeRuntimeIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeIdentityQuery {
+    pub host: HostKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<RuntimeIdentityAttestation>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BridgeInbound {
@@ -252,6 +343,8 @@ pub enum BridgeInbound {
         #[serde(default)]
         target: Option<String>,
         capabilities: Capabilities,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<BridgeIdentityClaim>,
     },
     Response {
         response: RpcResponse,
@@ -302,5 +395,39 @@ mod tests {
             RpcErrorResponse::new(Some(RequestId::from_string("x")), ERROR_HOST_SCRIPT, "boom")
                 .with_data(serde_json::json!({"line": 1}));
         assert_eq!(err.error.data.unwrap()["line"], 1);
+    }
+
+    #[test]
+    fn runtime_identity_contract_is_typed_and_secret_free() {
+        let identity = RuntimeIdentityAttestation {
+            identity_version: 1,
+            broker: BrokerRuntimeIdentity {
+                pid: 4100,
+                process_start_identity: "windows:133700000000000000".into(),
+                executable_path: "C:/adobepy/adobepy.exe".into(),
+                runtime_version: "0.1.0".into(),
+                instance_id: "76db1078-74c9-45c1-87e1-e8258649815e".into(),
+            },
+            host: HostRuntimeIdentity {
+                pid: 4200,
+                process_start_identity: "windows:133700000000000100".into(),
+                executable_path: "C:/Adobe/Photoshop.exe".into(),
+                host_version: "26.5.1".into(),
+                profile_id: "profile-production".into(),
+            },
+            bridge: BridgeRuntimeIdentity {
+                target: "retouch".into(),
+                bridge_kind: BridgeKind::Uxp,
+                bridge_version: "0.1.0".into(),
+                connected_at_epoch_ms: 1_720_000_000_000,
+                instance_id: "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99".into(),
+                installed_plugin_root: "C:/UXP/External/com.adobepy.bridge.photoshop".into(),
+                module_origin: "C:/UXP/External/com.adobepy.bridge.photoshop/dist/main.js".into(),
+            },
+        };
+        let value = serde_json::to_value(identity).unwrap();
+        assert_eq!(value["host"]["pid"], 4200);
+        assert_eq!(value["bridge"]["target"], "retouch");
+        assert!(!serde_json::to_string(&value).unwrap().contains("token"));
     }
 }

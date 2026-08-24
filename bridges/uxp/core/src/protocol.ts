@@ -16,6 +16,10 @@ export const ERROR_CODES = Object.freeze({
   ERROR_TIMEOUT: -32007,
   ERROR_SERIALIZATION: -32008,
   ERROR_UNAUTHORIZED: -32009,
+  ERROR_IDENTITY_UNAVAILABLE: -32010,
+  ERROR_IDENTITY_STALE: -32011,
+  ERROR_IDENTITY_AMBIGUOUS: -32012,
+  ERROR_IDENTITY_MISMATCH: -32013,
 } as const);
 
 export interface RpcOptions {
@@ -79,11 +83,64 @@ export interface BridgeSessionInfo {
   connectedAtEpochMs: number;
 }
 
+export interface HostIdentityClaim {
+  pid?: number;
+  processStartIdentity?: string;
+  executablePath?: string;
+  hostVersion?: string;
+  profileId?: string;
+}
+
+export interface BridgeInstanceClaim {
+  instanceId?: string;
+  installedPluginRoot?: string;
+  moduleOrigin?: string;
+}
+
+export interface BridgeIdentityClaim {
+  host: HostIdentityClaim;
+  bridge: BridgeInstanceClaim;
+}
+
+export interface BrokerRuntimeIdentity {
+  pid: number;
+  processStartIdentity: string;
+  executablePath: string;
+  runtimeVersion: string;
+  instanceId: string;
+}
+
+export interface HostRuntimeIdentity {
+  pid: number;
+  processStartIdentity: string;
+  executablePath: string;
+  hostVersion: string;
+  profileId: string;
+}
+
+export interface BridgeRuntimeIdentity {
+  target: string;
+  bridgeKind: BridgeKind;
+  bridgeVersion: string;
+  connectedAtEpochMs: number;
+  instanceId: string;
+  installedPluginRoot: string;
+  moduleOrigin: string;
+}
+
+export interface RuntimeIdentityAttestation {
+  identityVersion: number;
+  broker: BrokerRuntimeIdentity;
+  host: HostRuntimeIdentity;
+  bridge: BridgeRuntimeIdentity;
+}
+
 export interface BridgeHello {
   type: "hello";
   token: string;
   target?: string;
   capabilities: Capabilities;
+  identity?: BridgeIdentityClaim;
 }
 
 export interface BridgeResponse {

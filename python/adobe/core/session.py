@@ -6,6 +6,7 @@ from .capabilities import HostCapabilities, normalize_capability_sessions
 from .client import BrokerClient
 from .dom import DomNamespace
 from .errors import CapabilityError
+from .runtime_identity import RuntimeIdentityAttestation
 
 
 class HostSession:
@@ -40,6 +41,24 @@ class HostSession:
                 data={"host": self.host, "namespace": namespace, "method": method, "target": capabilities.target},
             )
         return capabilities
+
+    def runtime_identity(
+        self, expected: RuntimeIdentityAttestation | None = None
+    ) -> RuntimeIdentityAttestation:
+        return self.client.runtime_identity(
+            self.host,
+            target=getattr(self.client, "target", "default"),
+            expected=expected,
+        )
+
+    async def runtime_identity_async(
+        self, expected: RuntimeIdentityAttestation | None = None
+    ) -> RuntimeIdentityAttestation:
+        return await self.client.runtime_identity_async(
+            self.host,
+            target=getattr(self.client, "target", "default"),
+            expected=expected,
+        )
 
     def invoke(
         self,

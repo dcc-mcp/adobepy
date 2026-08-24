@@ -13,7 +13,11 @@
     "ERROR_MODAL_REQUIRED": -32006,
     "ERROR_TIMEOUT": -32007,
     "ERROR_SERIALIZATION": -32008,
-    "ERROR_UNAUTHORIZED": -32009
+    "ERROR_UNAUTHORIZED": -32009,
+    "ERROR_IDENTITY_UNAVAILABLE": -32010,
+    "ERROR_IDENTITY_STALE": -32011,
+    "ERROR_IDENTITY_AMBIGUOUS": -32012,
+    "ERROR_IDENTITY_MISMATCH": -32013
   },
   "wireTypes": {
     "RpcOptions": ["modal", "commandName", "timeoutMs", "traceId"],
@@ -23,7 +27,14 @@
     "RpcErrorResponse": ["jsonrpc", "id", "error", "diagnostics"],
     "Diagnostics": ["hostVersion", "bridge", "durationMs", "traceId"],
     "Capabilities": ["host", "bridgeKind", "bridgeVersion", "hostVersion", "namespaces", "features", "methods"],
-    "BridgeSessionInfo": ["target", "capabilities", "connectedAtEpochMs"]
+    "BridgeSessionInfo": ["target", "capabilities", "connectedAtEpochMs"],
+    "HostIdentityClaim": ["pid", "processStartIdentity", "executablePath", "hostVersion", "profileId"],
+    "BridgeInstanceClaim": ["instanceId", "installedPluginRoot", "moduleOrigin"],
+    "BridgeIdentityClaim": ["host", "bridge"],
+    "BrokerRuntimeIdentity": ["pid", "processStartIdentity", "executablePath", "runtimeVersion", "instanceId"],
+    "HostRuntimeIdentity": ["pid", "processStartIdentity", "executablePath", "hostVersion", "profileId"],
+    "BridgeRuntimeIdentity": ["target", "bridgeKind", "bridgeVersion", "connectedAtEpochMs", "instanceId", "installedPluginRoot", "moduleOrigin"],
+    "RuntimeIdentityAttestation": ["identityVersion", "broker", "host", "bridge"]
   },
   "bridgeInboundTypes": ["hello", "response", "error"],
   "bridgeOutboundTypes": ["request"],
@@ -37,6 +48,10 @@
     "ERROR_TIMEOUT": "TimeoutError",
     "ERROR_SERIALIZATION": "SerializationError",
     "ERROR_UNAUTHORIZED": "UnauthorizedError",
-    "ERROR_METHOD_NOT_FOUND": "MethodNotFoundError"
+    "ERROR_METHOD_NOT_FOUND": "MethodNotFoundError",
+    "ERROR_IDENTITY_UNAVAILABLE": "IdentityUnavailableError",
+    "ERROR_IDENTITY_STALE": "IdentityStaleError",
+    "ERROR_IDENTITY_AMBIGUOUS": "IdentityAmbiguousError",
+    "ERROR_IDENTITY_MISMATCH": "IdentityMismatchError"
   }
 }
