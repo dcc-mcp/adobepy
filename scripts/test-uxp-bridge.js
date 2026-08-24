@@ -257,6 +257,7 @@ async function testPhotoshopBridge() {
     }
   }, {
     __ADOBEPY_TARGET: "retouch",
+    __ADOBEPY_BOOTSTRAP_NONCE: "e".repeat(64),
     __ADOBEPY_HOST_IDENTITY: {
       pid: 4200,
       processStartIdentity: "windows:133700000000000100",
@@ -267,6 +268,7 @@ async function testPhotoshopBridge() {
 
   assert.strictEqual(env.sent[0].type, "hello");
   assert.strictEqual(env.sent[0].target, "retouch");
+  assert.strictEqual(env.sent[0].bootstrapNonce, "e".repeat(64));
   assert.strictEqual(env.sent[0].capabilities.hostVersion, "26.5.1");
   assert.deepStrictEqual(JSON.parse(JSON.stringify(env.sent[0].identity)), {
     host: {
@@ -283,6 +285,7 @@ async function testPhotoshopBridge() {
     }
   });
   assert.ok(!JSON.stringify(env.sent[0].identity).includes("test-token"));
+  assert.ok(!JSON.stringify(env.sent[0]).includes("C:/not-a-bootstrap-nonce"));
   assert.ok(env.sent[0].capabilities.methods.document.includes("getLayers"));
   assert.ok(env.sent[0].capabilities.methods.selection.includes("selectRectangle"));
   assert.ok(env.sent[0].capabilities.methods.channel.includes("getChannels"));

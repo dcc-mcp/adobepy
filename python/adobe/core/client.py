@@ -10,6 +10,11 @@ import urllib.request
 from typing import Any, Iterable
 
 from .errors import BrokerConnectionError, error_from_rpc
+from .photoshop_bootstrap import (
+    PhotoshopBootstrapContinuation,
+    PhotoshopBootstrapRequest,
+    PhotoshopBootstrapResult,
+)
 from .runtime_identity import RuntimeIdentityAttestation
 
 DEFAULT_BROKER_URL = "http://127.0.0.1:47391"
@@ -25,9 +30,13 @@ class BrokerClient:
         target: str | None = None,
         timeout: float = 30.0,
     ) -> None:
-        self.broker_url = (broker_url or os.getenv("ADOBEPY_BROKER_URL") or DEFAULT_BROKER_URL).rstrip("/")
+        self.broker_url = (
+            broker_url or os.getenv("ADOBEPY_BROKER_URL") or DEFAULT_BROKER_URL
+        ).rstrip("/")
         self.token = token if token is not None else os.getenv("ADOBEPY_TOKEN", "")
-        self.target = target if target is not None else os.getenv("ADOBEPY_TARGET", "default")
+        self.target = (
+            target if target is not None else os.getenv("ADOBEPY_TARGET", "default")
+        )
         self.timeout = timeout
 
     def call(
@@ -64,7 +73,9 @@ class BrokerClient:
         options: dict[str, Any] | None = None,
         target: str | None = None,
     ) -> Any:
-        return await _to_thread(self.call, host, namespace, method, args, options, target)
+        return await _to_thread(
+            self.call, host, namespace, method, args, options, target
+        )
 
     def capabilities(self) -> list[dict[str, Any]]:
         return self._get_json("/v1/capabilities")
@@ -94,7 +105,39 @@ class BrokerClient:
         target: str | None = None,
         expected: RuntimeIdentityAttestation | None = None,
     ) -> RuntimeIdentityAttestation:
-        return await _to_thread(self.runtime_identity, host, target=target, expected=expected)
+        return await _to_thread(
+            self.runtime_identity, host, target=target, expected=expected
+        )
+
+    def bootstrap_photoshop_uxp(
+        self, request: PhotoshopBootstrapRequest
+    ) -> PhotoshopBootstrapResult:
+        data = self._post_json("/v1/photoshop/bootstrap", request.to_wire())
+        if "error" in data:
+            raise error_from_rpc(data["error"], data)
+        return PhotoshopBootstrapResult.from_broker(data).require_request(request)
+
+    async def bootstrap_photoshop_uxp_async(
+        self, request: PhotoshopBootstrapRequest
+    ) -> PhotoshopBootstrapResult:
+        return await _to_thread(self.bootstrap_photoshop_uxp, request)
+
+    def verify_photoshop_bootstrap(
+        self, continuation: PhotoshopBootstrapContinuation
+    ) -> PhotoshopBootstrapResult:
+        data = self._post_json(
+            continuation.path, {"receiptId": continuation.receipt_id}
+        )
+        if "error" in data:
+            raise error_from_rpc(data["error"], data)
+        return PhotoshopBootstrapResult.from_broker(data).require_continuation(
+            continuation
+        )
+
+    async def verify_photoshop_bootstrap_async(
+        self, continuation: PhotoshopBootstrapContinuation
+    ) -> PhotoshopBootstrapResult:
+        return await _to_thread(self.verify_photoshop_bootstrap, continuation)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -104,11 +147,18 @@ class BrokerClient:
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(f"{self.broker_url}{path}", data=body, headers=self._headers(), method="POST")
+        request = urllib.request.Request(
+            f"{self.broker_url}{path}",
+            data=body,
+            headers=self._headers(),
+            method="POST",
+        )
         return self._open_json(request)
 
     def _get_json(self, path: str) -> Any:
-        request = urllib.request.Request(f"{self.broker_url}{path}", headers=self._headers(), method="GET")
+        request = urllib.request.Request(
+            f"{self.broker_url}{path}", headers=self._headers(), method="GET"
+        )
         return self._open_json(request)
 
     def _open_json(self, request: urllib.request.Request) -> Any:
@@ -117,11 +167,17 @@ class BrokerClient:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
-            raise BrokerConnectionError(f"broker returned HTTP {error.code}: {detail}") from error
+            raise BrokerConnectionError(
+                f"broker returned HTTP {error.code}: {detail}"
+            ) from error
         except urllib.error.URLError as error:
-            raise BrokerConnectionError(f"could not connect to broker at {self.broker_url}: {error}") from error
+            raise BrokerConnectionError(
+                f"could not connect to broker at {self.broker_url}: {error}"
+            ) from error
         except json.JSONDecodeError as error:
-            raise BrokerConnectionError(f"broker returned invalid JSON: {error}") from error
+            raise BrokerConnectionError(
+                f"broker returned invalid JSON: {error}"
+            ) from error
 
 
 async def _to_thread(func: Any, /, *args: Any, **kwargs: Any) -> Any:

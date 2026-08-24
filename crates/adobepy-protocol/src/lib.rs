@@ -23,6 +23,7 @@ pub const ERROR_IDENTITY_STALE: i32 = -32011;
 pub const ERROR_IDENTITY_AMBIGUOUS: i32 = -32012;
 pub const ERROR_IDENTITY_MISMATCH: i32 = -32013;
 pub const RUNTIME_IDENTITY_VERSION: u8 = 1;
+pub const PHOTOSHOP_BOOTSTRAP_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HostKind {
@@ -335,6 +336,102 @@ pub struct RuntimeIdentityQuery {
     pub expected: Option<RuntimeIdentityAttestation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PhotoshopHostTarget {
+    pub executable_path: String,
+    pub executable_bytes: u64,
+    pub executable_sha256: String,
+    pub host_version: String,
+    pub profile_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PhotoshopPluginTarget {
+    pub installed_plugin_root: String,
+    pub module_origin: String,
+    pub bridge_version: String,
+    pub manifest_bytes: u64,
+    pub manifest_sha256: String,
+    pub index_bytes: u64,
+    pub index_sha256: String,
+    pub module_bytes: u64,
+    pub module_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PhotoshopBootstrapRequest {
+    pub bootstrap_version: u8,
+    pub target: String,
+    pub timeout_ms: u64,
+    pub host: PhotoshopHostTarget,
+    pub plugin: PhotoshopPluginTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BootstrapBrokerBinding {
+    pub pid: u32,
+    pub process_start_identity: String,
+    pub runtime_version: String,
+    pub instance_id: String,
+    pub executable_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BootstrapHostBinding {
+    pub pid: u32,
+    pub process_start_identity: String,
+    pub host_version: String,
+    pub profile_id: String,
+    pub executable_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BootstrapPluginBinding {
+    pub instance_id: String,
+    pub bridge_version: String,
+    pub module_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhotoshopBootstrapStatus {
+    Ready,
+    AlreadyReady,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PhotoshopBootstrapContinuation {
+    pub method: String,
+    pub path: String,
+    pub receipt_id: String,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PhotoshopBootstrapResult {
+    pub bootstrap_version: u8,
+    pub status: PhotoshopBootstrapStatus,
+    pub identity_fingerprint: String,
+    pub broker: BootstrapBrokerBinding,
+    pub host: BootstrapHostBinding,
+    pub plugin: BootstrapPluginBinding,
+    pub continuation: PhotoshopBootstrapContinuation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PhotoshopBootstrapVerifyRequest {
+    pub receipt_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BridgeInbound {
@@ -345,6 +442,12 @@ pub enum BridgeInbound {
         capabilities: Capabilities,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         identity: Option<BridgeIdentityClaim>,
+        #[serde(
+            default,
+            rename = "bootstrapNonce",
+            skip_serializing_if = "Option::is_none"
+        )]
+        bootstrap_nonce: Option<String>,
     },
     Response {
         response: RpcResponse,
@@ -429,5 +532,76 @@ mod tests {
         assert_eq!(value["host"]["pid"], 4200);
         assert_eq!(value["bridge"]["target"], "retouch");
         assert!(!serde_json::to_string(&value).unwrap().contains("token"));
+    }
+
+    #[test]
+    fn photoshop_bootstrap_contract_is_typed_and_path_redacted() {
+        let request = PhotoshopBootstrapRequest {
+            bootstrap_version: PHOTOSHOP_BOOTSTRAP_VERSION,
+            target: "retouch".into(),
+            timeout_ms: 7_000,
+            host: PhotoshopHostTarget {
+                executable_path: "C:/Adobe/Photoshop.exe".into(),
+                executable_bytes: 42,
+                executable_sha256: "a".repeat(64),
+                host_version: "27.0.1".into(),
+                profile_id: "production".into(),
+            },
+            plugin: PhotoshopPluginTarget {
+                installed_plugin_root: "C:/UXP/com.adobepy.bridge.photoshop".into(),
+                module_origin: "C:/UXP/com.adobepy.bridge.photoshop/dist/main.js".into(),
+                bridge_version: "0.1.0".into(),
+                manifest_bytes: 640,
+                manifest_sha256: "d".repeat(64),
+                index_bytes: 180,
+                index_sha256: "e".repeat(64),
+                module_bytes: 47_901,
+                module_sha256: "f".repeat(64),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["bootstrapVersion"],
+            PHOTOSHOP_BOOTSTRAP_VERSION
+        );
+        let result = PhotoshopBootstrapResult {
+            bootstrap_version: PHOTOSHOP_BOOTSTRAP_VERSION,
+            status: PhotoshopBootstrapStatus::Ready,
+            identity_fingerprint: "b".repeat(64),
+            broker: BootstrapBrokerBinding {
+                pid: 1,
+                process_start_identity: "windows:1".into(),
+                runtime_version: "0.7.0".into(),
+                instance_id: UuidForTest::VALUE.into(),
+                executable_sha256: "c".repeat(64),
+            },
+            host: BootstrapHostBinding {
+                pid: 2,
+                process_start_identity: "windows:2".into(),
+                host_version: "27.0.1".into(),
+                profile_id: "production".into(),
+                executable_sha256: "a".repeat(64),
+            },
+            plugin: BootstrapPluginBinding {
+                instance_id: UuidForTest::VALUE.into(),
+                bridge_version: "0.1.0".into(),
+                module_sha256: "d".repeat(64),
+            },
+            continuation: PhotoshopBootstrapContinuation {
+                method: "POST".into(),
+                path: "/v1/photoshop/bootstrap/verify".into(),
+                receipt_id: UuidForTest::VALUE.into(),
+                timeout_ms: 7_000,
+            },
+        };
+        let wire = serde_json::to_string(&result).unwrap();
+        assert!(!wire.contains("executablePath"));
+        assert!(!wire.contains("installedPluginRoot"));
+        assert!(!wire.to_ascii_lowercase().contains("token"));
+    }
+
+    struct UuidForTest;
+
+    impl UuidForTest {
+        const VALUE: &'static str = "76db1078-74c9-45c1-87e1-e8258649815e";
     }
 }

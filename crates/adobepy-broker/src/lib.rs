@@ -1,11 +1,14 @@
 use adobepy_protocol::{
-    session_key, BridgeIdentityClaim, BridgeInbound, BridgeOutbound, BridgeRuntimeIdentity,
-    BridgeSessionInfo, BrokerRuntimeIdentity, HostKind, HostRuntimeIdentity, RequestId,
-    RpcErrorResponse, RpcRequest, RpcResponse, RuntimeIdentityAttestation, RuntimeIdentityQuery,
-    DEFAULT_TARGET, ERROR_BRIDGE_NOT_INSTALLED, ERROR_CAPABILITY, ERROR_IDENTITY_AMBIGUOUS,
-    ERROR_IDENTITY_MISMATCH, ERROR_IDENTITY_STALE, ERROR_IDENTITY_UNAVAILABLE,
-    ERROR_INVALID_REQUEST, ERROR_PARSE, ERROR_SERIALIZATION, ERROR_TIMEOUT, ERROR_UNAUTHORIZED,
-    JSONRPC_VERSION, RUNTIME_IDENTITY_VERSION,
+    session_key, BootstrapBrokerBinding, BootstrapHostBinding, BootstrapPluginBinding,
+    BridgeIdentityClaim, BridgeInbound, BridgeOutbound, BridgeRuntimeIdentity, BridgeSessionInfo,
+    BrokerRuntimeIdentity, HostKind, HostRuntimeIdentity, PhotoshopBootstrapContinuation,
+    PhotoshopBootstrapRequest, PhotoshopBootstrapResult, PhotoshopBootstrapStatus,
+    PhotoshopBootstrapVerifyRequest, RequestId, RpcErrorResponse, RpcRequest, RpcResponse,
+    RuntimeIdentityAttestation, RuntimeIdentityQuery, DEFAULT_TARGET, ERROR_BRIDGE_NOT_INSTALLED,
+    ERROR_CAPABILITY, ERROR_IDENTITY_AMBIGUOUS, ERROR_IDENTITY_MISMATCH, ERROR_IDENTITY_STALE,
+    ERROR_IDENTITY_UNAVAILABLE, ERROR_INVALID_REQUEST, ERROR_PARSE, ERROR_SERIALIZATION,
+    ERROR_TIMEOUT, ERROR_UNAUTHORIZED, JSONRPC_VERSION, PHOTOSHOP_BOOTSTRAP_VERSION,
+    RUNTIME_IDENTITY_VERSION,
 };
 use anyhow::{anyhow, Context};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -17,6 +20,7 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
@@ -26,6 +30,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use uuid::Uuid;
+
+mod photoshop_bootstrap;
+
+use photoshop_bootstrap::{
+    ObservedHostProcess, PhotoshopBootstrapBackend, PreparedBootstrap,
+    SystemPhotoshopBootstrapBackend,
+};
 
 type DispatchResult = Result<RpcResponse, Box<RpcErrorResponse>>;
 type ValidationResult = Result<(), Box<RpcErrorResponse>>;
@@ -41,6 +52,22 @@ struct PendingRequest {
 struct BridgeSender {
     connection_id: u64,
     sender: mpsc::UnboundedSender<BridgeOutbound>,
+}
+
+struct BootstrapGrant {
+    request: PhotoshopBootstrapRequest,
+    nonce: String,
+    nonce_claimed: bool,
+    observed: Option<ObservedHostProcess>,
+    module_sha256: String,
+    prepared: Option<PreparedBootstrap>,
+}
+
+#[derive(Clone)]
+struct BootstrapReceipt {
+    identity: RuntimeIdentityAttestation,
+    result: PhotoshopBootstrapResult,
+    expires_at_epoch_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -71,10 +98,30 @@ struct BrokerState {
     next_dispatch_id: Arc<AtomicU64>,
     next_connection_id: Arc<AtomicU64>,
     broker_identity: Arc<BrokerRuntimeIdentity>,
+    bootstrap_backend: Arc<dyn PhotoshopBootstrapBackend>,
+    bootstrap_grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
+    bootstrap_receipts: Arc<Mutex<HashMap<String, BootstrapReceipt>>>,
+    photoshop_websocket_url: String,
 }
 
 impl BrokerState {
     fn new(config: &BrokerConfig) -> anyhow::Result<Self> {
+        Self::with_bootstrap_backend(config, Arc::new(SystemPhotoshopBootstrapBackend))
+    }
+
+    fn with_bootstrap_backend(
+        config: &BrokerConfig,
+        bootstrap_backend: Arc<dyn PhotoshopBootstrapBackend>,
+    ) -> anyhow::Result<Self> {
+        let host = match config.bind.ip() {
+            std::net::IpAddr::V4(address) if address.is_loopback() => address.to_string(),
+            std::net::IpAddr::V6(address) if address.is_loopback() => format!("[{address}]"),
+            _ => {
+                return Err(anyhow!(
+                    "the adobepy broker must bind to a loopback address"
+                ))
+            }
+        };
         Ok(Self {
             token: config.token.clone(),
             default_timeout_ms: config.default_timeout_ms,
@@ -85,6 +132,13 @@ impl BrokerState {
             next_dispatch_id: Arc::new(AtomicU64::new(1)),
             next_connection_id: Arc::new(AtomicU64::new(1)),
             broker_identity: Arc::new(capture_broker_identity()?),
+            bootstrap_backend,
+            bootstrap_grants: Arc::new(Mutex::new(HashMap::new())),
+            bootstrap_receipts: Arc::new(Mutex::new(HashMap::new())),
+            photoshop_websocket_url: format!(
+                "ws://{host}:{}/v1/bridge/photoshop/ws",
+                config.bind.port()
+            ),
         })
     }
 
@@ -235,6 +289,557 @@ impl BrokerState {
         Ok(actual)
     }
 
+    async fn bootstrap_photoshop(
+        &self,
+        request: PhotoshopBootstrapRequest,
+    ) -> Result<PhotoshopBootstrapResult, Box<RpcErrorResponse>> {
+        validate_photoshop_bootstrap_request(&request)?;
+        let module_sha256 = self.bootstrap_backend.attest(&request).map_err(|_| {
+            identity_error(
+                ERROR_IDENTITY_UNAVAILABLE,
+                "the authenticated Photoshop product or fixed UXP bridge is unavailable",
+                json!({"stage": "attestation"}),
+            )
+        })?;
+        let key = session_key(HostKind::Photoshop, &request.target);
+        if self.sessions.read().await.contains_key(&key) {
+            let identity = self
+                .runtime_identity(RuntimeIdentityQuery {
+                    host: HostKind::Photoshop,
+                    target: Some(request.target.clone()),
+                    expected: None,
+                })
+                .await?;
+            self.validate_bootstrap_identity(&request, &identity, None)?;
+            return self
+                .record_bootstrap_result(
+                    identity,
+                    &request,
+                    &module_sha256,
+                    PhotoshopBootstrapStatus::AlreadyReady,
+                )
+                .await;
+        }
+
+        let mut reuse_grant = false;
+        let stale_prepared = {
+            let mut grants = self.bootstrap_grants.lock().await;
+            match grants.get(&key) {
+                Some(grant) if grant.request != request => {
+                    return Err(identity_error(
+                        ERROR_IDENTITY_AMBIGUOUS,
+                        "a different Photoshop bootstrap is already active for this target",
+                        json!({"target": request.target}),
+                    ));
+                }
+                Some(grant)
+                    if grant.observed.as_ref().is_none_or(|observed| {
+                        self.bootstrap_backend.process_matches(observed)
+                    }) =>
+                {
+                    reuse_grant = true;
+                    None
+                }
+                Some(_) => grants
+                    .remove(&key)
+                    .and_then(|mut grant| grant.prepared.take()),
+                None => None,
+            }
+        };
+        if let Some(prepared) = stale_prepared {
+            self.bootstrap_backend.rollback(prepared).map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "stale Photoshop bootstrap state could not be recovered",
+                    json!({"stage": "recovery"}),
+                )
+            })?;
+        }
+
+        if !reuse_grant {
+            let nonce = random_nonce();
+            let prepared = self
+                .bootstrap_backend
+                .prepare(&request, &nonce, &self.token, &self.photoshop_websocket_url)
+                .map_err(|_| {
+                    identity_error(
+                        ERROR_IDENTITY_UNAVAILABLE,
+                        "the fixed Photoshop UXP bridge could not be prepared",
+                        json!({"stage": "prepare"}),
+                    )
+                })?;
+            self.bootstrap_grants.lock().await.insert(
+                key.clone(),
+                BootstrapGrant {
+                    request: request.clone(),
+                    nonce,
+                    nonce_claimed: false,
+                    observed: None,
+                    module_sha256: prepared.module_sha256.clone(),
+                    prepared: Some(prepared),
+                },
+            );
+            let observed = match self.bootstrap_backend.launch(&request.host) {
+                Ok(observed) => observed,
+                Err(_) => {
+                    let prepared = self
+                        .bootstrap_grants
+                        .lock()
+                        .await
+                        .remove(&key)
+                        .and_then(|mut grant| grant.prepared.take());
+                    if let Some(prepared) = prepared {
+                        if self.bootstrap_backend.rollback(prepared).is_err() {
+                            return Err(identity_error(
+                                ERROR_IDENTITY_STALE,
+                                "failed Photoshop launch state could not be recovered",
+                                json!({"stage": "recovery"}),
+                            ));
+                        }
+                    }
+                    return Err(identity_error(
+                        ERROR_IDENTITY_UNAVAILABLE,
+                        "the selected Photoshop instance could not be launched",
+                        json!({"stage": "launch"}),
+                    ));
+                }
+            };
+            if let Some(grant) = self.bootstrap_grants.lock().await.get_mut(&key) {
+                grant.observed = Some(observed);
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(request.timeout_ms);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            match self
+                .runtime_identity(RuntimeIdentityQuery {
+                    host: HostKind::Photoshop,
+                    target: Some(request.target.clone()),
+                    expected: None,
+                })
+                .await
+            {
+                Ok(identity) => {
+                    let observed = self
+                        .bootstrap_grants
+                        .lock()
+                        .await
+                        .get(&key)
+                        .and_then(|grant| grant.observed.clone());
+                    if let Err(error) =
+                        self.validate_bootstrap_identity(&request, &identity, observed.as_ref())
+                    {
+                        self.rollback_bootstrap_grant(&key).await?;
+                        return Err(error);
+                    }
+                    let grant = {
+                        let mut grants = self.bootstrap_grants.lock().await;
+                        grants.remove(&key)
+                    };
+                    let Some(mut grant) = grant else {
+                        return self
+                            .record_bootstrap_result(
+                                identity,
+                                &request,
+                                &module_sha256,
+                                PhotoshopBootstrapStatus::AlreadyReady,
+                            )
+                            .await;
+                    };
+                    let grant_module_sha256 = grant.module_sha256.clone();
+                    let mut prepared = grant.prepared.take();
+                    if let Some(value) = prepared.as_ref() {
+                        if self.bootstrap_backend.finalize(value).is_err() {
+                            if let Some(value) = prepared.take() {
+                                if self.bootstrap_backend.rollback(value).is_err() {
+                                    return Err(identity_error(
+                                        ERROR_IDENTITY_STALE,
+                                        "uncommitted Photoshop bootstrap state could not be recovered",
+                                        json!({"stage": "recovery"}),
+                                    ));
+                                }
+                            }
+                            return Err(identity_error(
+                                ERROR_IDENTITY_UNAVAILABLE,
+                                "Photoshop bootstrap could not be committed",
+                                json!({"stage": "commit"}),
+                            ));
+                        }
+                    }
+                    let result = self
+                        .record_bootstrap_result(
+                            identity,
+                            &request,
+                            &grant_module_sha256,
+                            PhotoshopBootstrapStatus::Ready,
+                        )
+                        .await;
+                    if result.is_err() {
+                        if let Some(value) = prepared.take() {
+                            if self.bootstrap_backend.rollback(value).is_err() {
+                                return Err(identity_error(
+                                    ERROR_IDENTITY_STALE,
+                                    "unreceipted Photoshop bootstrap state could not be recovered",
+                                    json!({"stage": "recovery"}),
+                                ));
+                            }
+                        }
+                    }
+                    return result;
+                }
+                Err(error)
+                    if matches!(
+                        error.error.code,
+                        ERROR_IDENTITY_UNAVAILABLE | ERROR_BRIDGE_NOT_INSTALLED
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let prepared = self
+            .bootstrap_grants
+            .lock()
+            .await
+            .remove(&key)
+            .and_then(|mut grant| grant.prepared.take());
+        if let Some(prepared) = prepared {
+            self.bootstrap_backend.rollback(prepared).map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "timed-out Photoshop bootstrap state could not be recovered",
+                    json!({"stage": "recovery"}),
+                )
+            })?;
+        }
+        Err(identity_error(
+            ERROR_TIMEOUT,
+            "Photoshop UXP bootstrap timed out before exact-instance verification",
+            json!({"stage": "verify", "timeoutMs": request.timeout_ms}),
+        ))
+    }
+
+    async fn rollback_bootstrap_grant(&self, key: &str) -> ValidationResult {
+        let prepared = self
+            .bootstrap_grants
+            .lock()
+            .await
+            .remove(key)
+            .and_then(|mut grant| grant.prepared.take());
+        if let Some(prepared) = prepared {
+            self.bootstrap_backend.rollback(prepared).map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Photoshop bootstrap state could not be recovered",
+                    json!({"stage": "recovery"}),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn validate_bootstrap_identity(
+        &self,
+        request: &PhotoshopBootstrapRequest,
+        identity: &RuntimeIdentityAttestation,
+        observed: Option<&ObservedHostProcess>,
+    ) -> Result<(), Box<RpcErrorResponse>> {
+        let path_matches = normalized_paths_equal(
+            &identity.host.executable_path,
+            &request.host.executable_path,
+        ) && normalized_paths_equal(
+            &identity.bridge.installed_plugin_root,
+            &request.plugin.installed_plugin_root,
+        ) && normalized_paths_equal(
+            &identity.bridge.module_origin,
+            &request.plugin.module_origin,
+        );
+        let claimed_process = ObservedHostProcess {
+            pid: identity.host.pid,
+            process_start_identity: identity.host.process_start_identity.clone(),
+            executable_path: identity.host.executable_path.clone(),
+        };
+        let observed_matches = self.bootstrap_backend.process_matches(&claimed_process)
+            && observed.is_none_or(|expected| {
+                self.bootstrap_backend.process_matches(expected)
+                    && identity.host.pid == expected.pid
+                    && identity.host.process_start_identity == expected.process_start_identity
+                    && normalized_paths_equal(
+                        &identity.host.executable_path,
+                        &expected.executable_path,
+                    )
+            });
+        if !path_matches
+            || !observed_matches
+            || identity.host.host_version != request.host.host_version
+            || identity.host.profile_id != request.host.profile_id
+            || identity.bridge.target != request.target
+            || identity.bridge.bridge_kind != adobepy_protocol::BridgeKind::Uxp
+            || identity.bridge.bridge_version != request.plugin.bridge_version
+        {
+            return Err(identity_error(
+                ERROR_IDENTITY_MISMATCH,
+                "Photoshop bootstrap resolved to a foreign or mismatched instance",
+                json!({"field": "runtimeIdentity"}),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn record_bootstrap_result(
+        &self,
+        identity: RuntimeIdentityAttestation,
+        request: &PhotoshopBootstrapRequest,
+        module_sha256: &str,
+        status: PhotoshopBootstrapStatus,
+    ) -> Result<PhotoshopBootstrapResult, Box<RpcErrorResponse>> {
+        let broker_sha256 = self
+            .bootstrap_backend
+            .executable_sha256(&identity.broker.executable_path)
+            .map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_UNAVAILABLE,
+                    "broker executable identity is unavailable",
+                    json!({"stage": "broker_attestation"}),
+                )
+            })?;
+        let fingerprint = identity_fingerprint(&identity)?;
+        let receipt_id = Uuid::new_v4().hyphenated().to_string();
+        let result = PhotoshopBootstrapResult {
+            bootstrap_version: PHOTOSHOP_BOOTSTRAP_VERSION,
+            status,
+            identity_fingerprint: fingerprint,
+            broker: BootstrapBrokerBinding {
+                pid: identity.broker.pid,
+                process_start_identity: identity.broker.process_start_identity.clone(),
+                runtime_version: identity.broker.runtime_version.clone(),
+                instance_id: identity.broker.instance_id.clone(),
+                executable_sha256: broker_sha256,
+            },
+            host: BootstrapHostBinding {
+                pid: identity.host.pid,
+                process_start_identity: identity.host.process_start_identity.clone(),
+                host_version: identity.host.host_version.clone(),
+                profile_id: identity.host.profile_id.clone(),
+                executable_sha256: request.host.executable_sha256.clone(),
+            },
+            plugin: BootstrapPluginBinding {
+                instance_id: identity.bridge.instance_id.clone(),
+                bridge_version: identity.bridge.bridge_version.clone(),
+                module_sha256: module_sha256.to_owned(),
+            },
+            continuation: PhotoshopBootstrapContinuation {
+                method: "POST".into(),
+                path: "/v1/photoshop/bootstrap/verify".into(),
+                receipt_id: receipt_id.clone(),
+                timeout_ms: request.timeout_ms,
+            },
+        };
+        let mut receipts = self.bootstrap_receipts.lock().await;
+        let now = epoch_ms();
+        receipts.retain(|_, receipt| receipt.expires_at_epoch_ms >= now);
+        receipts.insert(
+            receipt_id,
+            BootstrapReceipt {
+                identity,
+                result: result.clone(),
+                expires_at_epoch_ms: now + 120_000,
+            },
+        );
+        Ok(result)
+    }
+
+    async fn verify_photoshop_bootstrap(
+        &self,
+        receipt_id: &str,
+    ) -> Result<PhotoshopBootstrapResult, Box<RpcErrorResponse>> {
+        if !is_uuid(receipt_id) {
+            return Err(identity_error(
+                ERROR_INVALID_REQUEST,
+                "Photoshop bootstrap receipt is invalid",
+                json!({"field": "receiptId"}),
+            ));
+        }
+        let receipt = self
+            .bootstrap_receipts
+            .lock()
+            .await
+            .get(receipt_id)
+            .cloned()
+            .filter(|receipt| receipt.expires_at_epoch_ms >= epoch_ms())
+            .ok_or_else(|| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Photoshop bootstrap receipt is stale or unavailable",
+                    json!({"field": "receiptId"}),
+                )
+            })?;
+        let actual = self
+            .runtime_identity(RuntimeIdentityQuery {
+                host: HostKind::Photoshop,
+                target: Some(receipt.identity.bridge.target.clone()),
+                expected: Some(receipt.identity.clone()),
+            })
+            .await?;
+        let observed = ObservedHostProcess {
+            pid: actual.host.pid,
+            process_start_identity: actual.host.process_start_identity.clone(),
+            executable_path: actual.host.executable_path.clone(),
+        };
+        if !self.bootstrap_backend.process_matches(&observed) {
+            return Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "Photoshop process identity changed after bootstrap",
+                json!({"field": "host.processStartIdentity"}),
+            ));
+        }
+        Ok(receipt.result)
+    }
+
+    async fn bind_photoshop_bootstrap_claim(
+        &self,
+        target: &str,
+        capabilities: &adobepy_protocol::Capabilities,
+        identity: Option<BridgeIdentityClaim>,
+        bootstrap_nonce: Option<&str>,
+    ) -> Result<Option<BridgeIdentityClaim>, Box<RpcErrorResponse>> {
+        if capabilities.host != HostKind::Photoshop {
+            if bootstrap_nonce.is_some() {
+                return Err(identity_error(
+                    ERROR_IDENTITY_MISMATCH,
+                    "Photoshop bootstrap nonce was presented by a foreign host",
+                    json!({"field": "host"}),
+                ));
+            }
+            return Ok(identity);
+        }
+        let key = session_key(HostKind::Photoshop, target);
+        let has_grant = self.bootstrap_grants.lock().await.contains_key(&key);
+        if !has_grant {
+            if bootstrap_nonce.is_some() {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Photoshop bootstrap nonce is stale",
+                    json!({"field": "bootstrapNonce"}),
+                ));
+            }
+            return Ok(identity);
+        }
+        let Some(nonce) = bootstrap_nonce else {
+            return Err(identity_error(
+                ERROR_IDENTITY_MISMATCH,
+                "Photoshop bootstrap connection omitted its one-time binding",
+                json!({"field": "bootstrapNonce"}),
+            ));
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let (request, observed) = loop {
+            let value = self
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&key)
+                .and_then(|grant| {
+                    (grant.nonce == nonce)
+                        .then(|| {
+                            grant
+                                .observed
+                                .clone()
+                                .map(|observed| (grant.request.clone(), observed))
+                        })
+                        .flatten()
+                });
+            if let Some(value) = value {
+                break value;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Photoshop bootstrap binding is stale or incomplete",
+                    json!({"field": "bootstrapNonce"}),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        if !self.bootstrap_backend.process_matches(&observed) {
+            return Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "selected Photoshop process identity changed before bridge connection",
+                json!({"field": "host.processStartIdentity"}),
+            ));
+        }
+        let Some(mut identity) = identity else {
+            return Err(identity_error(
+                ERROR_IDENTITY_UNAVAILABLE,
+                "Photoshop UXP bridge omitted its plugin identity",
+                json!({"missingFields": ["identity.bridge"]}),
+            ));
+        };
+        let claimed_host_matches = identity.host.pid.is_none_or(|pid| pid == observed.pid)
+            && identity
+                .host
+                .process_start_identity
+                .as_ref()
+                .is_none_or(|value| value == &observed.process_start_identity)
+            && identity
+                .host
+                .executable_path
+                .as_deref()
+                .is_none_or(|value| normalized_paths_equal(value, &observed.executable_path))
+            && identity
+                .host
+                .profile_id
+                .as_ref()
+                .is_none_or(|value| value == &request.host.profile_id);
+        let bridge_matches = identity
+            .bridge
+            .installed_plugin_root
+            .as_deref()
+            .is_some_and(|value| {
+                normalized_paths_equal(value, &request.plugin.installed_plugin_root)
+            })
+            && identity
+                .bridge
+                .module_origin
+                .as_deref()
+                .is_some_and(|value| normalized_paths_equal(value, &request.plugin.module_origin))
+            && capabilities.bridge_kind == adobepy_protocol::BridgeKind::Uxp
+            && capabilities.bridge_version == request.plugin.bridge_version
+            && capabilities.host_version.as_deref() == Some(request.host.host_version.as_str());
+        if !claimed_host_matches || !bridge_matches {
+            return Err(identity_error(
+                ERROR_IDENTITY_MISMATCH,
+                "Photoshop bootstrap connection is foreign or mismatched",
+                json!({"field": "runtimeIdentity"}),
+            ));
+        }
+        let nonce_consumed = {
+            let mut grants = self.bootstrap_grants.lock().await;
+            grants.get_mut(&key).is_some_and(|grant| {
+                if grant.nonce != nonce || grant.nonce_claimed {
+                    return false;
+                }
+                grant.nonce_claimed = true;
+                true
+            })
+        };
+        if !nonce_consumed {
+            return Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "Photoshop bootstrap nonce was already consumed",
+                json!({"field": "bootstrapNonce"}),
+            ));
+        }
+        identity.host.pid = Some(observed.pid);
+        identity.host.process_start_identity = Some(observed.process_start_identity);
+        identity.host.executable_path = Some(observed.executable_path);
+        identity.host.host_version = Some(request.host.host_version);
+        identity.host.profile_id = Some(request.host.profile_id);
+        Ok(Some(identity))
+    }
+
     fn next_connection_id(&self) -> u64 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -292,6 +897,11 @@ fn broker_router(state: BrokerState) -> Router {
         .route("/health", get(health))
         .route("/v1/capabilities", get(list_capabilities))
         .route("/v1/runtime-identity", post(runtime_identity))
+        .route("/v1/photoshop/bootstrap", post(photoshop_bootstrap))
+        .route(
+            "/v1/photoshop/bootstrap/verify",
+            post(verify_photoshop_bootstrap),
+        )
         .route("/v1/rpc", post(http_rpc))
         .route("/v1/client/ws", get(client_ws))
         .route("/v1/bridge/{host}/ws", get(bridge_ws))
@@ -330,6 +940,34 @@ async fn runtime_identity(
     }
     match state.runtime_identity(query).await {
         Ok(identity) => Json(identity).into_response(),
+        Err(error) => Json(*error).into_response(),
+    }
+}
+
+async fn photoshop_bootstrap(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Json(request): Json<PhotoshopBootstrapRequest>,
+) -> Response {
+    if !state.authorized(&headers) {
+        return unauthorized_response();
+    }
+    match state.bootstrap_photoshop(request).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => Json(*error).into_response(),
+    }
+}
+
+async fn verify_photoshop_bootstrap(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Json(request): Json<PhotoshopBootstrapVerifyRequest>,
+) -> Response {
+    if !state.authorized(&headers) {
+        return unauthorized_response();
+    }
+    match state.verify_photoshop_bootstrap(&request.receipt_id).await {
+        Ok(result) => Json(result).into_response(),
         Err(error) => Json(*error).into_response(),
     }
 }
@@ -408,6 +1046,7 @@ async fn bridge_socket(mut socket: WebSocket, state: BrokerState, expected_host:
         target,
         capabilities,
         identity,
+        bootstrap_nonce,
     }) = serde_json::from_str::<BridgeInbound>(&first)
     else {
         return;
@@ -439,6 +1078,23 @@ async fn bridge_socket(mut socket: WebSocket, state: BrokerState, expected_host:
         return;
     }
     let target = target.unwrap_or_else(|| DEFAULT_TARGET.to_owned());
+    let identity = match state
+        .bind_photoshop_bootstrap_claim(
+            &target,
+            &capabilities,
+            identity,
+            bootstrap_nonce.as_deref(),
+        )
+        .await
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = socket
+                .send(Message::Text(serialize_wire(&error).into()))
+                .await;
+            return;
+        }
+    };
     if let Err(error) = validate_bridge_identity_claim(&target, &capabilities, identity.as_ref()) {
         let _ = socket
             .send(Message::Text(serialize_wire(&error).into()))
@@ -515,6 +1171,110 @@ async fn handle_bridge_message(state: &BrokerState, text: &str) {
 
 fn identity_error(code: i32, message: &str, data: serde_json::Value) -> Box<RpcErrorResponse> {
     Box::new(RpcErrorResponse::new(None, code, message).with_data(data))
+}
+
+fn validate_photoshop_bootstrap_request(
+    request: &PhotoshopBootstrapRequest,
+) -> Result<(), Box<RpcErrorResponse>> {
+    let module_is_fixed = normalized_absolute_path(&request.plugin.installed_plugin_root)
+        .zip(normalized_absolute_path(&request.plugin.module_origin))
+        .is_some_and(|(root, module)| {
+            let case_insensitive = root.as_bytes().get(1) == Some(&b':');
+            let (root, module) = if case_insensitive {
+                (root.to_ascii_lowercase(), module.to_ascii_lowercase())
+            } else {
+                (root, module)
+            };
+            module == format!("{root}/dist/main.js")
+        });
+    if request.bootstrap_version != PHOTOSHOP_BOOTSTRAP_VERSION
+        || !is_bounded_identifier(&request.target, 128)
+        || !(50..=30_000).contains(&request.timeout_ms)
+        || request.host.executable_bytes == 0
+        || request.host.executable_bytes > 4 * 1024 * 1024 * 1024
+        || normalized_absolute_path(&request.host.executable_path).is_none()
+        || !is_sha256(&request.host.executable_sha256)
+        || !is_canonical_version(&request.host.host_version)
+        || !is_bounded_text(&request.host.profile_id, 256)
+        || !module_is_fixed
+        || !is_canonical_version(&request.plugin.bridge_version)
+        || request.plugin.manifest_bytes == 0
+        || request.plugin.manifest_bytes > 1024 * 1024
+        || !is_sha256(&request.plugin.manifest_sha256)
+        || request.plugin.index_bytes == 0
+        || request.plugin.index_bytes > 1024 * 1024
+        || !is_sha256(&request.plugin.index_sha256)
+        || request.plugin.module_bytes == 0
+        || request.plugin.module_bytes > 256 * 1024 * 1024
+        || !is_sha256(&request.plugin.module_sha256)
+    {
+        return Err(identity_error(
+            ERROR_INVALID_REQUEST,
+            "Photoshop bootstrap request is malformed or unbounded",
+            json!({"field": "request"}),
+        ));
+    }
+    Ok(())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn is_canonical_version(value: &str) -> bool {
+    if !is_bounded_text(value, 32) {
+        return false;
+    }
+    let components = value.split('.').collect::<Vec<_>>();
+    (2..=4).contains(&components.len())
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && component.len() <= 4
+                && component.bytes().all(|byte| byte.is_ascii_digit())
+                && (component == &"0" || !component.starts_with('0'))
+        })
+}
+
+fn normalized_paths_equal(left: &str, right: &str) -> bool {
+    let Some(left) = normalized_absolute_path(left) else {
+        return false;
+    };
+    let Some(right) = normalized_absolute_path(right) else {
+        return false;
+    };
+    if left.as_bytes().get(1) == Some(&b':') || right.as_bytes().get(1) == Some(&b':') {
+        left.eq_ignore_ascii_case(&right)
+    } else {
+        left == right
+    }
+}
+
+fn random_nonce() -> String {
+    let mut digest = Sha256::new();
+    digest.update(Uuid::new_v4().as_bytes());
+    digest.update(Uuid::new_v4().as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn identity_fingerprint(
+    identity: &RuntimeIdentityAttestation,
+) -> Result<String, Box<RpcErrorResponse>> {
+    let bytes = serde_json::to_vec(identity).map_err(|_| {
+        identity_error(
+            ERROR_SERIALIZATION,
+            "runtime identity fingerprint could not be serialized",
+            json!({"stage": "fingerprint"}),
+        )
+    })?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn is_uuid(value: &str) -> bool {
+    Uuid::parse_str(value)
+        .is_ok_and(|parsed| !parsed.is_nil() && parsed.hyphenated().to_string() == value)
 }
 
 fn is_bounded_text(value: &str, max_bytes: usize) -> bool {
@@ -1093,6 +1853,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tower::ServiceExt;
 
     fn state() -> BrokerState {
@@ -1102,6 +1863,109 @@ mod tests {
             default_timeout_ms: 1,
         })
         .expect("capture test broker identity")
+    }
+
+    #[derive(Default)]
+    struct FakeBootstrapBackend {
+        launches: AtomicUsize,
+        launch_delay_ms: AtomicU64,
+        rollbacks: AtomicUsize,
+        process_valid: AtomicBool,
+    }
+
+    impl FakeBootstrapBackend {
+        fn ready() -> Arc<Self> {
+            Arc::new(Self {
+                process_valid: AtomicBool::new(true),
+                ..Self::default()
+            })
+        }
+    }
+
+    impl PhotoshopBootstrapBackend for FakeBootstrapBackend {
+        fn attest(&self, _request: &PhotoshopBootstrapRequest) -> anyhow::Result<String> {
+            Ok("d".repeat(64))
+        }
+
+        fn prepare(
+            &self,
+            _request: &PhotoshopBootstrapRequest,
+            _nonce: &str,
+            _token: &str,
+            _websocket_url: &str,
+        ) -> anyhow::Result<PreparedBootstrap> {
+            Ok(PreparedBootstrap::fake("d".repeat(64)))
+        }
+
+        fn launch(
+            &self,
+            target: &adobepy_protocol::PhotoshopHostTarget,
+        ) -> anyhow::Result<ObservedHostProcess> {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(
+                self.launch_delay_ms.load(Ordering::SeqCst),
+            ));
+            Ok(ObservedHostProcess {
+                pid: 4200,
+                process_start_identity: "windows:133700000000000100".into(),
+                executable_path: target.executable_path.clone(),
+            })
+        }
+
+        fn process_matches(&self, _observed: &ObservedHostProcess) -> bool {
+            self.process_valid.load(Ordering::SeqCst)
+        }
+
+        fn rollback(&self, _prepared: PreparedBootstrap) -> anyhow::Result<()> {
+            self.rollbacks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn finalize(&self, _prepared: &PreparedBootstrap) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn executable_sha256(&self, _path: &str) -> anyhow::Result<String> {
+            Ok("c".repeat(64))
+        }
+    }
+
+    fn bootstrap_state(backend: Arc<FakeBootstrapBackend>) -> BrokerState {
+        BrokerState::with_bootstrap_backend(
+            &BrokerConfig {
+                bind: SocketAddr::from(([127, 0, 0, 1], 47_391)),
+                token: "t".into(),
+                default_timeout_ms: 1,
+            },
+            backend,
+        )
+        .expect("capture test broker identity")
+    }
+
+    fn bootstrap_request(timeout_ms: u64) -> PhotoshopBootstrapRequest {
+        PhotoshopBootstrapRequest {
+            bootstrap_version: PHOTOSHOP_BOOTSTRAP_VERSION,
+            target: "retouch".into(),
+            timeout_ms,
+            host: adobepy_protocol::PhotoshopHostTarget {
+                executable_path: "C:/Adobe/Photoshop.exe".into(),
+                executable_bytes: 42,
+                executable_sha256: "a".repeat(64),
+                host_version: "26.5.1".into(),
+                profile_id: "profile-production".into(),
+            },
+            plugin: adobepy_protocol::PhotoshopPluginTarget {
+                installed_plugin_root: "C:/UXP/External/com.adobepy.bridge.photoshop".into(),
+                module_origin: "C:/UXP/External/com.adobepy.bridge.photoshop/dist/main.js".into(),
+                bridge_version: "0.1.0".into(),
+                manifest_bytes: 640,
+                manifest_sha256: "d".repeat(64),
+                index_bytes: 180,
+                index_sha256: "e".repeat(64),
+                module_bytes: 47_901,
+                module_sha256: "f".repeat(64),
+            },
+        }
     }
 
     fn request() -> RpcRequest {
@@ -1505,5 +2369,222 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn photoshop_bootstrap_binds_exact_instance_and_is_idempotent() {
+        let backend = FakeBootstrapBackend::ready();
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(1_000);
+        let task = tokio::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        let (nonce, observed) = loop {
+            let value = state
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&session_key(HostKind::Photoshop, "retouch"))
+                .and_then(|grant| {
+                    grant
+                        .observed
+                        .clone()
+                        .map(|observed| (grant.nonce.clone(), observed))
+                });
+            if let Some(value) = value {
+                break value;
+            }
+            tokio::task::yield_now().await;
+        };
+        let mut claim = identity_claim();
+        claim.host = adobepy_protocol::HostIdentityClaim::default();
+        let bound = state
+            .bind_photoshop_bootstrap_claim("retouch", &caps(), Some(claim), Some(&nonce))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.host.pid, Some(observed.pid));
+        assert_eq!(
+            bound.host.process_start_identity.as_deref(),
+            Some("windows:133700000000000100")
+        );
+        let replay = state
+            .bind_photoshop_bootstrap_claim(
+                "retouch",
+                &caps(),
+                Some(identity_claim()),
+                Some(&nonce),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(replay.error.code, ERROR_IDENTITY_STALE);
+        insert_identity_session(&state, "retouch", 1_720_000_000_000, Some(bound)).await;
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.status, PhotoshopBootstrapStatus::Ready);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        let wire = serde_json::to_string(&result).unwrap();
+        assert!(!wire.contains("C:/"));
+        assert!(!wire.to_ascii_lowercase().contains("token"));
+
+        let verified = state
+            .verify_photoshop_bootstrap(&result.continuation.receipt_id)
+            .await
+            .unwrap();
+        assert_eq!(verified.identity_fingerprint, result.identity_fingerprint);
+        let repeated = state.bootstrap_photoshop(request).await.unwrap();
+        assert_eq!(repeated.status, PhotoshopBootstrapStatus::AlreadyReady);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        let error = state
+            .bind_photoshop_bootstrap_claim(
+                "retouch",
+                &caps(),
+                Some(identity_claim()),
+                Some(&nonce),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+        backend.process_valid.store(false, Ordering::SeqCst);
+        let error = state
+            .verify_photoshop_bootstrap(&result.continuation.receipt_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_identical_bootstrap_requests_share_one_launch() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.launch_delay_ms.store(100, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(1_000);
+        let first = tokio::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        loop {
+            if state
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&session_key(HostKind::Photoshop, "retouch"))
+                .is_some_and(|grant| grant.observed.is_none())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let second = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        let (nonce, observed) = loop {
+            let value = state
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&session_key(HostKind::Photoshop, "retouch"))
+                .and_then(|grant| {
+                    grant
+                        .observed
+                        .clone()
+                        .map(|observed| (grant.nonce.clone(), observed))
+                });
+            if let Some(value) = value {
+                break value;
+            }
+            tokio::task::yield_now().await;
+        };
+        let mut claim = identity_claim();
+        claim.host = adobepy_protocol::HostIdentityClaim::default();
+        let bound = state
+            .bind_photoshop_bootstrap_claim("retouch", &caps(), Some(claim), Some(&nonce))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.host.pid, Some(observed.pid));
+        insert_identity_session(&state, "retouch", 1_720_000_000_000, Some(bound)).await;
+
+        assert!(first.await.unwrap().is_ok());
+        assert!(second.await.unwrap().is_ok());
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn photoshop_bootstrap_rejects_foreign_stale_and_timed_out_connections() {
+        let backend = FakeBootstrapBackend::ready();
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(50);
+        let task = tokio::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        let nonce = loop {
+            let value = state
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&session_key(HostKind::Photoshop, "retouch"))
+                .and_then(|grant| grant.observed.as_ref().map(|_| grant.nonce.clone()));
+            if let Some(value) = value {
+                break value;
+            }
+            tokio::task::yield_now().await;
+        };
+        let mut foreign = identity_claim();
+        foreign.bridge.module_origin = Some("C:/Foreign/dist/main.js".into());
+        let error = state
+            .bind_photoshop_bootstrap_claim("retouch", &caps(), Some(foreign), Some(&nonce))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
+        let mut wrong_profile = identity_claim();
+        wrong_profile.host.profile_id = Some("foreign-profile".into());
+        let error = state
+            .bind_photoshop_bootstrap_claim("retouch", &caps(), Some(wrong_profile), Some(&nonce))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
+
+        let error = task.await.unwrap().unwrap_err();
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(1_000);
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        let nonce = loop {
+            let value = state
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&session_key(HostKind::Photoshop, "retouch"))
+                .and_then(|grant| grant.observed.as_ref().map(|_| grant.nonce.clone()));
+            if let Some(value) = value {
+                break value;
+            }
+            tokio::task::yield_now().await;
+        };
+        backend.process_valid.store(false, Ordering::SeqCst);
+        let error = state
+            .bind_photoshop_bootstrap_claim(
+                "retouch",
+                &caps(),
+                Some(identity_claim()),
+                Some(&nonce),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+        task.abort();
     }
 }

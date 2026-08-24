@@ -15,6 +15,8 @@ Implemented pieces:
 - Local JSON-RPC broker with per-session token, target, timeout, and capability gates.
 - Authenticated, typed broker/host/bridge runtime identity attestation for
   exact-instance checks by DCC MCP adapters.
+- Bounded Photoshop UXP bootstrap with one-time exact-instance binding and a
+  typed verification continuation; no arbitrary plug-in, command, script, or UI fallback.
 - Python SDK under `adobe.core`, `adobe.raw`, `adobe.photoshop`, `adobe.indesign`, `adobe.premiere`, `adobe.after_effects`, and `adobe.illustrator`.
 - Structured, non-eval access to the complete installed InDesign, Premiere,
   After Effects, and Illustrator object models.

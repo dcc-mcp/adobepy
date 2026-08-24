@@ -22,7 +22,15 @@ export function connectBridge(adapter: HostAdapter, identityProvider?: BridgeIde
     } catch {
       console.error("[adobepy] runtime identity is unavailable; exact-instance verification will fail closed.");
     }
-    socket.send(JSON.stringify({ type: "hello", token, target, capabilities: adapter.capabilities(), ...(identity ? { identity } : {}) }));
+    const bootstrapNonce = boundedBootstrapNonce((globalThis as any).__ADOBEPY_BOOTSTRAP_NONCE);
+    socket.send(JSON.stringify({
+      type: "hello",
+      token,
+      target,
+      capabilities: adapter.capabilities(),
+      ...(identity ? { identity } : {}),
+      ...(bootstrapNonce ? { bootstrapNonce } : {})
+    }));
   });
   socket.addEventListener("message", async (event: { data: string }) => {
     const message = JSON.parse(event.data) as BridgeRequest;
@@ -35,6 +43,10 @@ export function connectBridge(adapter: HostAdapter, identityProvider?: BridgeIde
       socket.send(JSON.stringify({ type: "error", error: hostError(request.id, error) }));
     }
   });
+}
+
+function boundedBootstrapNonce(value: unknown): string | undefined {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : undefined;
 }
 
 function hostError(id: string | number, error: unknown) {
