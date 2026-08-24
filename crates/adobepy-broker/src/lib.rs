@@ -27,7 +27,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use uuid::Uuid;
 
-type DispatchResult = Result<RpcResponse, RpcErrorResponse>;
+type DispatchResult = Result<RpcResponse, Box<RpcErrorResponse>>;
 type ValidationResult = Result<(), Box<RpcErrorResponse>>;
 
 struct PendingRequest {
@@ -97,7 +97,7 @@ impl BrokerState {
     }
 
     async fn dispatch_request(&self, request: RpcRequest) -> DispatchResult {
-        validate_request(&request).map_err(|error| *error)?;
+        validate_request(&request)?;
         let target = request.target_or_default().to_owned();
         let key = session_key(request.host, &target);
         let (sender, session) = {
@@ -106,23 +106,23 @@ impl BrokerState {
             (senders.get(&key).cloned(), sessions.get(&key).cloned())
         };
         let Some(sender) = sender else {
-            return Err(RpcErrorResponse::new(
+            return Err(Box::new(RpcErrorResponse::new(
                 Some(request.id.clone()),
                 ERROR_BRIDGE_NOT_INSTALLED,
                 format!(
                     "no bridge session is connected for host '{}' target '{}'",
                     request.host, target
                 ),
-            ));
+            )));
         };
         let Some(session) = session else {
-            return Err(RpcErrorResponse::new(
+            return Err(Box::new(RpcErrorResponse::new(
                 Some(request.id.clone()),
                 ERROR_BRIDGE_NOT_INSTALLED,
                 "bridge session metadata is unavailable",
-            ));
+            )));
         };
-        validate_capability_contract(&request, &target, &session).map_err(|error| *error)?;
+        validate_capability_contract(&request, &target, &session)?;
         let timeout_ms = request
             .options
             .timeout_ms
@@ -152,26 +152,26 @@ impl BrokerState {
             .is_err()
         {
             self.pending.lock().await.remove(&dispatch_id);
-            return Err(RpcErrorResponse::new(
+            return Err(Box::new(RpcErrorResponse::new(
                 Some(original_id),
                 ERROR_BRIDGE_NOT_INSTALLED,
                 "bridge disconnected before request could be sent",
-            ));
+            )));
         }
         match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(RpcErrorResponse::new(
+            Ok(Err(_)) => Err(Box::new(RpcErrorResponse::new(
                 Some(original_id),
                 ERROR_BRIDGE_NOT_INSTALLED,
                 "bridge response channel closed",
-            )),
+            ))),
             Err(_) => {
                 self.pending.lock().await.remove(&dispatch_id);
-                Err(RpcErrorResponse::new(
+                Err(Box::new(RpcErrorResponse::new(
                     Some(original_id),
                     ERROR_TIMEOUT,
                     format!("request timed out after {timeout_ms}ms"),
-                ))
+                )))
             }
         }
     }
@@ -271,11 +271,11 @@ impl BrokerState {
                 .collect::<Vec<_>>()
         };
         for request in drained {
-            let _ = request.sender.send(Err(RpcErrorResponse::new(
+            let _ = request.sender.send(Err(Box::new(RpcErrorResponse::new(
                 Some(request.original_id),
                 ERROR_BRIDGE_NOT_INSTALLED,
                 message.clone(),
-            )));
+            ))));
         }
     }
 }
@@ -349,7 +349,7 @@ async fn http_rpc(
     }
     match state.dispatch_request(request).await {
         Ok(response) => Json(response).into_response(),
-        Err(error) => Json(error).into_response(),
+        Err(error) => Json(*error).into_response(),
     }
 }
 
@@ -505,7 +505,7 @@ async fn handle_bridge_message(state: &BrokerState, text: &str) {
             if let Some(id) = error.id.clone() {
                 if let Some(pending) = state.pending.lock().await.remove(&id) {
                     error.id = Some(pending.original_id);
-                    let _ = pending.sender.send(Err(error));
+                    let _ = pending.sender.send(Err(Box::new(error)));
                 }
             }
         }
