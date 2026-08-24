@@ -3,7 +3,19 @@
     ".": {
       "release-type": "python",
       "package-name": "adobepy",
-      "extra-files": ["package.json"]
+      "extra-files": [
+        "package.json",
+        {
+          "type": "json",
+          "path": "package-lock.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "package-lock.json",
+          "jsonpath": "$.packages[\"\"].version"
+        }
+      ]
     }
   }
 }

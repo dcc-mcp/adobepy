@@ -1,4 +1,6 @@
+import json
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +26,97 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 class DistributionTests(unittest.TestCase):
+    def test_release_version_projection_is_consistent(self):
+        package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+        package_lock = json.loads((REPO_ROOT / "package-lock.json").read_text(encoding="utf-8"))
+        release_manifest = json.loads(
+            (REPO_ROOT / ".github" / "release-please-manifest.json").read_text(encoding="utf-8")
+        )
+        pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        project_table = re.search(r"(?ms)^\[project\]\s*$\n(.*?)(?=^\[|\Z)", pyproject)
+        self.assertIsNotNone(project_table)
+        pyproject_version = re.search(
+            r'(?m)^version\s*=\s*"([^"]+)"\s*$', project_table.group(1)
+        )
+        self.assertIsNotNone(pyproject_version)
+
+        expected = package["version"]
+        self.assertEqual(pyproject_version.group(1), expected)
+        self.assertEqual(release_manifest["."], expected)
+        self.assertEqual(package_lock["version"], expected)
+        self.assertEqual(package_lock["packages"][""]["version"], expected)
+
+    def test_release_please_projects_package_lock_versions(self):
+        config = json.loads(
+            (REPO_ROOT / ".github" / "release-please-config.json").read_text(encoding="utf-8")
+        )
+        extra_files = config["packages"]["."]["extra-files"]
+        self.assertIn(
+            {"type": "json", "path": "package-lock.json", "jsonpath": "$.version"},
+            extra_files,
+        )
+        self.assertIn(
+            {
+                "type": "json",
+                "path": "package-lock.json",
+                "jsonpath": '$.packages[""].version',
+            },
+            extra_files,
+        )
+
+    def test_release_packager_validates_source_and_staged_versions(self):
+        package_script = (REPO_ROOT / "scripts" / "package-release.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertGreaterEqual(package_script.count("check-release-versions.js"), 2)
+        self.assertIn('"package-lock.json"', package_script)
+        self.assertIn('"package-manifest.json"', package_script)
+        ci_workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Expand-Archive", ci_workflow)
+        self.assertIn("node scripts/check-release-versions.js --root", ci_workflow)
+
+    def test_release_version_checker_rejects_staged_drift(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is required to execute the release version contract")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "package.json").write_text(
+                json.dumps({"name": "adobepy", "version": "0.7.0"}), encoding="utf-8"
+            )
+            (root / "package-lock.json").write_text(
+                json.dumps(
+                    {
+                        "name": "adobepy",
+                        "version": "0.7.0",
+                        "packages": {"": {"name": "adobepy", "version": "0.6.2"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "pyproject.toml").write_text(
+                '[project]\nname = "adobepy"\nversion = "0.7.0"\n', encoding="utf-8"
+            )
+            (root / "package-manifest.json").write_text(
+                json.dumps({"name": "adobepy", "version": "0.7.0"}), encoding="utf-8"
+            )
+            result = subprocess.run(
+                [
+                    node,
+                    str(REPO_ROOT / "scripts" / "check-release-versions.js"),
+                    "--root",
+                    str(root),
+                    "--expected",
+                    "0.7.0",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('package-lock.json packages[""].version', result.stderr)
+
     def test_installed_bridge_config_precedes_bundle(self):
         for kind, host in (
             ("cep", "after-effects"),
