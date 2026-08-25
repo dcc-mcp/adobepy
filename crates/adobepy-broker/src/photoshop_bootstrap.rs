@@ -66,6 +66,29 @@ pub(crate) trait PhotoshopBootstrapBackend: Send + Sync {
 #[derive(Debug, Default)]
 pub(crate) struct SystemPhotoshopBootstrapBackend;
 
+impl SystemPhotoshopBootstrapBackend {
+    fn verify_prepared_configuration(
+        &self,
+        prepared: PreparedBootstrap,
+    ) -> anyhow::Result<PreparedBootstrap> {
+        let verification = prepared
+            .config_path
+            .as_deref()
+            .zip(prepared.transient_config.as_deref())
+            .context("prepared Photoshop configuration is incomplete")
+            .and_then(|(path, transient)| exact_config_matches(path, transient));
+        match verification {
+            Ok(()) => Ok(prepared),
+            Err(error) => match self.rollback(prepared) {
+                Ok(()) => Err(error),
+                Err(recovery) => Err(anyhow!(
+                    "Photoshop bootstrap preparation failed and could not be recovered: {recovery}"
+                )),
+            },
+        }
+    }
+}
+
 impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
     fn attest(&self, request: &PhotoshopBootstrapRequest) -> anyhow::Result<String> {
         attest_request(request)
@@ -105,14 +128,14 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
             },
         }
         atomic_write(&config_path, &transient_config)?;
-        exact_config_matches(&config_path, &transient_config)?;
-        Ok(PreparedBootstrap {
+        let prepared = PreparedBootstrap {
             config_path: Some(config_path),
             previous_config,
             transient_config: Some(transient_config),
             committed_config: Some(committed_config),
             module_sha256,
-        })
+        };
+        self.verify_prepared_configuration(prepared)
     }
 
     fn launch(&self, target: &PhotoshopHostTarget) -> anyhow::Result<ObservedHostProcess> {
@@ -388,17 +411,31 @@ fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
-    if unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error());
+    const TRANSIENT_REPLACE_ERRORS: [i32; 3] = [5, 32, 33];
+    const MAX_REPLACE_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_REPLACE_ATTEMPTS {
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if attempt + 1 == MAX_REPLACE_ATTEMPTS
+            || !error
+                .raw_os_error()
+                .is_some_and(|code| TRANSIENT_REPLACE_ERRORS.contains(&code))
+        {
+            return Err(error);
+        }
+        thread::sleep(Duration::from_millis(5));
     }
-    Ok(())
+    unreachable!("bounded atomic replace loop always returns")
 }
 
 #[cfg(not(windows))]
@@ -425,7 +462,7 @@ fn validate_exact_file(
 }
 
 fn stable_file_bytes(path: &Path, maximum: u64) -> std::io::Result<Vec<u8>> {
-    ensure_no_redirects(path).map_err(std::io::Error::other)?;
+    ensure_no_redirects(path)?;
     let mut file = fs::File::open(path)?;
     let before = file.metadata()?;
     if !before.is_file() || before.len() == 0 || before.len() > maximum {
@@ -448,7 +485,7 @@ fn stable_file_bytes(path: &Path, maximum: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn ensure_no_redirects(path: &Path) -> anyhow::Result<()> {
+fn ensure_no_redirects(path: &Path) -> std::io::Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
@@ -460,7 +497,9 @@ fn ensure_no_redirects(path: &Path) -> anyhow::Result<()> {
         }
         let metadata = fs::symlink_metadata(&current)?;
         if metadata.file_type().is_symlink() || is_windows_reparse(&metadata) {
-            return Err(anyhow!("redirected path identity is not allowed"));
+            return Err(std::io::Error::other(
+                "redirected path identity is not allowed",
+            ));
         }
     }
     Ok(())
@@ -699,6 +738,34 @@ mod tests {
         assert_eq!(fs::read(&config).unwrap(), b"operator-change");
         assert!(backend.rollback(prepared).is_err());
         assert_eq!(fs::read(&config).unwrap(), b"operator-change");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepare_verification_failure_restores_the_prior_configuration() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "photoshop-bootstrap-prepare-recovery-{}",
+                Uuid::new_v4().simple()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join(CONFIG_NAME);
+        fs::write(&config, b"transient-config").unwrap();
+        let prepared = PreparedBootstrap {
+            config_path: Some(config.clone()),
+            previous_config: Some(b"prior-config".to_vec()),
+            transient_config: Some(b"transient-config".to_vec()),
+            committed_config: Some(b"committed-config".to_vec()),
+            module_sha256: "a".repeat(64),
+        };
+        fs::remove_file(&config).unwrap();
+
+        let backend = SystemPhotoshopBootstrapBackend;
+        assert!(backend.verify_prepared_configuration(prepared).is_err());
+        assert_eq!(fs::read(&config).unwrap(), b"prior-config");
 
         fs::remove_dir_all(root).unwrap();
     }
