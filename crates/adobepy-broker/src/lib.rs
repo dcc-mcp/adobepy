@@ -423,7 +423,9 @@ impl BrokerState {
             return Err(bootstrap_timeout_error(&request, "reservation"));
         }
         if let Some(waiter) = initial_waiter {
-            return self.wait_for_bootstrap_completion(waiter?).await;
+            return self
+                .wait_for_bootstrap_completion(&request, deadline, waiter?)
+                .await;
         }
 
         let has_session = self.sessions.read().await.contains_key(&key);
@@ -449,7 +451,9 @@ impl BrokerState {
                 return Err(bootstrap_timeout_error(&request, "reservation"));
             }
             if let Some(waiter) = in_flight_waiter {
-                return self.wait_for_bootstrap_completion(waiter?).await;
+                return self
+                    .wait_for_bootstrap_completion(&request, deadline, waiter?)
+                    .await;
             }
             let identity = self
                 .runtime_identity(RuntimeIdentityQuery {
@@ -513,7 +517,9 @@ impl BrokerState {
             }
         };
         if let Some(waiter) = follower {
-            return self.wait_for_bootstrap_completion(waiter).await;
+            return self
+                .wait_for_bootstrap_completion(&request, deadline, waiter)
+                .await;
         }
         let mut transaction_guard = BootstrapTransactionGuard::new(
             key.clone(),
@@ -690,18 +696,30 @@ impl BrokerState {
 
     async fn wait_for_bootstrap_completion(
         &self,
+        request: &PhotoshopBootstrapRequest,
+        deadline: tokio::time::Instant,
         mut completion: watch::Receiver<Option<BootstrapResult>>,
     ) -> BootstrapResult {
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(bootstrap_timeout_error(request, "transaction"));
+            }
             if let Some(outcome) = completion.borrow().clone() {
                 return outcome;
             }
-            if completion.changed().await.is_err() {
-                return Err(identity_error(
-                    ERROR_IDENTITY_STALE,
-                    "Photoshop bootstrap transaction ended without a durable outcome",
-                    json!({"stage": "transaction"}),
-                ));
+            match tokio::time::timeout_at(deadline, completion.changed()).await {
+                Err(_) => return Err(bootstrap_timeout_error(request, "transaction")),
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    if let Some(outcome) = completion.borrow().clone() {
+                        return outcome;
+                    }
+                    return Err(identity_error(
+                        ERROR_IDENTITY_STALE,
+                        "Photoshop bootstrap transaction ended without a durable outcome",
+                        json!({"stage": "transaction"}),
+                    ));
+                }
             }
         }
     }
@@ -2121,6 +2139,7 @@ mod tests {
         attest_arrivals: AtomicUsize,
         attest_wait_for: AtomicUsize,
         attest_delay_ms: AtomicU64,
+        first_attest_delay_ms: AtomicU64,
         prepares: AtomicUsize,
         prepare_delay_ms: AtomicU64,
         prepare_fails: AtomicBool,
@@ -2150,14 +2169,19 @@ mod tests {
 
     impl PhotoshopBootstrapBackend for FakeBootstrapBackend {
         fn attest(&self, _request: &PhotoshopBootstrapRequest) -> anyhow::Result<String> {
-            self.attest_arrivals.fetch_add(1, Ordering::SeqCst);
+            let arrival = self.attest_arrivals.fetch_add(1, Ordering::SeqCst) + 1;
             let wait_for = self.attest_wait_for.load(Ordering::SeqCst);
             while wait_for > 0 && self.attest_arrivals.load(Ordering::SeqCst) < wait_for {
                 std::thread::yield_now();
             }
-            std::thread::sleep(Duration::from_millis(
-                self.attest_delay_ms.load(Ordering::SeqCst),
-            ));
+            let delay_ms = if arrival == 1 {
+                self.first_attest_delay_ms
+                    .load(Ordering::SeqCst)
+                    .max(self.attest_delay_ms.load(Ordering::SeqCst))
+            } else {
+                self.attest_delay_ms.load(Ordering::SeqCst)
+            };
+            std::thread::sleep(Duration::from_millis(delay_ms));
             Ok("d".repeat(64))
         }
 
@@ -2915,6 +2939,159 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn staggered_follower_uses_its_own_entry_deadline_without_cancelling_owner() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.first_attest_delay_ms.store(300, Ordering::SeqCst);
+        backend.prepare_delay_ms.store(400, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(500);
+
+        let first = tokio::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.attest_arrivals.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first caller must enter attestation");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let owner = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let receivers = state
+                    .bootstrap_grants
+                    .lock()
+                    .await
+                    .get(&session_key(HostKind::Photoshop, "retouch"))
+                    .map(|grant| grant.completion.receiver_count())
+                    .unwrap_or_default();
+                if receivers == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the earlier caller must subscribe to the later owner's grant");
+
+        let first_error = tokio::time::timeout(Duration::from_millis(400), first)
+            .await
+            .expect("the follower must stop at its own handler-entry deadline")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(first_error.error.code, ERROR_TIMEOUT);
+        assert_eq!(
+            first_error
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("transaction")
+        );
+        assert!(!owner.is_finished());
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 0);
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+        assert!(state
+            .bootstrap_grants
+            .lock()
+            .await
+            .contains_key(&session_key(HostKind::Photoshop, "retouch")));
+
+        publish_matching_bootstrap_session(&state).await;
+        let owner_result = owner.await.unwrap().unwrap();
+        assert_eq!(owner_result.status, PhotoshopBootstrapStatus::Ready);
+        assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.finalizes.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 0);
+        assert_eq!(state.bootstrap_receipts.lock().await.len(), 1);
+        assert_eq!(
+            state
+                .verify_photoshop_bootstrap(&owner_result.continuation.receipt_id)
+                .await
+                .unwrap(),
+            owner_result
+        );
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn follower_wait_is_race_safe_for_terminal_close_and_its_local_deadline() {
+        let state = bootstrap_state(FakeBootstrapBackend::ready());
+        let request = bootstrap_request(500);
+        let terminal = identity_error(
+            ERROR_IDENTITY_UNAVAILABLE,
+            "the owner failed deterministically",
+            json!({"stage": "commit"}),
+        );
+        let (completion, receiver) = watch::channel::<Option<BootstrapResult>>(None);
+        completion.send_replace(Some(Err(terminal.clone())));
+        drop(completion);
+        let observed = state
+            .wait_for_bootstrap_completion(
+                &request,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                receiver,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(observed.error.code, terminal.error.code);
+        assert_eq!(observed.error.data, terminal.error.data);
+
+        let (completion, receiver) = watch::channel::<Option<BootstrapResult>>(None);
+        drop(completion);
+        let closed = state
+            .wait_for_bootstrap_completion(
+                &request,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                receiver,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(closed.error.code, ERROR_IDENTITY_STALE);
+        assert_eq!(
+            closed
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("transaction")
+        );
+
+        let (completion, receiver) = watch::channel::<Option<BootstrapResult>>(None);
+        let late_owner = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            completion.send_replace(Some(Err(terminal)));
+        });
+        let timed_out = state
+            .wait_for_bootstrap_completion(
+                &request,
+                tokio::time::Instant::now() + Duration::from_millis(30),
+                receiver,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(timed_out.error.code, ERROR_TIMEOUT);
+        assert_eq!(
+            timed_out
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("transaction")
+        );
+        late_owner.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn identical_waiter_observes_the_owners_durable_commit_failure() {
         let backend = FakeBootstrapBackend::ready();
         backend.attest_wait_for.store(2, Ordering::SeqCst);
@@ -3041,17 +3218,20 @@ mod tests {
             .into_iter()
             .map(Result::unwrap_err)
             .collect::<Vec<_>>();
-        assert_eq!(errors[0].error.code, ERROR_TIMEOUT);
-        assert_eq!(errors[1].error.code, errors[0].error.code);
-        assert_eq!(errors[1].error.data, errors[0].error.data);
-        assert_eq!(
-            errors[0]
-                .error
-                .data
-                .as_ref()
-                .and_then(|data| data["stage"].as_str()),
-            Some("commit")
-        );
+        assert!(errors.iter().all(|error| error.error.code == ERROR_TIMEOUT));
+        let mut stages = errors
+            .iter()
+            .map(|error| {
+                error
+                    .error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data["stage"].as_str())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        stages.sort_unstable();
+        assert_eq!(stages, ["commit", "transaction"]);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
         assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
         assert!(state.bootstrap_grants.lock().await.is_empty());
@@ -3109,17 +3289,20 @@ mod tests {
             .into_iter()
             .map(Result::unwrap_err)
             .collect::<Vec<_>>();
-        assert_eq!(errors[0].error.code, ERROR_TIMEOUT);
-        assert_eq!(errors[1].error.code, errors[0].error.code);
-        assert_eq!(errors[1].error.data, errors[0].error.data);
-        assert_eq!(
-            errors[0]
-                .error
-                .data
-                .as_ref()
-                .and_then(|data| data["stage"].as_str()),
-            Some("receipt")
-        );
+        assert!(errors.iter().all(|error| error.error.code == ERROR_TIMEOUT));
+        let mut stages = errors
+            .iter()
+            .map(|error| {
+                error
+                    .error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data["stage"].as_str())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        stages.sort_unstable();
+        assert_eq!(stages, ["receipt", "transaction"]);
         assert_eq!(backend.finalizes.load(Ordering::SeqCst), 1);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
         assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
@@ -3357,17 +3540,23 @@ mod tests {
                 .into_iter()
                 .map(Result::unwrap_err)
                 .collect::<Vec<_>>();
-            assert_eq!(errors[0].error.code, ERROR_TIMEOUT, "{stage}");
-            assert_eq!(errors[1].error.code, errors[0].error.code, "{stage}");
-            assert_eq!(errors[1].error.data, errors[0].error.data, "{stage}");
-            assert_eq!(
-                errors[0]
-                    .error
-                    .data
-                    .as_ref()
-                    .and_then(|data| data["stage"].as_str()),
-                Some(stage)
+            assert!(
+                errors.iter().all(|error| error.error.code == ERROR_TIMEOUT),
+                "{stage}"
             );
+            let mut stages = errors
+                .iter()
+                .map(|error| {
+                    error
+                        .error
+                        .data
+                        .as_ref()
+                        .and_then(|data| data["stage"].as_str())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            stages.sort_unstable();
+            assert_eq!(stages, [stage, "transaction"], "{stage}");
             assert_eq!(backend.prepares.load(Ordering::SeqCst), 1, "{stage}");
             assert_eq!(
                 backend.launches.load(Ordering::SeqCst),
@@ -3385,13 +3574,43 @@ mod tests {
     }
 
     #[test]
-    fn recovery_failure_takes_precedence_over_a_latched_timeout_for_all_waiters() {
+    fn recovery_failure_reaches_a_waiter_that_is_still_within_its_own_deadline() {
         let backend = FakeBootstrapBackend::ready();
-        backend.attest_wait_for.store(2, Ordering::SeqCst);
         backend.launch_delay_ms.store(250, Ordering::SeqCst);
         backend.rollback_fails.store(true, Ordering::SeqCst);
         let state = bootstrap_state(backend.clone());
-        let outcomes = run_simultaneous_bootstraps_without_session(&state, &bootstrap_request(200));
+        let request = bootstrap_request(200);
+        let owner = std::thread::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while backend.launches.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < wait_deadline,
+                "the owner must enter launch"
+            );
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(80));
+        let waiter = std::thread::spawn({
+            let state = state.clone();
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
+        let outcomes = [owner.join().unwrap(), waiter.join().unwrap()];
         let errors = outcomes
             .into_iter()
             .map(Result::unwrap_err)
