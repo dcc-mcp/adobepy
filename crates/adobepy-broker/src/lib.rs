@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
 use uuid::Uuid;
 
 mod photoshop_bootstrap;
@@ -40,6 +40,7 @@ use photoshop_bootstrap::{
 
 type DispatchResult = Result<RpcResponse, Box<RpcErrorResponse>>;
 type ValidationResult = Result<(), Box<RpcErrorResponse>>;
+type BootstrapResult = Result<PhotoshopBootstrapResult, Box<RpcErrorResponse>>;
 
 struct PendingRequest {
     original_id: RequestId,
@@ -61,6 +62,106 @@ struct BootstrapGrant {
     observed: Option<ObservedHostProcess>,
     module_sha256: String,
     prepared: Option<PreparedBootstrap>,
+    completion: watch::Sender<Option<BootstrapResult>>,
+}
+
+struct PreparedCleanupGuard {
+    backend: Arc<dyn PhotoshopBootstrapBackend>,
+    prepared: Option<PreparedBootstrap>,
+}
+
+impl PreparedCleanupGuard {
+    fn new(backend: Arc<dyn PhotoshopBootstrapBackend>, prepared: PreparedBootstrap) -> Self {
+        Self {
+            backend,
+            prepared: Some(prepared),
+        }
+    }
+
+    fn take(&mut self) -> PreparedBootstrap {
+        self.prepared.take().expect("prepared bootstrap is present")
+    }
+}
+
+impl Drop for PreparedCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(prepared) = self.prepared.take() {
+            let _ = self.backend.rollback(prepared);
+        }
+    }
+}
+
+struct BootstrapTransactionGuard {
+    key: String,
+    grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
+    backend: Arc<dyn PhotoshopBootstrapBackend>,
+    armed: bool,
+}
+
+impl BootstrapTransactionGuard {
+    fn new(
+        key: String,
+        grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
+        backend: Arc<dyn PhotoshopBootstrapBackend>,
+    ) -> Self {
+        Self {
+            key,
+            grants,
+            backend,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BootstrapTransactionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let key = self.key.clone();
+        let grants = self.grants.clone();
+        let backend = self.backend.clone();
+        if let Ok(mut locked) = grants.try_lock() {
+            cancel_bootstrap_grant(&mut locked, &key, backend.as_ref());
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut locked = grants.lock().await;
+                cancel_bootstrap_grant(&mut locked, &key, backend.as_ref());
+            });
+        }
+    }
+}
+
+fn cancel_bootstrap_grant(
+    grants: &mut HashMap<String, BootstrapGrant>,
+    key: &str,
+    backend: &dyn PhotoshopBootstrapBackend,
+) {
+    let Some(grant) = grants.get_mut(key) else {
+        return;
+    };
+    let rollback_failed = grant
+        .prepared
+        .take()
+        .is_some_and(|prepared| backend.rollback(prepared).is_err());
+    let error = if rollback_failed {
+        bootstrap_recovery_error("cancelled Photoshop bootstrap state could not be recovered")
+    } else {
+        identity_error(
+            ERROR_IDENTITY_STALE,
+            "Photoshop bootstrap transaction was cancelled",
+            json!({"stage": "cancellation"}),
+        )
+    };
+    grant.completion.send_replace(Some(Err(error)));
+    grants.remove(key);
 }
 
 #[derive(Clone)]
@@ -289,12 +390,14 @@ impl BrokerState {
         Ok(actual)
     }
 
-    async fn bootstrap_photoshop(
-        &self,
-        request: PhotoshopBootstrapRequest,
-    ) -> Result<PhotoshopBootstrapResult, Box<RpcErrorResponse>> {
+    async fn bootstrap_photoshop(&self, request: PhotoshopBootstrapRequest) -> BootstrapResult {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(request.timeout_ms);
         validate_photoshop_bootstrap_request(&request)?;
-        let module_sha256 = self.bootstrap_backend.attest(&request).map_err(|_| {
+        let attestation = self.bootstrap_backend.attest(&request);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(bootstrap_timeout_error(&request, "attestation"));
+        }
+        let module_sha256 = attestation.map_err(|_| {
             identity_error(
                 ERROR_IDENTITY_UNAVAILABLE,
                 "the authenticated Photoshop product or fixed UXP bridge is unavailable",
@@ -302,28 +405,86 @@ impl BrokerState {
             )
         })?;
         let key = session_key(HostKind::Photoshop, &request.target);
-        if self.sessions.read().await.contains_key(&key) {
+        let initial_waiter = {
+            let grants = self.bootstrap_grants.lock().await;
+            grants.get(&key).map(|grant| {
+                if grant.request == request {
+                    Ok(grant.completion.subscribe())
+                } else {
+                    Err(identity_error(
+                        ERROR_IDENTITY_AMBIGUOUS,
+                        "a different Photoshop bootstrap is already active for this target",
+                        json!({"target": request.target}),
+                    ))
+                }
+            })
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(bootstrap_timeout_error(&request, "reservation"));
+        }
+        if let Some(waiter) = initial_waiter {
+            return self.wait_for_bootstrap_completion(waiter?).await;
+        }
+
+        let has_session = self.sessions.read().await.contains_key(&key);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(bootstrap_timeout_error(&request, "session"));
+        }
+        if has_session {
+            let in_flight_waiter = {
+                let grants = self.bootstrap_grants.lock().await;
+                grants.get(&key).map(|grant| {
+                    if grant.request == request {
+                        Ok(grant.completion.subscribe())
+                    } else {
+                        Err(identity_error(
+                            ERROR_IDENTITY_AMBIGUOUS,
+                            "a different Photoshop bootstrap is already active for this target",
+                            json!({"target": request.target}),
+                        ))
+                    }
+                })
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(bootstrap_timeout_error(&request, "reservation"));
+            }
+            if let Some(waiter) = in_flight_waiter {
+                return self.wait_for_bootstrap_completion(waiter?).await;
+            }
             let identity = self
                 .runtime_identity(RuntimeIdentityQuery {
                     host: HostKind::Photoshop,
                     target: Some(request.target.clone()),
                     expected: None,
                 })
-                .await?;
-            self.validate_bootstrap_identity(&request, &identity, None)?;
+                .await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(bootstrap_timeout_error(&request, "identity"));
+            }
+            let identity = identity?;
+            let validation = self.validate_bootstrap_identity(&request, &identity, None);
+            if tokio::time::Instant::now() >= deadline {
+                return Err(bootstrap_timeout_error(&request, "identity_validation"));
+            }
+            validation?;
             return self
                 .record_bootstrap_result(
                     identity,
                     &request,
                     &module_sha256,
                     PhotoshopBootstrapStatus::AlreadyReady,
+                    deadline,
+                    None,
                 )
                 .await;
         }
 
-        let mut reuse_grant = false;
-        let stale_prepared = {
+        let nonce = random_nonce();
+        let follower = {
             let mut grants = self.bootstrap_grants.lock().await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(bootstrap_timeout_error(&request, "reservation"));
+            }
             match grants.get(&key) {
                 Some(grant) if grant.request != request => {
                     return Err(identity_error(
@@ -332,212 +493,240 @@ impl BrokerState {
                         json!({"target": request.target}),
                     ));
                 }
-                Some(grant)
-                    if grant.observed.as_ref().is_none_or(|observed| {
-                        self.bootstrap_backend.process_matches(observed)
-                    }) =>
-                {
-                    reuse_grant = true;
+                Some(grant) => Some(grant.completion.subscribe()),
+                None => {
+                    let (completion, _) = watch::channel::<Option<BootstrapResult>>(None);
+                    grants.insert(
+                        key.clone(),
+                        BootstrapGrant {
+                            request: request.clone(),
+                            nonce: nonce.clone(),
+                            nonce_claimed: false,
+                            observed: None,
+                            module_sha256: module_sha256.clone(),
+                            prepared: None,
+                            completion,
+                        },
+                    );
                     None
                 }
-                Some(_) => grants
-                    .remove(&key)
-                    .and_then(|mut grant| grant.prepared.take()),
-                None => None,
             }
         };
-        if let Some(prepared) = stale_prepared {
-            self.bootstrap_backend.rollback(prepared).map_err(|_| {
+        if let Some(waiter) = follower {
+            return self.wait_for_bootstrap_completion(waiter).await;
+        }
+        let mut transaction_guard = BootstrapTransactionGuard::new(
+            key.clone(),
+            self.bootstrap_grants.clone(),
+            self.bootstrap_backend.clone(),
+        );
+
+        let owner_result: BootstrapResult = async {
+            let prepared = self.bootstrap_backend.prepare(
+                &request,
+                &nonce,
+                &self.token,
+                &self.photoshop_websocket_url,
+            );
+            if tokio::time::Instant::now() >= deadline {
+                if let Ok(prepared) = prepared {
+                    let mut grants = self.bootstrap_grants.lock().await;
+                    if let Some(grant) = grants.get_mut(&key) {
+                        grant.prepared = Some(prepared);
+                    } else {
+                        let _ = self.bootstrap_backend.rollback(prepared);
+                    }
+                }
+                return Err(bootstrap_timeout_error(&request, "prepare"));
+            }
+            let prepared = prepared.map_err(|_| {
                 identity_error(
-                    ERROR_IDENTITY_STALE,
-                    "stale Photoshop bootstrap state could not be recovered",
-                    json!({"stage": "recovery"}),
+                    ERROR_IDENTITY_UNAVAILABLE,
+                    "the fixed Photoshop UXP bridge could not be prepared",
+                    json!({"stage": "prepare"}),
                 )
             })?;
-        }
-
-        if !reuse_grant {
-            let nonce = random_nonce();
-            let prepared = self
-                .bootstrap_backend
-                .prepare(&request, &nonce, &self.token, &self.photoshop_websocket_url)
-                .map_err(|_| {
-                    identity_error(
-                        ERROR_IDENTITY_UNAVAILABLE,
-                        "the fixed Photoshop UXP bridge could not be prepared",
-                        json!({"stage": "prepare"}),
-                    )
-                })?;
-            self.bootstrap_grants.lock().await.insert(
-                key.clone(),
-                BootstrapGrant {
-                    request: request.clone(),
-                    nonce,
-                    nonce_claimed: false,
-                    observed: None,
-                    module_sha256: prepared.module_sha256.clone(),
-                    prepared: Some(prepared),
-                },
-            );
-            let observed = match self.bootstrap_backend.launch(&request.host) {
-                Ok(observed) => observed,
-                Err(_) => {
-                    let prepared = self
-                        .bootstrap_grants
-                        .lock()
-                        .await
-                        .remove(&key)
-                        .and_then(|mut grant| grant.prepared.take());
-                    if let Some(prepared) = prepared {
-                        if self.bootstrap_backend.rollback(prepared).is_err() {
-                            return Err(identity_error(
-                                ERROR_IDENTITY_STALE,
-                                "failed Photoshop launch state could not be recovered",
-                                json!({"stage": "recovery"}),
-                            ));
-                        }
-                    }
+            let mut prepared_guard =
+                PreparedCleanupGuard::new(self.bootstrap_backend.clone(), prepared);
+            {
+                let mut grants = self.bootstrap_grants.lock().await;
+                let Some(grant) = grants.get_mut(&key) else {
                     return Err(identity_error(
-                        ERROR_IDENTITY_UNAVAILABLE,
-                        "the selected Photoshop instance could not be launched",
+                        ERROR_IDENTITY_STALE,
+                        "Photoshop bootstrap reservation was cancelled",
+                        json!({"stage": "prepare"}),
+                    ));
+                };
+                let prepared = prepared_guard.take();
+                grant.module_sha256 = prepared.module_sha256.clone();
+                grant.prepared = Some(prepared);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(bootstrap_timeout_error(&request, "prepare"));
+            }
+            let observed = self.bootstrap_backend.launch(&request.host);
+            if tokio::time::Instant::now() >= deadline {
+                return Err(bootstrap_timeout_error(&request, "launch"));
+            }
+            let observed = observed.map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_UNAVAILABLE,
+                    "the selected Photoshop instance could not be launched",
+                    json!({"stage": "launch"}),
+                )
+            })?;
+            {
+                let mut grants = self.bootstrap_grants.lock().await;
+                let Some(grant) = grants.get_mut(&key) else {
+                    return Err(identity_error(
+                        ERROR_IDENTITY_STALE,
+                        "Photoshop bootstrap reservation was cancelled",
                         json!({"stage": "launch"}),
                     ));
-                }
-            };
-            if let Some(grant) = self.bootstrap_grants.lock().await.get_mut(&key) {
+                };
                 grant.observed = Some(observed);
             }
-        }
-
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(request.timeout_ms);
-        loop {
             if tokio::time::Instant::now() >= deadline {
-                break;
+                return Err(bootstrap_timeout_error(&request, "launch"));
             }
-            match self
-                .runtime_identity(RuntimeIdentityQuery {
-                    host: HostKind::Photoshop,
-                    target: Some(request.target.clone()),
-                    expected: None,
-                })
-                .await
-            {
-                Ok(identity) => {
-                    let observed = self
-                        .bootstrap_grants
-                        .lock()
-                        .await
-                        .get(&key)
-                        .and_then(|grant| grant.observed.clone());
-                    if let Err(error) =
-                        self.validate_bootstrap_identity(&request, &identity, observed.as_ref())
-                    {
-                        self.rollback_bootstrap_grant(&key).await?;
-                        return Err(error);
-                    }
-                    let grant = {
-                        let mut grants = self.bootstrap_grants.lock().await;
-                        grants.remove(&key)
-                    };
-                    let Some(mut grant) = grant else {
+
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(bootstrap_timeout_error(&request, "verify"));
+                }
+                let identity = self
+                    .runtime_identity(RuntimeIdentityQuery {
+                        host: HostKind::Photoshop,
+                        target: Some(request.target.clone()),
+                        expected: None,
+                    })
+                    .await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(bootstrap_timeout_error(&request, "verify"));
+                }
+                match identity {
+                    Ok(identity) => {
+                        let observed = self
+                            .bootstrap_grants
+                            .lock()
+                            .await
+                            .get(&key)
+                            .and_then(|grant| grant.observed.clone());
+                        let validation = self.validate_bootstrap_identity(
+                            &request,
+                            &identity,
+                            observed.as_ref(),
+                        );
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(bootstrap_timeout_error(&request, "identity_validation"));
+                        }
+                        validation?;
+                        let finalize = {
+                            let grants = self.bootstrap_grants.lock().await;
+                            let Some(prepared) =
+                                grants.get(&key).and_then(|grant| grant.prepared.as_ref())
+                            else {
+                                return Err(identity_error(
+                                    ERROR_IDENTITY_STALE,
+                                    "Photoshop bootstrap reservation is unavailable",
+                                    json!({"stage": "commit"}),
+                                ));
+                            };
+                            self.bootstrap_backend.finalize(prepared)
+                        };
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(bootstrap_timeout_error(&request, "commit"));
+                        }
+                        finalize.map_err(|_| {
+                            identity_error(
+                                ERROR_IDENTITY_UNAVAILABLE,
+                                "Photoshop bootstrap could not be committed",
+                                json!({"stage": "commit"}),
+                            )
+                        })?;
+                        let grant_module_sha256 = self
+                            .bootstrap_grants
+                            .lock()
+                            .await
+                            .get(&key)
+                            .map(|grant| grant.module_sha256.clone())
+                            .ok_or_else(|| {
+                                identity_error(
+                                    ERROR_IDENTITY_STALE,
+                                    "Photoshop bootstrap reservation is unavailable",
+                                    json!({"stage": "commit"}),
+                                )
+                            })?;
                         return self
                             .record_bootstrap_result(
                                 identity,
                                 &request,
-                                &module_sha256,
-                                PhotoshopBootstrapStatus::AlreadyReady,
+                                &grant_module_sha256,
+                                PhotoshopBootstrapStatus::Ready,
+                                deadline,
+                                Some(&key),
                             )
                             .await;
-                    };
-                    let grant_module_sha256 = grant.module_sha256.clone();
-                    let mut prepared = grant.prepared.take();
-                    if let Some(value) = prepared.as_ref() {
-                        if self.bootstrap_backend.finalize(value).is_err() {
-                            if let Some(value) = prepared.take() {
-                                if self.bootstrap_backend.rollback(value).is_err() {
-                                    return Err(identity_error(
-                                        ERROR_IDENTITY_STALE,
-                                        "uncommitted Photoshop bootstrap state could not be recovered",
-                                        json!({"stage": "recovery"}),
-                                    ));
-                                }
-                            }
-                            return Err(identity_error(
-                                ERROR_IDENTITY_UNAVAILABLE,
-                                "Photoshop bootstrap could not be committed",
-                                json!({"stage": "commit"}),
-                            ));
-                        }
                     }
-                    let result = self
-                        .record_bootstrap_result(
-                            identity,
-                            &request,
-                            &grant_module_sha256,
-                            PhotoshopBootstrapStatus::Ready,
-                        )
-                        .await;
-                    if result.is_err() {
-                        if let Some(value) = prepared.take() {
-                            if self.bootstrap_backend.rollback(value).is_err() {
-                                return Err(identity_error(
-                                    ERROR_IDENTITY_STALE,
-                                    "unreceipted Photoshop bootstrap state could not be recovered",
-                                    json!({"stage": "recovery"}),
-                                ));
-                            }
-                        }
-                    }
-                    return result;
+                    Err(error)
+                        if matches!(
+                            error.error.code,
+                            ERROR_IDENTITY_UNAVAILABLE | ERROR_BRIDGE_NOT_INSTALLED
+                        ) => {}
+                    Err(error) => return Err(error),
                 }
-                Err(error)
-                    if matches!(
-                        error.error.code,
-                        ERROR_IDENTITY_UNAVAILABLE | ERROR_BRIDGE_NOT_INSTALLED
-                    ) => {}
-                Err(error) => return Err(error),
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let prepared = self
-            .bootstrap_grants
-            .lock()
-            .await
-            .remove(&key)
-            .and_then(|mut grant| grant.prepared.take());
-        if let Some(prepared) = prepared {
-            self.bootstrap_backend.rollback(prepared).map_err(|_| {
-                identity_error(
-                    ERROR_IDENTITY_STALE,
-                    "timed-out Photoshop bootstrap state could not be recovered",
-                    json!({"stage": "recovery"}),
-                )
-            })?;
-        }
-        Err(identity_error(
-            ERROR_TIMEOUT,
-            "Photoshop UXP bootstrap timed out before exact-instance verification",
-            json!({"stage": "verify", "timeoutMs": request.timeout_ms}),
-        ))
+        .await;
+
+        let final_result = match owner_result {
+            Ok(result) => Ok(result),
+            Err(error) => self.complete_bootstrap_failure(&key, error).await,
+        };
+        transaction_guard.disarm();
+        final_result
     }
 
-    async fn rollback_bootstrap_grant(&self, key: &str) -> ValidationResult {
-        let prepared = self
-            .bootstrap_grants
-            .lock()
-            .await
-            .remove(key)
-            .and_then(|mut grant| grant.prepared.take());
-        if let Some(prepared) = prepared {
-            self.bootstrap_backend.rollback(prepared).map_err(|_| {
-                identity_error(
+    async fn wait_for_bootstrap_completion(
+        &self,
+        mut completion: watch::Receiver<Option<BootstrapResult>>,
+    ) -> BootstrapResult {
+        loop {
+            if let Some(outcome) = completion.borrow().clone() {
+                return outcome;
+            }
+            if completion.changed().await.is_err() {
+                return Err(identity_error(
                     ERROR_IDENTITY_STALE,
-                    "Photoshop bootstrap state could not be recovered",
-                    json!({"stage": "recovery"}),
-                )
-            })?;
+                    "Photoshop bootstrap transaction ended without a durable outcome",
+                    json!({"stage": "transaction"}),
+                ));
+            }
         }
-        Ok(())
+    }
+
+    async fn complete_bootstrap_failure(
+        &self,
+        key: &str,
+        primary_error: Box<RpcErrorResponse>,
+    ) -> BootstrapResult {
+        let mut grants = self.bootstrap_grants.lock().await;
+        let Some(grant) = grants.get_mut(key) else {
+            return Err(primary_error);
+        };
+        let rollback_failed = grant
+            .prepared
+            .take()
+            .is_some_and(|prepared| self.bootstrap_backend.rollback(prepared).is_err());
+        let error = if rollback_failed {
+            bootstrap_recovery_error("Photoshop bootstrap state could not be recovered")
+        } else {
+            primary_error
+        };
+        grant.completion.send_replace(Some(Err(error.clone())));
+        grants.remove(key);
+        Err(error)
     }
 
     fn validate_bootstrap_identity(
@@ -594,18 +783,27 @@ impl BrokerState {
         request: &PhotoshopBootstrapRequest,
         module_sha256: &str,
         status: PhotoshopBootstrapStatus,
-    ) -> Result<PhotoshopBootstrapResult, Box<RpcErrorResponse>> {
-        let broker_sha256 = self
+        deadline: tokio::time::Instant,
+        owner_key: Option<&str>,
+    ) -> BootstrapResult {
+        let broker_attestation = self
             .bootstrap_backend
-            .executable_sha256(&identity.broker.executable_path)
-            .map_err(|_| {
-                identity_error(
-                    ERROR_IDENTITY_UNAVAILABLE,
-                    "broker executable identity is unavailable",
-                    json!({"stage": "broker_attestation"}),
-                )
-            })?;
-        let fingerprint = identity_fingerprint(&identity)?;
+            .executable_sha256(&identity.broker.executable_path);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(bootstrap_timeout_error(request, "broker_attestation"));
+        }
+        let broker_sha256 = broker_attestation.map_err(|_| {
+            identity_error(
+                ERROR_IDENTITY_UNAVAILABLE,
+                "broker executable identity is unavailable",
+                json!({"stage": "broker_attestation"}),
+            )
+        })?;
+        let fingerprint = identity_fingerprint(&identity);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(bootstrap_timeout_error(request, "fingerprint"));
+        }
+        let fingerprint = fingerprint?;
         let receipt_id = Uuid::new_v4().hyphenated().to_string();
         let result = PhotoshopBootstrapResult {
             bootstrap_version: PHOTOSHOP_BOOTSTRAP_VERSION,
@@ -637,17 +835,53 @@ impl BrokerState {
                 timeout_ms: request.timeout_ms,
             },
         };
-        let mut receipts = self.bootstrap_receipts.lock().await;
-        let now = epoch_ms();
-        receipts.retain(|_, receipt| receipt.expires_at_epoch_ms >= now);
-        receipts.insert(
-            receipt_id,
-            BootstrapReceipt {
-                identity,
-                result: result.clone(),
-                expires_at_epoch_ms: now + 120_000,
-            },
-        );
+        let receipt = BootstrapReceipt {
+            identity,
+            result: result.clone(),
+            expires_at_epoch_ms: epoch_ms() + 120_000,
+        };
+        if let Some(key) = owner_key {
+            let mut grants = self.bootstrap_grants.lock().await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(bootstrap_timeout_error(request, "receipt"));
+            }
+            if grants
+                .get(key)
+                .and_then(|grant| grant.prepared.as_ref())
+                .is_none()
+            {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Photoshop bootstrap reservation is unavailable",
+                    json!({"stage": "receipt"}),
+                ));
+            }
+            let mut receipts = self.bootstrap_receipts.lock().await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(bootstrap_timeout_error(request, "receipt"));
+            }
+            let now = epoch_ms();
+            receipts.retain(|_, receipt| receipt.expires_at_epoch_ms >= now);
+            receipts.insert(receipt_id, receipt);
+            let grant = grants
+                .get_mut(key)
+                .expect("owner grant remains locked through receipt persistence");
+            let prepared = grant
+                .prepared
+                .take()
+                .expect("owner prepared state remains locked through receipt persistence");
+            drop(prepared);
+            grant.completion.send_replace(Some(Ok(result.clone())));
+            grants.remove(key);
+        } else {
+            let mut receipts = self.bootstrap_receipts.lock().await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(bootstrap_timeout_error(request, "receipt"));
+            }
+            let now = epoch_ms();
+            receipts.retain(|_, receipt| receipt.expires_at_epoch_ms >= now);
+            receipts.insert(receipt_id, receipt);
+        }
         Ok(result)
     }
 
@@ -777,6 +1011,13 @@ impl BrokerState {
                 json!({"missingFields": ["identity.bridge"]}),
             ));
         };
+        let Some(profile_id) = identity.host.profile_id.as_ref() else {
+            return Err(identity_error(
+                ERROR_IDENTITY_UNAVAILABLE,
+                "Photoshop bootstrap connection omitted its host profile identity",
+                json!({"missingFields": ["identity.host.profileId"]}),
+            ));
+        };
         let claimed_host_matches = identity.host.pid.is_none_or(|pid| pid == observed.pid)
             && identity
                 .host
@@ -788,11 +1029,7 @@ impl BrokerState {
                 .executable_path
                 .as_deref()
                 .is_none_or(|value| normalized_paths_equal(value, &observed.executable_path))
-            && identity
-                .host
-                .profile_id
-                .as_ref()
-                .is_none_or(|value| value == &request.host.profile_id);
+            && profile_id == &request.host.profile_id;
         let bridge_matches = identity
             .bridge
             .installed_plugin_root
@@ -836,7 +1073,6 @@ impl BrokerState {
         identity.host.process_start_identity = Some(observed.process_start_identity);
         identity.host.executable_path = Some(observed.executable_path);
         identity.host.host_version = Some(request.host.host_version);
-        identity.host.profile_id = Some(request.host.profile_id);
         Ok(Some(identity))
     }
 
@@ -1171,6 +1407,21 @@ async fn handle_bridge_message(state: &BrokerState, text: &str) {
 
 fn identity_error(code: i32, message: &str, data: serde_json::Value) -> Box<RpcErrorResponse> {
     Box::new(RpcErrorResponse::new(None, code, message).with_data(data))
+}
+
+fn bootstrap_timeout_error(
+    request: &PhotoshopBootstrapRequest,
+    stage: &str,
+) -> Box<RpcErrorResponse> {
+    identity_error(
+        ERROR_TIMEOUT,
+        "Photoshop UXP bootstrap exceeded its bounded operation deadline",
+        json!({"stage": stage, "timeoutMs": request.timeout_ms}),
+    )
+}
+
+fn bootstrap_recovery_error(message: &str) -> Box<RpcErrorResponse> {
+    identity_error(ERROR_IDENTITY_STALE, message, json!({"stage": "recovery"}))
 }
 
 fn validate_photoshop_bootstrap_request(
@@ -1867,16 +2118,31 @@ mod tests {
 
     #[derive(Default)]
     struct FakeBootstrapBackend {
+        attest_arrivals: AtomicUsize,
+        attest_wait_for: AtomicUsize,
+        attest_delay_ms: AtomicU64,
+        prepares: AtomicUsize,
+        prepare_delay_ms: AtomicU64,
+        prepare_fails: AtomicBool,
         launches: AtomicUsize,
         launch_delay_ms: AtomicU64,
+        launch_fails: AtomicBool,
+        finalizes: AtomicUsize,
+        finalize_delay_ms: AtomicU64,
+        finalize_fails: AtomicBool,
         rollbacks: AtomicUsize,
+        rollback_delay_ms: AtomicU64,
+        rollback_fails: AtomicBool,
         process_valid: AtomicBool,
+        config_state: AtomicUsize,
+        executable_sha256_delay_ms: AtomicU64,
     }
 
     impl FakeBootstrapBackend {
         fn ready() -> Arc<Self> {
             Arc::new(Self {
                 process_valid: AtomicBool::new(true),
+                config_state: AtomicUsize::new(1),
                 ..Self::default()
             })
         }
@@ -1884,6 +2150,14 @@ mod tests {
 
     impl PhotoshopBootstrapBackend for FakeBootstrapBackend {
         fn attest(&self, _request: &PhotoshopBootstrapRequest) -> anyhow::Result<String> {
+            self.attest_arrivals.fetch_add(1, Ordering::SeqCst);
+            let wait_for = self.attest_wait_for.load(Ordering::SeqCst);
+            while wait_for > 0 && self.attest_arrivals.load(Ordering::SeqCst) < wait_for {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(
+                self.attest_delay_ms.load(Ordering::SeqCst),
+            ));
             Ok("d".repeat(64))
         }
 
@@ -1894,6 +2168,16 @@ mod tests {
             _token: &str,
             _websocket_url: &str,
         ) -> anyhow::Result<PreparedBootstrap> {
+            self.prepares.fetch_add(1, Ordering::SeqCst);
+            self.config_state.store(2, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(
+                self.prepare_delay_ms.load(Ordering::SeqCst),
+            ));
+            if self.prepare_fails.load(Ordering::SeqCst) {
+                self.rollbacks.fetch_add(1, Ordering::SeqCst);
+                self.config_state.store(1, Ordering::SeqCst);
+                return Err(anyhow!("deterministic prepare failure"));
+            }
             Ok(PreparedBootstrap::fake("d".repeat(64)))
         }
 
@@ -1905,6 +2189,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(
                 self.launch_delay_ms.load(Ordering::SeqCst),
             ));
+            if self.launch_fails.load(Ordering::SeqCst) {
+                return Err(anyhow!("deterministic launch failure"));
+            }
             Ok(ObservedHostProcess {
                 pid: 4200,
                 process_start_identity: "windows:133700000000000100".into(),
@@ -1918,14 +2205,32 @@ mod tests {
 
         fn rollback(&self, _prepared: PreparedBootstrap) -> anyhow::Result<()> {
             self.rollbacks.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(
+                self.rollback_delay_ms.load(Ordering::SeqCst),
+            ));
+            if self.rollback_fails.load(Ordering::SeqCst) {
+                return Err(anyhow!("deterministic rollback failure"));
+            }
+            self.config_state.store(1, Ordering::SeqCst);
             Ok(())
         }
 
         fn finalize(&self, _prepared: &PreparedBootstrap) -> anyhow::Result<()> {
+            self.finalizes.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(
+                self.finalize_delay_ms.load(Ordering::SeqCst),
+            ));
+            if self.finalize_fails.load(Ordering::SeqCst) {
+                return Err(anyhow!("deterministic finalize failure"));
+            }
+            self.config_state.store(3, Ordering::SeqCst);
             Ok(())
         }
 
         fn executable_sha256(&self, _path: &str) -> anyhow::Result<String> {
+            std::thread::sleep(Duration::from_millis(
+                self.executable_sha256_delay_ms.load(Ordering::SeqCst),
+            ));
             Ok("c".repeat(64))
         }
     }
@@ -1966,6 +2271,41 @@ mod tests {
                 module_sha256: "f".repeat(64),
             },
         }
+    }
+
+    fn run_simultaneous_bootstraps_without_session(
+        state: &BrokerState,
+        request: &PhotoshopBootstrapRequest,
+    ) -> [BootstrapResult; 2] {
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first = std::thread::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
+        let second = std::thread::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
+        barrier.wait();
+        [first.join().unwrap(), second.join().unwrap()]
     }
 
     fn request() -> RpcRequest {
@@ -2032,6 +2372,43 @@ mod tests {
         if let Some(identity) = identity {
             state.session_identities.write().await.insert(key, identity);
         }
+    }
+
+    async fn publish_matching_bootstrap_session(state: &BrokerState) -> ObservedHostProcess {
+        let (nonce, observed) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let value = state
+                    .bootstrap_grants
+                    .lock()
+                    .await
+                    .get(&session_key(HostKind::Photoshop, "retouch"))
+                    .and_then(|grant| {
+                        grant
+                            .observed
+                            .clone()
+                            .map(|observed| (grant.nonce.clone(), observed))
+                    });
+                if let Some(value) = value {
+                    return value;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("bootstrap owner must publish its observed process");
+        let bound = state
+            .bind_photoshop_bootstrap_claim(
+                "retouch",
+                &caps(),
+                Some(identity_claim()),
+                Some(&nonce),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.host.pid, Some(observed.pid));
+        insert_identity_session(state, "retouch", 1_720_000_000_000, Some(bound)).await;
+        observed
     }
 
     fn identity_query(target: Option<&str>) -> RuntimeIdentityQuery {
@@ -2399,7 +2776,9 @@ mod tests {
             tokio::task::yield_now().await;
         };
         let mut claim = identity_claim();
+        let profile_id = claim.host.profile_id.clone();
         claim.host = adobepy_protocol::HostIdentityClaim::default();
+        claim.host.profile_id = profile_id;
         let bound = state
             .bind_photoshop_bootstrap_claim("retouch", &caps(), Some(claim), Some(&nonce))
             .await
@@ -2456,33 +2835,40 @@ mod tests {
         assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_identical_bootstrap_requests_share_one_launch() {
         let backend = FakeBootstrapBackend::ready();
-        backend.launch_delay_ms.store(100, Ordering::SeqCst);
+        backend.attest_wait_for.store(2, Ordering::SeqCst);
+        backend.prepare_delay_ms.store(100, Ordering::SeqCst);
         let state = bootstrap_state(backend.clone());
         let request = bootstrap_request(1_000);
-        let first = tokio::spawn({
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first = std::thread::spawn({
             let state = state.clone();
             let request = request.clone();
-            async move { state.bootstrap_photoshop(request).await }
-        });
-        loop {
-            if state
-                .bootstrap_grants
-                .lock()
-                .await
-                .get(&session_key(HostKind::Photoshop, "retouch"))
-                .is_some_and(|grant| grant.observed.is_none())
-            {
-                break;
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
             }
-            tokio::task::yield_now().await;
-        }
-        let second = tokio::spawn({
-            let state = state.clone();
-            async move { state.bootstrap_photoshop(request).await }
         });
+        let second = std::thread::spawn({
+            let state = state.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
+        barrier.wait();
         let (nonce, observed) = loop {
             let value = state
                 .bootstrap_grants
@@ -2498,10 +2884,12 @@ mod tests {
             if let Some(value) = value {
                 break value;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         };
         let mut claim = identity_claim();
+        let profile_id = claim.host.profile_id.clone();
         claim.host = adobepy_protocol::HostIdentityClaim::default();
+        claim.host.profile_id = profile_id;
         let bound = state
             .bind_photoshop_bootstrap_claim("retouch", &caps(), Some(claim), Some(&nonce))
             .await
@@ -2510,9 +2898,600 @@ mod tests {
         assert_eq!(bound.host.pid, Some(observed.pid));
         insert_identity_session(&state, "retouch", 1_720_000_000_000, Some(bound)).await;
 
-        assert!(first.await.unwrap().is_ok());
-        assert!(second.await.unwrap().is_ok());
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert_eq!(second, first);
+        assert_eq!(state.bootstrap_receipts.lock().await.len(), 1);
+        let verified = state
+            .verify_photoshop_bootstrap(&first.continuation.receipt_id)
+            .await
+            .unwrap();
+        assert_eq!(verified, first);
+        assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
         assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.finalizes.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 0);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn identical_waiter_observes_the_owners_durable_commit_failure() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.attest_wait_for.store(2, Ordering::SeqCst);
+        backend.finalize_delay_ms.store(150, Ordering::SeqCst);
+        backend.finalize_fails.store(true, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(1_000);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            let barrier = barrier.clone();
+            let completed_tx = completed_tx.clone();
+            move || {
+                barrier.wait();
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request));
+                completed_tx.send(result).unwrap();
+            }
+        });
+        let second = std::thread::spawn({
+            let state = state.clone();
+            let barrier = barrier.clone();
+            let completed_tx = completed_tx.clone();
+            move || {
+                barrier.wait();
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request));
+                completed_tx.send(result).unwrap();
+            }
+        });
+        drop(completed_tx);
+        barrier.wait();
+
+        publish_matching_bootstrap_session(&state).await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.finalizes.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("owner must enter finalize");
+        let premature = completed_rx.recv_timeout(Duration::from_millis(40)).ok();
+        let had_premature = premature.is_some();
+        let mut outcomes = premature.into_iter().collect::<Vec<_>>();
+        while outcomes.len() < 2 {
+            outcomes.push(
+                completed_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("both bootstrap calls must finish"),
+            );
+        }
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert!(
+            !had_premature,
+            "an identical waiter returned before the owner finished finalize"
+        );
+        let errors = outcomes
+            .into_iter()
+            .map(Result::unwrap_err)
+            .collect::<Vec<_>>();
+        assert_eq!(errors[0].error.code, ERROR_IDENTITY_UNAVAILABLE);
+        assert_eq!(errors[1].error.code, errors[0].error.code);
+        assert_eq!(errors[1].error.data, errors[0].error.data);
+        assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.finalizes.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn late_finalize_failure_is_one_timeout_outcome_for_owner_and_waiter() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.attest_wait_for.store(2, Ordering::SeqCst);
+        backend.finalize_delay_ms.store(250, Ordering::SeqCst);
+        backend.finalize_fails.store(true, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(200);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first = std::thread::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
+        let second = std::thread::spawn({
+            let state = state.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
+        barrier.wait();
+
+        publish_matching_bootstrap_session(&state).await;
+
+        let outcomes = [first.join().unwrap(), second.join().unwrap()];
+        let errors = outcomes
+            .into_iter()
+            .map(Result::unwrap_err)
+            .collect::<Vec<_>>();
+        assert_eq!(errors[0].error.code, ERROR_TIMEOUT);
+        assert_eq!(errors[1].error.code, errors[0].error.code);
+        assert_eq!(errors[1].error.data, errors[0].error.data);
+        assert_eq!(
+            errors[0]
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("commit")
+        );
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn receipt_deadline_failure_is_shared_only_after_rollback() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.attest_wait_for.store(2, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let receipt_lock = state.bootstrap_receipts.lock().await;
+        let request = bootstrap_request(200);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first = std::thread::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
+        let second = std::thread::spawn({
+            let state = state.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
+        barrier.wait();
+
+        publish_matching_bootstrap_session(&state).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.finalizes.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("owner must enter finalize");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        drop(receipt_lock);
+
+        let outcomes = [first.join().unwrap(), second.join().unwrap()];
+        let errors = outcomes
+            .into_iter()
+            .map(Result::unwrap_err)
+            .collect::<Vec<_>>();
+        assert_eq!(errors[0].error.code, ERROR_TIMEOUT);
+        assert_eq!(errors[1].error.code, errors[0].error.code);
+        assert_eq!(errors[1].error.data, errors[0].error.data);
+        assert_eq!(
+            errors[0]
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("receipt")
+        );
+        assert_eq!(backend.finalizes.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_conflicting_bootstraps_have_one_owner_and_no_second_effects() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.attest_wait_for.store(2, Ordering::SeqCst);
+        backend.prepare_delay_ms.store(100, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let first_request = bootstrap_request(1_000);
+        let mut second_request = first_request.clone();
+        second_request.host.profile_id = "profile-conflict".into();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let first = std::thread::spawn({
+            let state = state.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(first_request))
+            }
+        });
+        let second = std::thread::spawn({
+            let state = state.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(second_request))
+            }
+        });
+        barrier.wait();
+
+        let (nonce, observed, profile_id) = loop {
+            let value = state
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&session_key(HostKind::Photoshop, "retouch"))
+                .and_then(|grant| {
+                    grant.observed.clone().map(|observed| {
+                        (
+                            grant.nonce.clone(),
+                            observed,
+                            grant.request.host.profile_id.clone(),
+                        )
+                    })
+                });
+            if let Some(value) = value {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let mut claim = identity_claim();
+        claim.host.profile_id = Some(profile_id);
+        let bound = state
+            .bind_photoshop_bootstrap_claim("retouch", &caps(), Some(claim), Some(&nonce))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.host.pid, Some(observed.pid));
+        insert_identity_session(&state, "retouch", 1_720_000_000_000, Some(bound)).await;
+
+        let outcomes = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(outcomes.iter().filter(|value| value.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|value| {
+                    value
+                        .as_ref()
+                        .is_err_and(|error| error.error.code == ERROR_IDENTITY_AMBIGUOUS)
+                })
+                .count(),
+            1
+        );
+        assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_an_unobserved_profile_without_request_fallback() {
+        let backend = FakeBootstrapBackend::ready();
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(50);
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        let nonce = loop {
+            let value = state
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&session_key(HostKind::Photoshop, "retouch"))
+                .and_then(|grant| grant.observed.as_ref().map(|_| grant.nonce.clone()));
+            if let Some(value) = value {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let mut missing_profile = identity_claim();
+        missing_profile.host.profile_id = None;
+        let error = state
+            .bind_photoshop_bootstrap_claim("retouch", &caps(), Some(missing_profile), Some(&nonce))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_UNAVAILABLE);
+        assert!(error
+            .error
+            .data
+            .as_ref()
+            .is_some_and(|data| data.to_string().contains("identity.host.profileId")));
+        assert_eq!(task.await.unwrap().unwrap_err().error.code, ERROR_TIMEOUT);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn timeout_budget_starts_at_entry_and_cleans_every_mutating_phase() {
+        let attest_backend = FakeBootstrapBackend::ready();
+        attest_backend.attest_delay_ms.store(80, Ordering::SeqCst);
+        let error = bootstrap_state(attest_backend.clone())
+            .bootstrap_photoshop(bootstrap_request(50))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(attest_backend.prepares.load(Ordering::SeqCst), 0);
+        assert_eq!(attest_backend.launches.load(Ordering::SeqCst), 0);
+
+        let hash_backend = FakeBootstrapBackend::ready();
+        hash_backend
+            .executable_sha256_delay_ms
+            .store(80, Ordering::SeqCst);
+        let hash_state = bootstrap_state(hash_backend.clone());
+        insert_identity_session(
+            &hash_state,
+            "retouch",
+            1_720_000_000_000,
+            Some(identity_claim()),
+        )
+        .await;
+        let error = hash_state
+            .bootstrap_photoshop(bootstrap_request(50))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(
+            error
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("broker_attestation")
+        );
+        assert_eq!(hash_backend.prepares.load(Ordering::SeqCst), 0);
+        assert_eq!(hash_backend.launches.load(Ordering::SeqCst), 0);
+
+        let prepare_backend = FakeBootstrapBackend::ready();
+        prepare_backend.prepare_delay_ms.store(80, Ordering::SeqCst);
+        let prepare_state = bootstrap_state(prepare_backend.clone());
+        let error = prepare_state
+            .bootstrap_photoshop(bootstrap_request(50))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(prepare_backend.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(prepare_backend.launches.load(Ordering::SeqCst), 0);
+        assert_eq!(prepare_backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(prepare_backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(prepare_state.bootstrap_grants.lock().await.is_empty());
+
+        let launch_backend = FakeBootstrapBackend::ready();
+        launch_backend.launch_delay_ms.store(80, Ordering::SeqCst);
+        let launch_state = bootstrap_state(launch_backend.clone());
+        let error = launch_state
+            .bootstrap_photoshop(bootstrap_request(50))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(launch_backend.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(launch_backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(launch_backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(launch_backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(launch_state.bootstrap_grants.lock().await.is_empty());
+
+        let rollback_backend = FakeBootstrapBackend::ready();
+        rollback_backend
+            .rollback_delay_ms
+            .store(80, Ordering::SeqCst);
+        let rollback_state = bootstrap_state(rollback_backend.clone());
+        let error = rollback_state
+            .bootstrap_photoshop(bootstrap_request(50))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(rollback_backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(rollback_backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(rollback_state.bootstrap_grants.lock().await.is_empty());
+    }
+
+    #[test]
+    fn late_prepare_and_launch_failures_share_timeout_after_exact_recovery() {
+        for (stage, backend) in [
+            ("prepare", {
+                let backend = FakeBootstrapBackend::ready();
+                backend.attest_wait_for.store(2, Ordering::SeqCst);
+                backend.prepare_delay_ms.store(250, Ordering::SeqCst);
+                backend.prepare_fails.store(true, Ordering::SeqCst);
+                backend
+            }),
+            ("launch", {
+                let backend = FakeBootstrapBackend::ready();
+                backend.attest_wait_for.store(2, Ordering::SeqCst);
+                backend.launch_delay_ms.store(250, Ordering::SeqCst);
+                backend.launch_fails.store(true, Ordering::SeqCst);
+                backend
+            }),
+        ] {
+            let state = bootstrap_state(backend.clone());
+            let outcomes =
+                run_simultaneous_bootstraps_without_session(&state, &bootstrap_request(200));
+            let errors = outcomes
+                .into_iter()
+                .map(Result::unwrap_err)
+                .collect::<Vec<_>>();
+            assert_eq!(errors[0].error.code, ERROR_TIMEOUT, "{stage}");
+            assert_eq!(errors[1].error.code, errors[0].error.code, "{stage}");
+            assert_eq!(errors[1].error.data, errors[0].error.data, "{stage}");
+            assert_eq!(
+                errors[0]
+                    .error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data["stage"].as_str()),
+                Some(stage)
+            );
+            assert_eq!(backend.prepares.load(Ordering::SeqCst), 1, "{stage}");
+            assert_eq!(
+                backend.launches.load(Ordering::SeqCst),
+                usize::from(stage == "launch"),
+                "{stage}"
+            );
+            assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1, "{stage}");
+            assert_eq!(backend.config_state.load(Ordering::SeqCst), 1, "{stage}");
+            assert!(state.bootstrap_grants.blocking_lock().is_empty(), "{stage}");
+            assert!(
+                state.bootstrap_receipts.blocking_lock().is_empty(),
+                "{stage}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_failure_takes_precedence_over_a_latched_timeout_for_all_waiters() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.attest_wait_for.store(2, Ordering::SeqCst);
+        backend.launch_delay_ms.store(250, Ordering::SeqCst);
+        backend.rollback_fails.store(true, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let outcomes = run_simultaneous_bootstraps_without_session(&state, &bootstrap_request(200));
+        let errors = outcomes
+            .into_iter()
+            .map(Result::unwrap_err)
+            .collect::<Vec<_>>();
+        assert_eq!(errors[0].error.code, ERROR_IDENTITY_STALE);
+        assert_eq!(errors[1].error.code, errors[0].error.code);
+        assert_eq!(errors[1].error.data, errors[0].error.data);
+        assert_eq!(
+            errors[0]
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("recovery")
+        );
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 2);
+        assert!(state.bootstrap_grants.blocking_lock().is_empty());
+        assert!(state.bootstrap_receipts.blocking_lock().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abort_after_prepare_rolls_back_once_and_removes_the_grant() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.launch_delay_ms.store(250, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(bootstrap_request(1_000)).await }
+        });
+        while backend.config_state.load(Ordering::SeqCst) != 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 2);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.rollbacks.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled transaction must finish rollback");
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn owner_cancellation_rolls_back_before_releasing_identical_waiters() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.launch_delay_ms.store(250, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(1_000);
+        let owner = tokio::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        while backend.config_state.load(Ordering::SeqCst) != 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let waiter = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        loop {
+            let receivers = state
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&session_key(HostKind::Photoshop, "retouch"))
+                .map(|grant| grant.completion.receiver_count())
+                .unwrap_or_default();
+            if receivers == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        let error = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter must be released after cancellation cleanup")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+        assert_eq!(
+            error
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("cancellation")
+        );
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
     }
 
     #[tokio::test]
