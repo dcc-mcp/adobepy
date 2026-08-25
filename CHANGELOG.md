@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.7.0...adobepy-v0.8.0) (2026-08-25)
+
+
+### Features
+
+* add bounded Photoshop UXP bootstrap ([67bbfee](https://github.com/dcc-mcp/adobepy/commit/67bbfeef3b976d6fc8f96aa3448431cbf8b5d678))
+
+
+### Bug Fixes
+
+* bound Photoshop bootstrap follower deadlines ([efe5310](https://github.com/dcc-mcp/adobepy/commit/efe53106c6e70cfbb948d0ee7b86667353da506d))
+* harden Photoshop bootstrap transaction ([eb6d449](https://github.com/dcc-mcp/adobepy/commit/eb6d44984113eb11b6de9c1f965938505cd723ea))
+
 ## [0.7.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.6.2...adobepy-v0.7.0) (2026-08-24)
 
 
