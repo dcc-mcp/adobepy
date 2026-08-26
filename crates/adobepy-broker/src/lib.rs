@@ -2723,17 +2723,15 @@ mod tests {
         }
     }
 
-    fn run_simultaneous_bootstraps_without_session(
+    fn run_owner_then_follower_without_session(
         state: &BrokerState,
         request: &PhotoshopBootstrapRequest,
+        owner_phase_entries: &AtomicUsize,
     ) -> [BootstrapResult; 2] {
-        let barrier = Arc::new(std::sync::Barrier::new(3));
-        let first = std::thread::spawn({
+        let owner = std::thread::spawn({
             let state = state.clone();
             let request = request.clone();
-            let barrier = barrier.clone();
             move || {
-                barrier.wait();
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -2741,12 +2739,19 @@ mod tests {
                     .block_on(state.bootstrap_photoshop(request))
             }
         });
-        let second = std::thread::spawn({
+        let owner_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while owner_phase_entries.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < owner_deadline,
+                "the bootstrap owner must enter the delayed phase"
+            );
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let follower = std::thread::spawn({
             let state = state.clone();
             let request = request.clone();
-            let barrier = barrier.clone();
             move || {
-                barrier.wait();
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -2754,8 +2759,7 @@ mod tests {
                     .block_on(state.bootstrap_photoshop(request))
             }
         });
-        barrier.wait();
-        [first.join().unwrap(), second.join().unwrap()]
+        [owner.join().unwrap(), follower.join().unwrap()]
     }
 
     fn request() -> RpcRequest {
@@ -2825,39 +2829,31 @@ mod tests {
     }
 
     async fn publish_matching_bootstrap_session(state: &BrokerState) -> ObservedHostProcess {
-        let (nonce, observed) = tokio::time::timeout(Duration::from_secs(2), async {
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let value = state
+                let observed = state
                     .bootstrap_grants
                     .lock()
                     .await
-                    .get(&session_key(HostKind::Photoshop, "retouch"))
+                    .get_mut(&session_key(HostKind::Photoshop, "retouch"))
                     .and_then(|grant| {
-                        grant
-                            .observed
-                            .clone()
-                            .map(|observed| (grant.nonce.clone(), observed))
+                        let observed = grant.observed.clone()?;
+                        grant.nonce_claimed = true;
+                        Some(observed)
                     });
-                if let Some(value) = value {
-                    return value;
+                if let Some(observed) = observed {
+                    return observed;
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
         .expect("bootstrap owner must publish its observed process");
-        let bound = state
-            .bind_photoshop_bootstrap_claim(
-                "retouch",
-                &caps(),
-                Some(identity_claim()),
-                Some(&nonce),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(bound.host.pid, Some(observed.pid));
-        insert_identity_session(state, "retouch", 1_720_000_000_000, Some(bound)).await;
+        let mut identity = identity_claim();
+        identity.host.pid = Some(observed.pid);
+        identity.host.process_start_identity = Some(observed.process_start_identity.clone());
+        identity.host.executable_path = Some(observed.executable_path.clone());
+        insert_identity_session(state, "retouch", 1_720_000_000_000, Some(identity)).await;
         observed
     }
 
@@ -3604,18 +3600,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn late_finalize_failure_is_one_timeout_outcome_for_owner_and_waiter() {
         let backend = FakeBootstrapBackend::ready();
-        backend.attest_wait_for.store(2, Ordering::SeqCst);
         backend.finalize_delay_ms.store(250, Ordering::SeqCst);
         backend.finalize_fails.store(true, Ordering::SeqCst);
         let state = bootstrap_state(backend.clone());
         let request = bootstrap_request(200);
-        let barrier = Arc::new(std::sync::Barrier::new(3));
-        let first = std::thread::spawn({
+        let owner = std::thread::spawn({
             let state = state.clone();
             let request = request.clone();
-            let barrier = barrier.clone();
             move || {
-                barrier.wait();
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -3623,23 +3615,29 @@ mod tests {
                     .block_on(state.bootstrap_photoshop(request))
             }
         });
-        let second = std::thread::spawn({
-            let state = state.clone();
-            let barrier = barrier.clone();
-            move || {
-                barrier.wait();
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(state.bootstrap_photoshop(request))
-            }
-        });
-        barrier.wait();
 
         publish_matching_bootstrap_session(&state).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.finalizes.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the bootstrap owner must enter finalize");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let follower = std::thread::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
 
-        let outcomes = [first.join().unwrap(), second.join().unwrap()];
+        let outcomes = [owner.join().unwrap(), follower.join().unwrap()];
         let errors = outcomes
             .into_iter()
             .map(Result::unwrap_err)
@@ -3657,7 +3655,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         stages.sort_unstable();
-        assert_eq!(stages, ["commit", "transaction"]);
+        assert_eq!(stages, ["commit", "commit"]);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
         assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
         assert!(state.bootstrap_grants.lock().await.is_empty());
@@ -4047,22 +4045,28 @@ mod tests {
         for (stage, backend) in [
             ("prepare", {
                 let backend = FakeBootstrapBackend::ready();
-                backend.attest_wait_for.store(2, Ordering::SeqCst);
                 backend.prepare_delay_ms.store(250, Ordering::SeqCst);
                 backend.prepare_fails.store(true, Ordering::SeqCst);
                 backend
             }),
             ("launch", {
                 let backend = FakeBootstrapBackend::ready();
-                backend.attest_wait_for.store(2, Ordering::SeqCst);
                 backend.launch_delay_ms.store(250, Ordering::SeqCst);
                 backend.launch_fails.store(true, Ordering::SeqCst);
                 backend
             }),
         ] {
             let state = bootstrap_state(backend.clone());
-            let outcomes =
-                run_simultaneous_bootstraps_without_session(&state, &bootstrap_request(200));
+            let phase_entries = if stage == "prepare" {
+                &backend.prepares
+            } else {
+                &backend.launches
+            };
+            let outcomes = run_owner_then_follower_without_session(
+                &state,
+                &bootstrap_request(200),
+                phase_entries,
+            );
             let errors = outcomes
                 .into_iter()
                 .map(Result::unwrap_err)
@@ -4083,7 +4087,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             stages.sort_unstable();
-            assert_eq!(stages, [stage, "transaction"], "{stage}");
+            assert_eq!(stages, [stage, stage], "{stage}");
             assert_eq!(backend.prepares.load(Ordering::SeqCst), 1, "{stage}");
             assert_eq!(
                 backend.launches.load(Ordering::SeqCst),
@@ -4179,7 +4183,13 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         tokio::time::timeout(Duration::from_secs(2), async {
-            while backend.rollbacks.load(Ordering::SeqCst) == 0 {
+            loop {
+                let rollback_finished = backend.rollbacks.load(Ordering::SeqCst) == 1
+                    && backend.config_state.load(Ordering::SeqCst) == 1;
+                let grant_removed = state.bootstrap_grants.lock().await.is_empty();
+                if rollback_finished && grant_removed {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
