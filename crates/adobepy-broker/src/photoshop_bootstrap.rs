@@ -3,7 +3,7 @@ use anyhow::{anyhow, Context};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::bootstrap_transaction::{
-    ConfigLease, ConfigTransactionOwner, FileReceipt, HostProcessBroker, OwnedHostProcess,
-    StagedArtifact,
+    read_bounded_sync, same_file_identity, ConfigLease, ConfigTransactionOwner, FileReceipt,
+    HostProcessBroker, OwnedHostProcess, StagedArtifact,
 };
 
 const MAX_HASH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -362,7 +362,11 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
         }
         let owned = self
             .host_owner
-            .spawn(Path::new(&target.executable_path), &self.launch_arguments)
+            .spawn_cancelable(
+                Path::new(&target.executable_path),
+                &self.launch_arguments,
+                cancelled.clone(),
+            )
             .map_err(anyhow::Error::from)?;
         let deadline = Instant::now() + Duration::from_secs(2);
         let observed = loop {
@@ -558,17 +562,21 @@ fn stable_file_bytes(path: &Path, maximum: u64) -> std::io::Result<Vec<u8>> {
     if !before.is_file() || before.len() == 0 || before.len() > maximum {
         return Err(std::io::Error::other("file is empty or unbounded"));
     }
-    let capacity =
-        usize::try_from(before.len()).map_err(|_| std::io::Error::other("file is too large"))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.read_to_end(&mut bytes)?;
+    let bytes = read_bounded_sync(&mut file, maximum)?;
     let handle_after = file.metadata()?;
-    let path_after = fs::metadata(path)?;
+    ensure_no_redirects(path)?;
+    let path_after = fs::symlink_metadata(path)?;
+    let path_after_handle = fs::File::open(path)?;
     if before.len() != handle_after.len()
         || before.modified()? != handle_after.modified()?
         || before.len() != path_after.len()
         || before.modified()? != path_after.modified()?
-        || bytes.len() != capacity
+        || path_after.file_type().is_symlink()
+        || is_windows_reparse(&path_after)
+        || !same_file_identity(&file, &path_after_handle)
+            .map_err(|_| std::io::Error::other("file identity is unavailable"))?
+        || u64::try_from(bytes.len()).map_err(|_| std::io::Error::other("file is too large"))?
+            != before.len()
     {
         return Err(std::io::Error::other("file changed during attestation"));
     }
@@ -905,6 +913,56 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    #[ignore = "launched only by the nested owned-host integration regression"]
+    fn nested_owned_host_descendant_fixture() {
+        std::thread::sleep(Duration::from_secs(10));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "launched only by the nested owned-host integration regression"]
+    fn nested_owned_host_parent_fixture() {
+        let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "photoshop_bootstrap::tests::nested_owned_host_descendant_fixture",
+                "--nocapture",
+            ])
+            .spawn()
+            .unwrap();
+        let marker =
+            std::env::temp_dir().join(format!("adobepy-owned-host-{}.ready", std::process::id()));
+        fs::write(&marker, descendant.id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_secs(10));
+        let _ = descendant.kill();
+        let _ = descendant.wait();
+        let _ = fs::remove_file(marker);
+    }
+
+    #[cfg(windows)]
+    fn terminate_test_process(pid: u32) {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+            fn TerminateProcess(process: isize, exit_code: u32) -> i32;
+            fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
+            fn CloseHandle(handle: isize) -> i32;
+        }
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let process = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid) };
+        if process != 0 {
+            unsafe {
+                TerminateProcess(process, 1);
+                WaitForSingleObject(process, 2000);
+                CloseHandle(process);
+            }
+        }
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn public_system_launch_retains_and_reaps_the_original_process_owner() {
         let root = std::env::current_dir()
@@ -949,5 +1007,89 @@ mod tests {
         );
 
         fs::remove_dir_all(root.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn public_cancel_after_spawn_reaps_the_original_process_and_its_descendant() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("owned-public-cancel-{}", Uuid::new_v4().simple()))
+            .join("Adobe Photoshop Test");
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("Photoshop.exe");
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let bytes = fs::metadata(&executable).unwrap().len();
+        let sha256 = digest_file(&executable).unwrap();
+        let backend = Arc::new(SystemPhotoshopBootstrapBackend::with_launch_arguments(
+            vec![
+                "--ignored".into(),
+                "--exact".into(),
+                "photoshop_bootstrap::tests::nested_owned_host_parent_fixture".into(),
+                "--nocapture".into(),
+            ],
+        ));
+        let target = PhotoshopHostTarget {
+            executable_path: executable.to_string_lossy().into_owned(),
+            executable_bytes: bytes,
+            executable_sha256: sha256,
+            host_version: "test".into(),
+            profile_id: "test".into(),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let hook_cancelled = cancelled.clone();
+        let nested_pid = Arc::new(Mutex::new(None));
+        let hook_nested_pid = nested_pid.clone();
+        let nested_marker = Arc::new(Mutex::new(None));
+        let hook_nested_marker = nested_marker.clone();
+        crate::bootstrap_transaction::set_after_host_spawn(
+            fs::canonicalize(&executable).unwrap(),
+            move |parent_pid| {
+                let marker =
+                    std::env::temp_dir().join(format!("adobepy-owned-host-{parent_pid}.ready"));
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !marker.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let pid = fs::read_to_string(&marker)
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap();
+                *hook_nested_pid.lock().unwrap() = Some(pid);
+                *hook_nested_marker.lock().unwrap() = Some(marker);
+                hook_cancelled.store(true, Ordering::SeqCst);
+            },
+        );
+
+        let launch_backend = backend.clone();
+        let launch =
+            tokio::task::spawn_blocking(move || launch_backend.launch_owned(&target, cancelled))
+                .await
+                .unwrap();
+        let descendant_pid = nested_pid.lock().unwrap().unwrap();
+        let quiesced = backend
+            .host_owner
+            .quiesce(tokio::time::Instant::now() + Duration::from_millis(500))
+            .await;
+        let descendant_was_alive = observe_process(descendant_pid).is_ok();
+        if descendant_was_alive {
+            terminate_test_process(descendant_pid);
+        }
+        if let Some(marker) = nested_marker.lock().unwrap().take() {
+            let _ = fs::remove_file(marker);
+        }
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+
+        assert!(
+            launch.is_err(),
+            "cancellation did not reject the public launch"
+        );
+        assert!(quiesced, "post-spawn failure lost broker reap ownership");
+        assert!(
+            !descendant_was_alive,
+            "a descendant escaped before Windows Job ownership was established"
+        );
     }
 }

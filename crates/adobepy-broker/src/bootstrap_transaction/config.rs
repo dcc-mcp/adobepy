@@ -1,10 +1,10 @@
-use super::is_windows_reparse;
+use super::{is_windows_reparse, read_bounded_sync};
 use anyhow::{anyhow, Context};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
@@ -17,10 +17,21 @@ type ActivateHook = Box<dyn FnOnce() + Send>;
 #[cfg(test)]
 static BEFORE_ACTIVATE_WRITE: LazyLock<Mutex<HashMap<PathBuf, ActivateHook>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static AFTER_RECEIPT_METADATA: LazyLock<Mutex<HashMap<PathBuf, ActivateHook>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
 pub(crate) fn set_before_activate_write(path: PathBuf, intervene: impl FnOnce() + Send + 'static) {
     BEFORE_ACTIVATE_WRITE
+        .lock()
+        .unwrap()
+        .insert(path, Box::new(intervene));
+}
+
+#[cfg(test)]
+fn set_after_receipt_metadata(path: PathBuf, intervene: impl FnOnce() + Send + 'static) {
+    AFTER_RECEIPT_METADATA
         .lock()
         .unwrap()
         .insert(path, Box::new(intervene));
@@ -62,6 +73,10 @@ impl FileReceipt {
                 "configuration identity is not a bounded regular file"
             ));
         }
+        #[cfg(test)]
+        if let Some(hook) = AFTER_RECEIPT_METADATA.lock().unwrap().remove(&path) {
+            hook();
+        }
         let handle_identity = file_identity(&file)?;
         let path_handle = fs::File::open(&path)?;
         let path_identity = file_identity(&path_handle)?;
@@ -69,13 +84,16 @@ impl FileReceipt {
             return Err(anyhow!("configuration path changed before capture"));
         }
         let mut reader = file;
-        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len())?);
-        reader.read_to_end(&mut bytes)?;
+        let bytes = read_bounded_sync(&mut reader, MAX_CONFIG_BYTES)?;
         let handle_after = reader.metadata()?;
+        ensure_no_redirects_to_parent(&path)?;
         let path_after = fs::symlink_metadata(&path)?;
         let path_after_handle = fs::File::open(&path)?;
         if file_identity(&reader)? != handle_identity
             || file_identity(&path_after_handle)? != handle_identity
+            || !path_after.is_file()
+            || path_after.file_type().is_symlink()
+            || is_windows_reparse(&path_after)
             || handle_after.len() != u64::try_from(bytes.len())?
             || path_after.len() != u64::try_from(bytes.len())?
         {
@@ -770,6 +788,32 @@ fn remove_owned_config_platform(file: fs::File, path: &Path) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_rejects_same_identity_growth_beyond_the_bound_after_metadata() {
+        let root =
+            std::env::temp_dir().join(format!("adobepy-config-growth-{}", Uuid::new_v4().simple()));
+        fs::create_dir(&root).unwrap();
+        let config = root.join("config.js");
+        fs::write(&config, b"x").unwrap();
+        let grow_path = config.clone();
+        set_after_receipt_metadata(config.clone(), move || {
+            let mut file = fs::OpenOptions::new().append(true).open(grow_path).unwrap();
+            file.write_all(&vec![b'y'; (MAX_CONFIG_BYTES as usize) + 1])
+                .unwrap();
+            file.sync_all().unwrap();
+        });
+
+        let result = FileReceipt::capture(&config);
+        let final_len = fs::metadata(&config).unwrap().len();
+        fs::remove_dir_all(root).unwrap();
+
+        assert!(final_len > MAX_CONFIG_BYTES);
+        assert!(
+            result.is_err(),
+            "same-identity growth bypassed the configured receipt bound"
+        );
+    }
 
     #[test]
     fn activate_rejects_an_identity_swap_after_the_final_recapture() {
