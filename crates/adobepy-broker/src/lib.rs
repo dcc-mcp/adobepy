@@ -1,13 +1,17 @@
 use adobepy_protocol::{
-    session_key, BootstrapBrokerBinding, BootstrapHostBinding, BootstrapPluginBinding,
-    BridgeIdentityClaim, BridgeInbound, BridgeOutbound, BridgeRuntimeIdentity, BridgeSessionInfo,
-    BrokerRuntimeIdentity, HostKind, HostRuntimeIdentity, PhotoshopBootstrapContinuation,
+    session_key, BootstrapAdapterContinuation, BootstrapBrokerBinding, BootstrapHostBinding,
+    BootstrapPluginBinding, BridgeIdentityClaim, BridgeInbound, BridgeOutbound,
+    BridgeRuntimeIdentity, BridgeSessionInfo, BrokerRuntimeIdentity, HostKind, HostRuntimeIdentity,
+    IllustratorBootstrapContinuation, IllustratorBootstrapRequest, IllustratorBootstrapResult,
+    IllustratorBootstrapStatus, IllustratorBootstrapVerifyRequest, IllustratorBrokerBinding,
+    IllustratorHostBinding, IllustratorPluginBinding, PhotoshopBootstrapContinuation,
     PhotoshopBootstrapRequest, PhotoshopBootstrapResult, PhotoshopBootstrapStatus,
-    PhotoshopBootstrapVerifyRequest, RequestId, RpcErrorResponse, RpcRequest, RpcResponse,
-    RuntimeIdentityAttestation, RuntimeIdentityQuery, DEFAULT_TARGET, ERROR_BRIDGE_NOT_INSTALLED,
-    ERROR_CAPABILITY, ERROR_IDENTITY_AMBIGUOUS, ERROR_IDENTITY_MISMATCH, ERROR_IDENTITY_STALE,
-    ERROR_IDENTITY_UNAVAILABLE, ERROR_INVALID_REQUEST, ERROR_PARSE, ERROR_SERIALIZATION,
-    ERROR_TIMEOUT, ERROR_UNAUTHORIZED, JSONRPC_VERSION, PHOTOSHOP_BOOTSTRAP_VERSION,
+    PhotoshopBootstrapVerifyRequest, PhotoshopHostTarget, PhotoshopPluginTarget, RequestId,
+    RpcErrorResponse, RpcRequest, RpcResponse, RuntimeIdentityAttestation, RuntimeIdentityQuery,
+    DEFAULT_TARGET, ERROR_BRIDGE_NOT_INSTALLED, ERROR_CAPABILITY, ERROR_IDENTITY_AMBIGUOUS,
+    ERROR_IDENTITY_MISMATCH, ERROR_IDENTITY_STALE, ERROR_IDENTITY_UNAVAILABLE,
+    ERROR_INVALID_REQUEST, ERROR_PARSE, ERROR_SERIALIZATION, ERROR_TIMEOUT, ERROR_UNAUTHORIZED,
+    ILLUSTRATOR_BOOTSTRAP_VERSION, JSONRPC_VERSION, PHOTOSHOP_BOOTSTRAP_VERSION,
     RUNTIME_IDENTITY_VERSION,
 };
 use anyhow::{anyhow, Context};
@@ -39,7 +43,8 @@ mod photoshop_bootstrap;
 use photoshop_bootstrap::PreparedBootstrap;
 use photoshop_bootstrap::{
     LaunchedHostProcess, ObservedHostProcess, PhotoshopBootstrapBackend,
-    PhotoshopBootstrapTransaction, SystemPhotoshopBootstrapBackend,
+    PhotoshopBootstrapTransaction, SystemIllustratorBootstrapBackend,
+    SystemPhotoshopBootstrapBackend,
 };
 #[cfg(test)]
 use photoshop_bootstrap::{
@@ -49,6 +54,7 @@ use photoshop_bootstrap::{
 type DispatchResult = Result<RpcResponse, Box<RpcErrorResponse>>;
 type ValidationResult = Result<(), Box<RpcErrorResponse>>;
 type BootstrapResult = Result<PhotoshopBootstrapResult, Box<RpcErrorResponse>>;
+type IllustratorResult = Result<IllustratorBootstrapResult, Box<RpcErrorResponse>>;
 
 const BOOTSTRAP_BLOCKING_CAPACITY: usize = 2;
 const BOOTSTRAP_BLOCKING_QUEUE: usize = 2;
@@ -343,6 +349,7 @@ struct BootstrapTransactionGuard {
     key: String,
     grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
     blocking: BootstrapBlockingBoundary,
+    product: &'static str,
     armed: bool,
 }
 
@@ -351,11 +358,13 @@ impl BootstrapTransactionGuard {
         key: String,
         grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
         blocking: BootstrapBlockingBoundary,
+        product: &'static str,
     ) -> Self {
         Self {
             key,
             grants,
             blocking,
+            product,
             armed: true,
         }
     }
@@ -374,9 +383,10 @@ impl Drop for BootstrapTransactionGuard {
         let key = self.key.clone();
         let grants = self.grants.clone();
         let blocking = self.blocking.clone();
+        let product = self.product;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                cancel_bootstrap_grant(grants, &key, blocking).await;
+                cancel_bootstrap_grant(grants, &key, blocking, product).await;
             });
         }
     }
@@ -386,6 +396,7 @@ async fn cancel_bootstrap_grant(
     grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
     key: &str,
     blocking: BootstrapBlockingBoundary,
+    product: &str,
 ) {
     let (transaction, launched) = {
         let mut grants = grants.lock().await;
@@ -416,11 +427,13 @@ async fn cancel_bootstrap_grant(
         false
     };
     let error = if rollback_failed || host_failed {
-        bootstrap_recovery_error("cancelled Photoshop bootstrap state could not be recovered")
+        bootstrap_recovery_error(&format!(
+            "cancelled {product} bootstrap state could not be recovered"
+        ))
     } else {
         identity_error(
             ERROR_IDENTITY_STALE,
-            "Photoshop bootstrap transaction was cancelled",
+            &format!("{product} bootstrap transaction was cancelled"),
             json!({"stage": "cancellation"}),
         )
     };
@@ -435,6 +448,13 @@ async fn cancel_bootstrap_grant(
 struct BootstrapReceipt {
     identity: RuntimeIdentityAttestation,
     result: PhotoshopBootstrapResult,
+    expires_at_epoch_ms: u128,
+}
+
+#[derive(Clone)]
+struct IllustratorBootstrapReceipt {
+    identity: RuntimeIdentityAttestation,
+    result: IllustratorBootstrapResult,
     expires_at_epoch_ms: u128,
 }
 
@@ -468,20 +488,40 @@ struct BrokerState {
     broker_identity: Arc<BrokerRuntimeIdentity>,
     bootstrap_backend: Arc<dyn PhotoshopBootstrapBackend>,
     bootstrap_blocking: BootstrapBlockingBoundary,
+    illustrator_bootstrap_backend: Arc<dyn PhotoshopBootstrapBackend>,
     bootstrap_grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
     bootstrap_owned_hosts: Arc<Mutex<HashMap<String, LaunchedHostProcess>>>,
     bootstrap_receipts: Arc<Mutex<HashMap<String, BootstrapReceipt>>>,
+    illustrator_bootstrap_receipts: Arc<Mutex<HashMap<String, IllustratorBootstrapReceipt>>>,
     photoshop_websocket_url: String,
+    illustrator_websocket_url: String,
 }
 
 impl BrokerState {
     fn new(config: &BrokerConfig) -> anyhow::Result<Self> {
-        Self::with_bootstrap_backend(config, Arc::new(SystemPhotoshopBootstrapBackend::default()))
+        Self::with_bootstrap_backends(
+            config,
+            Arc::new(SystemPhotoshopBootstrapBackend::default()),
+            Arc::new(SystemIllustratorBootstrapBackend::default()),
+        )
     }
 
+    #[cfg(test)]
     fn with_bootstrap_backend(
         config: &BrokerConfig,
         bootstrap_backend: Arc<dyn PhotoshopBootstrapBackend>,
+    ) -> anyhow::Result<Self> {
+        Self::with_bootstrap_backends(
+            config,
+            bootstrap_backend,
+            Arc::new(SystemIllustratorBootstrapBackend::default()),
+        )
+    }
+
+    fn with_bootstrap_backends(
+        config: &BrokerConfig,
+        bootstrap_backend: Arc<dyn PhotoshopBootstrapBackend>,
+        illustrator_bootstrap_backend: Arc<dyn PhotoshopBootstrapBackend>,
     ) -> anyhow::Result<Self> {
         let host = match config.bind.ip() {
             std::net::IpAddr::V4(address) if address.is_loopback() => address.to_string(),
@@ -504,11 +544,17 @@ impl BrokerState {
             broker_identity: Arc::new(capture_broker_identity()?),
             bootstrap_backend,
             bootstrap_blocking: BootstrapBlockingBoundary::default(),
+            illustrator_bootstrap_backend,
             bootstrap_grants: Arc::new(Mutex::new(HashMap::new())),
             bootstrap_owned_hosts: Arc::new(Mutex::new(HashMap::new())),
             bootstrap_receipts: Arc::new(Mutex::new(HashMap::new())),
+            illustrator_bootstrap_receipts: Arc::new(Mutex::new(HashMap::new())),
             photoshop_websocket_url: format!(
                 "ws://{host}:{}/v1/bridge/photoshop/ws",
+                config.bind.port()
+            ),
+            illustrator_websocket_url: format!(
+                "ws://{host}:{}/v1/bridge/illustrator/ws",
                 config.bind.port()
             ),
         })
@@ -807,6 +853,7 @@ impl BrokerState {
             key.clone(),
             self.bootstrap_grants.clone(),
             self.bootstrap_blocking.clone(),
+            "Photoshop",
         );
 
         let owner_result: BootstrapResult = async {
@@ -1110,6 +1157,755 @@ impl BrokerState {
         final_result
     }
 
+    async fn bootstrap_illustrator(
+        &self,
+        request: IllustratorBootstrapRequest,
+    ) -> IllustratorResult {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(request.timeout_ms);
+        validate_illustrator_bootstrap_request(&request)?;
+        let backend_request = illustrator_backend_request(&request);
+        let attestation = {
+            let backend = self.illustrator_bootstrap_backend.clone();
+            let backend_request = backend_request.clone();
+            self.bootstrap_blocking
+                .execute(deadline, move || backend.attest(&backend_request))
+                .await
+        };
+        let attestation = match attestation {
+            Err(BlockingBoundaryError::TimedOut) => {
+                return Err(illustrator_bootstrap_timeout_error(&request, "attestation"));
+            }
+            Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                Err(anyhow!("Illustrator attestation worker failed closed"))
+            }
+            Ok(attestation) => attestation,
+        };
+        let module_sha256 = attestation.map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_UNAVAILABLE,
+                    "the authenticated Illustrator product or fixed CEP bridge is unavailable",
+                    json!({"stage": "attestation"}),
+                )
+            })?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(illustrator_bootstrap_timeout_error(&request, "attestation"));
+        }
+        let key = session_key(HostKind::Illustrator, &request.target);
+        if self.sessions.read().await.contains_key(&key) {
+            let identity = self
+                .runtime_identity(RuntimeIdentityQuery {
+                    host: HostKind::Illustrator,
+                    target: Some(request.target.clone()),
+                    expected: None,
+                })
+                .await?;
+            self.validate_illustrator_bootstrap_identity(&request, &identity, None)?;
+            return self
+                .record_illustrator_bootstrap_result(
+                    identity,
+                    &request,
+                    &module_sha256,
+                    IllustratorBootstrapStatus::AlreadyReady,
+                    deadline,
+                    None,
+                )
+                .await;
+        }
+
+        let nonce = random_nonce();
+        {
+            let mut grants = self.bootstrap_grants.lock().await;
+            if grants.contains_key(&key) {
+                return Err(identity_error(
+                    ERROR_IDENTITY_AMBIGUOUS,
+                    "an Illustrator bootstrap is already active for this target",
+                    json!({"target": request.target}),
+                ));
+            }
+            let (completion, _) = watch::channel::<Option<BootstrapResult>>(None);
+            grants.insert(
+                key.clone(),
+                BootstrapGrant {
+                    request: backend_request.clone(),
+                    nonce: nonce.clone(),
+                    nonce_claimed: false,
+                    observed: None,
+                    launched: None,
+                    launch_cancelled: Arc::new(AtomicBool::new(false)),
+                    module_sha256: module_sha256.clone(),
+                    transaction: None,
+                    completion,
+                },
+            );
+        }
+        let mut transaction_guard = BootstrapTransactionGuard::new(
+            key.clone(),
+            self.bootstrap_grants.clone(),
+            self.bootstrap_blocking.clone(),
+            "Illustrator",
+        );
+
+        let owner_result: IllustratorResult = async {
+            let prepared = {
+                let backend = self.illustrator_bootstrap_backend.clone();
+                let backend_request = backend_request.clone();
+                let nonce = nonce.clone();
+                let token = self.token.clone();
+                let websocket_url = self.illustrator_websocket_url.clone();
+                self.bootstrap_blocking
+                    .execute(deadline, move || {
+                        backend.prepare(&backend_request, &nonce, &token, &websocket_url)
+                    })
+                    .await
+            };
+            let prepared = match prepared {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    return Err(illustrator_bootstrap_timeout_error(&request, "prepare"));
+                }
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    Err(anyhow!("Illustrator preparation worker failed closed"))
+                }
+                Ok(prepared) => prepared,
+            }
+            .map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_UNAVAILABLE,
+                    "the fixed Illustrator CEP bridge could not be prepared",
+                    json!({"stage": "prepare"}),
+                )
+            })?;
+            let ownership_cancelled = Arc::new(AtomicBool::new(false));
+            let transaction = {
+                let backend = self.illustrator_bootstrap_backend.clone();
+                let ownership_cancelled = ownership_cancelled.clone();
+                self.bootstrap_blocking
+                    .execute(deadline, move || {
+                        let transaction = backend.begin_transaction(prepared)?;
+                        if ownership_cancelled.load(Ordering::SeqCst) {
+                            transaction.revoke();
+                            transaction.rollback()?;
+                            return Err(anyhow!("Illustrator transaction ownership was revoked"));
+                        }
+                        Ok(transaction)
+                    })
+                    .await
+            };
+            let transaction = match transaction {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    ownership_cancelled.store(true, Ordering::SeqCst);
+                    return Err(illustrator_bootstrap_timeout_error(
+                        &request,
+                        "transaction_ownership",
+                    ));
+                }
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    ownership_cancelled.store(true, Ordering::SeqCst);
+                    Err(anyhow!("Illustrator transaction ownership worker failed closed"))
+                }
+                Ok(transaction) => transaction,
+            }
+            .map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_UNAVAILABLE,
+                    "the fixed Illustrator CEP bridge transaction could not be owned",
+                    json!({"stage": "transaction_ownership"}),
+                )
+            })?;
+            let inserted = {
+                let mut grants = self.bootstrap_grants.lock().await;
+                if let Some(grant) = grants.get_mut(&key) {
+                    grant.module_sha256 = transaction.module_sha256().to_owned();
+                    grant.transaction = Some(transaction.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+            if !inserted {
+                transaction.revoke();
+                let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+                let _ = self
+                    .bootstrap_blocking
+                    .execute_cleanup(cleanup_deadline, move || transaction.rollback())
+                    .await;
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap reservation was cancelled",
+                    json!({"stage": "prepare"}),
+                ));
+            }
+            let activation = {
+                let transaction = transaction.clone();
+                self.bootstrap_blocking
+                    .execute(deadline, move || transaction.activate())
+                    .await
+            };
+            let activation = match activation {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    transaction.revoke();
+                    return Err(illustrator_bootstrap_timeout_error(
+                        &request,
+                        "prepare_activation",
+                    ));
+                }
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    transaction.revoke();
+                    Err(anyhow!("Illustrator activation worker failed closed"))
+                }
+                Ok(activation) => activation,
+            };
+            activation.map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_UNAVAILABLE,
+                    "the fixed Illustrator CEP bridge could not be activated",
+                    json!({"stage": "prepare_activation"}),
+                )
+            })?;
+            if tokio::time::Instant::now() >= deadline {
+                transaction.revoke();
+                return Err(illustrator_bootstrap_timeout_error(
+                    &request,
+                    "prepare_activation",
+                ));
+            }
+            let launch_cancelled = {
+                let grants = self.bootstrap_grants.lock().await;
+                grants
+                    .get(&key)
+                    .map(|grant| grant.launch_cancelled.clone())
+                    .ok_or_else(|| {
+                        identity_error(
+                            ERROR_IDENTITY_STALE,
+                            "Illustrator bootstrap reservation was cancelled",
+                            json!({"stage": "launch"}),
+                        )
+                    })?
+            };
+            let launched = {
+                let backend = self.illustrator_bootstrap_backend.clone();
+                let target = backend_request.host.clone();
+                let launch_cancelled = launch_cancelled.clone();
+                self.bootstrap_blocking
+                    .execute(deadline, move || backend.launch_owned(&target, launch_cancelled))
+                    .await
+            };
+            let launched = match launched {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    launch_cancelled.store(true, Ordering::SeqCst);
+                    return Err(illustrator_bootstrap_timeout_error(&request, "launch"));
+                }
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    launch_cancelled.store(true, Ordering::SeqCst);
+                    Err(anyhow!("Illustrator launch worker failed closed"))
+                }
+                Ok(launched) => launched,
+            };
+            let launched = launched.map_err(|_| {
+                    identity_error(
+                        ERROR_IDENTITY_UNAVAILABLE,
+                        "the selected Illustrator instance could not be launched",
+                        json!({"stage": "launch"}),
+                    )
+                })?;
+            let mut launched = Some(launched);
+            let inserted_launch = {
+                let mut grants = self.bootstrap_grants.lock().await;
+                if let Some(grant) = grants.get_mut(&key) {
+                    let launched = launched.take().expect("launched host is present");
+                    grant.observed = Some(launched.observed.clone());
+                    grant.launched = Some(launched);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !inserted_launch {
+                let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+                let _ = launched
+                    .take()
+                    .expect("unclaimed launched host is present")
+                    .terminate_and_reap(cleanup_deadline)
+                    .await;
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap reservation was cancelled",
+                    json!({"stage": "launch"}),
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(illustrator_bootstrap_timeout_error(&request, "launch"));
+            }
+
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(illustrator_bootstrap_timeout_error(&request, "verify"));
+                }
+                match self
+                    .runtime_identity(RuntimeIdentityQuery {
+                        host: HostKind::Illustrator,
+                        target: Some(request.target.clone()),
+                        expected: None,
+                    })
+                    .await
+                {
+                    Ok(identity) => {
+                        let observed = self
+                            .bootstrap_grants
+                            .lock()
+                            .await
+                            .get(&key)
+                            .and_then(|grant| grant.observed.clone());
+                        self.validate_illustrator_bootstrap_identity(
+                            &request,
+                            &identity,
+                            observed.as_ref(),
+                        )?;
+                        let transaction = {
+                            let grants = self.bootstrap_grants.lock().await;
+                            grants
+                                .get(&key)
+                                .and_then(|grant| grant.transaction.clone())
+                                .ok_or_else(|| {
+                                    identity_error(
+                                        ERROR_IDENTITY_STALE,
+                                        "Illustrator bootstrap reservation is unavailable",
+                                        json!({"stage": "commit"}),
+                                    )
+                                })?
+                        };
+                        let finalize = {
+                            let transaction = transaction.clone();
+                            self.bootstrap_blocking
+                                .execute(deadline, move || transaction.finalize_pending())
+                                .await
+                        };
+                        let finalize = match finalize {
+                            Err(BlockingBoundaryError::TimedOut) => {
+                                transaction.revoke();
+                                return Err(illustrator_bootstrap_timeout_error(
+                                    &request,
+                                    "commit",
+                                ));
+                            }
+                            Err(
+                                BlockingBoundaryError::Overloaded
+                                | BlockingBoundaryError::Panicked,
+                            ) => {
+                                transaction.revoke();
+                                Err(anyhow!("Illustrator commit worker failed closed"))
+                            }
+                            Ok(finalize) => finalize,
+                        };
+                        finalize.map_err(|_| {
+                            identity_error(
+                                ERROR_IDENTITY_UNAVAILABLE,
+                                "Illustrator bootstrap could not be committed",
+                                json!({"stage": "commit"}),
+                            )
+                        })?;
+                        let module_sha256 = self
+                            .bootstrap_grants
+                            .lock()
+                            .await
+                            .get(&key)
+                            .map(|grant| grant.module_sha256.clone())
+                            .ok_or_else(|| {
+                                identity_error(
+                                    ERROR_IDENTITY_STALE,
+                                    "Illustrator bootstrap reservation is unavailable",
+                                    json!({"stage": "commit"}),
+                                )
+                            })?;
+                        return self
+                            .record_illustrator_bootstrap_result(
+                                identity,
+                                &request,
+                                &module_sha256,
+                                IllustratorBootstrapStatus::Ready,
+                                deadline,
+                                Some(&key),
+                            )
+                            .await;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.error.code,
+                            ERROR_IDENTITY_UNAVAILABLE | ERROR_BRIDGE_NOT_INSTALLED
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        .await;
+
+        let final_result = match owner_result {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.complete_illustrator_bootstrap_failure(&key, error)
+                    .await
+            }
+        };
+        transaction_guard.disarm();
+        final_result
+    }
+
+    async fn complete_illustrator_bootstrap_failure(
+        &self,
+        key: &str,
+        primary_error: Box<RpcErrorResponse>,
+    ) -> IllustratorResult {
+        let (transaction, launched) = {
+            let mut grants = self.bootstrap_grants.lock().await;
+            let Some(grant) = grants.get_mut(key) else {
+                return Err(primary_error);
+            };
+            grant.launch_cancelled.store(true, Ordering::SeqCst);
+            if let Some(transaction) = grant.transaction.as_ref() {
+                transaction.revoke();
+            }
+            (grant.transaction.take(), grant.launched.take())
+        };
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+        let host_failed = if let Some(launched) = launched {
+            launched.terminate_and_reap(cleanup_deadline).await.is_err()
+        } else {
+            false
+        };
+        let rollback_failed = if let Some(transaction) = transaction {
+            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+            !matches!(
+                self.bootstrap_blocking
+                    .execute_cleanup(cleanup_deadline, move || transaction.rollback())
+                    .await,
+                Ok(Ok(()))
+            )
+        } else {
+            false
+        };
+        let error = if rollback_failed || host_failed {
+            bootstrap_recovery_error("Illustrator bootstrap state could not be recovered")
+        } else {
+            primary_error
+        };
+        let mut grants = self.bootstrap_grants.lock().await;
+        grants.remove(key);
+        Err(error)
+    }
+
+    fn validate_illustrator_bootstrap_identity(
+        &self,
+        request: &IllustratorBootstrapRequest,
+        identity: &RuntimeIdentityAttestation,
+        observed: Option<&ObservedHostProcess>,
+    ) -> ValidationResult {
+        let claimed_process = ObservedHostProcess {
+            pid: identity.host.pid,
+            process_start_identity: identity.host.process_start_identity.clone(),
+            executable_path: identity.host.executable_path.clone(),
+        };
+        let path_matches = normalized_paths_equal(
+            &identity.host.executable_path,
+            &request.host.executable_path,
+        ) && normalized_paths_equal(
+            &identity.bridge.installed_plugin_root,
+            &request.plugin.installed_plugin_root,
+        ) && normalized_paths_equal(
+            &identity.bridge.module_origin,
+            &request.plugin.module_origin,
+        );
+        let observed_matches = self
+            .illustrator_bootstrap_backend
+            .process_matches(&claimed_process)
+            && observed.is_none_or(|expected| {
+                self.illustrator_bootstrap_backend.process_matches(expected)
+                    && identity.host.pid == expected.pid
+                    && identity.host.process_start_identity == expected.process_start_identity
+                    && normalized_paths_equal(
+                        &identity.host.executable_path,
+                        &expected.executable_path,
+                    )
+            });
+        if !path_matches
+            || !observed_matches
+            || identity.host.host_version != request.host.host_version
+            || identity.host.profile_id != request.host.profile_id
+            || identity.bridge.target != request.target
+            || identity.bridge.bridge_kind != adobepy_protocol::BridgeKind::Cep
+            || identity.bridge.bridge_version != request.plugin.bridge_version
+        {
+            return Err(identity_error(
+                ERROR_IDENTITY_MISMATCH,
+                "Illustrator bootstrap resolved to a foreign or mismatched instance",
+                json!({"field": "runtimeIdentity"}),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn record_illustrator_bootstrap_result(
+        &self,
+        identity: RuntimeIdentityAttestation,
+        request: &IllustratorBootstrapRequest,
+        module_sha256: &str,
+        status: IllustratorBootstrapStatus,
+        deadline: tokio::time::Instant,
+        owner_key: Option<&str>,
+    ) -> IllustratorResult {
+        let broker_attestation = {
+            let backend = self.illustrator_bootstrap_backend.clone();
+            let path = identity.broker.executable_path.clone();
+            self.bootstrap_blocking
+                .execute(deadline, move || backend.executable_sha256(&path))
+                .await
+        };
+        let broker_attestation = match broker_attestation {
+            Err(BlockingBoundaryError::TimedOut) => {
+                return Err(illustrator_bootstrap_timeout_error(
+                    request,
+                    "broker_attestation",
+                ));
+            }
+            Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                Err(anyhow!("Illustrator broker attestation worker failed closed"))
+            }
+            Ok(attestation) => attestation,
+        };
+        let broker_sha256 = broker_attestation.map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_UNAVAILABLE,
+                    "broker executable identity is unavailable",
+                    json!({"stage": "broker_attestation"}),
+                )
+            })?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(illustrator_bootstrap_timeout_error(
+                request,
+                "broker_attestation",
+            ));
+        }
+        let fingerprint = identity_fingerprint(&identity)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(illustrator_bootstrap_timeout_error(request, "fingerprint"));
+        }
+        let receipt_id = Uuid::new_v4().hyphenated().to_string();
+        let result = IllustratorBootstrapResult {
+            bootstrap_version: ILLUSTRATOR_BOOTSTRAP_VERSION,
+            status,
+            identity_fingerprint: fingerprint,
+            broker: IllustratorBrokerBinding {
+                pid: identity.broker.pid,
+                process_start_identity: identity.broker.process_start_identity.clone(),
+                runtime_version: identity.broker.runtime_version.clone(),
+                instance_id: identity.broker.instance_id.clone(),
+                executable_sha256: broker_sha256,
+            },
+            host: IllustratorHostBinding {
+                pid: identity.host.pid,
+                process_start_identity: identity.host.process_start_identity.clone(),
+                host_version: identity.host.host_version.clone(),
+                profile_id: identity.host.profile_id.clone(),
+                instance_id: identity.bridge.instance_id.clone(),
+                executable_sha256: request.host.executable_sha256.clone(),
+            },
+            plugin: IllustratorPluginBinding {
+                target: identity.bridge.target.clone(),
+                connected_at_epoch_ms: identity.bridge.connected_at_epoch_ms,
+                instance_id: identity.bridge.instance_id.clone(),
+                bridge_version: identity.bridge.bridge_version.clone(),
+                module_sha256: module_sha256.to_owned(),
+            },
+            continuation: IllustratorBootstrapContinuation {
+                method: "POST".into(),
+                path: "/v1/illustrator/bootstrap/verify".into(),
+                receipt_id: receipt_id.clone(),
+                timeout_ms: request.timeout_ms,
+            },
+            adapter_continuation: BootstrapAdapterContinuation {
+                kind: "command".into(),
+                argv: vec![
+                    "dcc-mcp-illustrator".into(),
+                    "verify".into(),
+                    "--json".into(),
+                ],
+            },
+        };
+        let receipt = IllustratorBootstrapReceipt {
+            identity,
+            result: result.clone(),
+            expires_at_epoch_ms: epoch_ms() + 120_000,
+        };
+        if let Some(key) = owner_key {
+            let transaction = {
+                let grants = self.bootstrap_grants.lock().await;
+                grants
+                    .get(key)
+                    .and_then(|grant| grant.transaction.clone())
+                    .ok_or_else(|| {
+                        identity_error(
+                            ERROR_IDENTITY_STALE,
+                            "Illustrator bootstrap reservation is unavailable",
+                            json!({"stage": "receipt"}),
+                        )
+                    })?
+            };
+            if tokio::time::Instant::now() >= deadline {
+                transaction.revoke();
+                return Err(illustrator_bootstrap_timeout_error(request, "receipt"));
+            }
+            let confirmation = {
+                let transaction = transaction.clone();
+                self.bootstrap_blocking
+                    .execute(deadline, move || transaction.prepare_commit_confirmation())
+                    .await
+            };
+            let confirmation = match confirmation {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    transaction.revoke();
+                    return Err(illustrator_bootstrap_timeout_error(request, "receipt"));
+                }
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    transaction.revoke();
+                    Err(anyhow!("Illustrator commit confirmation worker failed closed"))
+                }
+                Ok(confirmation) => confirmation,
+            }
+            .map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap commit ownership is stale",
+                    json!({"stage": "receipt"}),
+                )
+            })?;
+            if tokio::time::Instant::now() >= deadline {
+                transaction.revoke();
+                return Err(illustrator_bootstrap_timeout_error(request, "receipt"));
+            }
+            let publication = self
+                .bootstrap_blocking
+                .execute(deadline, move || confirmation.confirm())
+                .await;
+            let publication = match publication {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    transaction.revoke();
+                    return Err(illustrator_bootstrap_timeout_error(request, "receipt"));
+                }
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    transaction.revoke();
+                    Err(anyhow!("Illustrator commit confirmation worker failed closed"))
+                }
+                Ok(publication) => publication,
+            }
+            .map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap commit ownership is stale",
+                    json!({"stage": "receipt"}),
+                )
+            })?;
+            if tokio::time::Instant::now() >= deadline {
+                transaction.revoke();
+                return Err(illustrator_bootstrap_timeout_error(request, "receipt"));
+            }
+            let mut owned_hosts = self.bootstrap_owned_hosts.lock().await;
+            let mut grants = self.bootstrap_grants.lock().await;
+            let Some(grant_transaction) =
+                grants.get(key).and_then(|grant| grant.transaction.as_ref())
+            else {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap reservation is unavailable",
+                    json!({"stage": "receipt"}),
+                ));
+            };
+            if !Arc::ptr_eq(grant_transaction, &transaction) {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap commit ownership is stale",
+                    json!({"stage": "receipt"}),
+                ));
+            }
+            let mut receipts = self.illustrator_bootstrap_receipts.lock().await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(illustrator_bootstrap_timeout_error(request, "receipt"));
+            }
+            let now = epoch_ms();
+            receipts.retain(|_, receipt| receipt.expires_at_epoch_ms >= now);
+            let grant = grants
+                .get_mut(key)
+                .expect("Illustrator owner grant remains locked through receipt persistence");
+            publication.publish().map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap commit ownership is stale",
+                    json!({"stage": "receipt"}),
+                )
+            })?;
+            grant.transaction.take();
+            if let Some(launched) = grant.launched.take() {
+                owned_hosts.insert(key.to_owned(), launched);
+            }
+            receipts.insert(receipt_id, receipt);
+            grants.remove(key);
+        } else {
+            let mut receipts = self.illustrator_bootstrap_receipts.lock().await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(illustrator_bootstrap_timeout_error(request, "receipt"));
+            }
+            let now = epoch_ms();
+            receipts.retain(|_, receipt| receipt.expires_at_epoch_ms >= now);
+            receipts.insert(receipt_id, receipt);
+        }
+        Ok(result)
+    }
+
+    async fn verify_illustrator_bootstrap(&self, receipt_id: &str) -> IllustratorResult {
+        if !is_uuid(receipt_id) {
+            return Err(identity_error(
+                ERROR_INVALID_REQUEST,
+                "Illustrator bootstrap receipt is invalid",
+                json!({"field": "receiptId"}),
+            ));
+        }
+        let receipt = self
+            .illustrator_bootstrap_receipts
+            .lock()
+            .await
+            .get(receipt_id)
+            .cloned()
+            .filter(|receipt| receipt.expires_at_epoch_ms >= epoch_ms())
+            .ok_or_else(|| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap receipt is stale or unavailable",
+                    json!({"field": "receiptId"}),
+                )
+            })?;
+        let actual = self
+            .runtime_identity(RuntimeIdentityQuery {
+                host: HostKind::Illustrator,
+                target: Some(receipt.identity.bridge.target.clone()),
+                expected: Some(receipt.identity.clone()),
+            })
+            .await?;
+        let observed = ObservedHostProcess {
+            pid: actual.host.pid,
+            process_start_identity: actual.host.process_start_identity.clone(),
+            executable_path: actual.host.executable_path,
+        };
+        if !self
+            .illustrator_bootstrap_backend
+            .process_matches(&observed)
+        {
+            return Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "Illustrator process identity changed after bootstrap",
+                json!({"field": "host.processStartIdentity"}),
+            ));
+        }
+        Ok(receipt.result)
+    }
+
     async fn wait_for_bootstrap_completion(
         &self,
         request: &PhotoshopBootstrapRequest,
@@ -1316,6 +2112,7 @@ impl BrokerState {
                 receipt_id: receipt_id.clone(),
                 timeout_ms: request.timeout_ms,
             },
+            adapter_continuation: None,
         };
         let receipt = BootstrapReceipt {
             identity,
@@ -1665,6 +2462,146 @@ impl BrokerState {
         Ok(Some(identity))
     }
 
+    async fn bind_illustrator_bootstrap_claim(
+        &self,
+        target: &str,
+        capabilities: &adobepy_protocol::Capabilities,
+        identity: Option<BridgeIdentityClaim>,
+        bootstrap_nonce: Option<&str>,
+    ) -> Result<Option<BridgeIdentityClaim>, Box<RpcErrorResponse>> {
+        let key = session_key(HostKind::Illustrator, target);
+        let has_grant = self.bootstrap_grants.lock().await.contains_key(&key);
+        if !has_grant {
+            if bootstrap_nonce.is_some() {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap nonce is stale",
+                    json!({"field": "bootstrapNonce"}),
+                ));
+            }
+            return Ok(identity);
+        }
+        let Some(nonce) = bootstrap_nonce else {
+            return Err(identity_error(
+                ERROR_IDENTITY_MISMATCH,
+                "Illustrator bootstrap connection omitted its one-time binding",
+                json!({"field": "bootstrapNonce"}),
+            ));
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let (request, observed) = loop {
+            let value = self
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&key)
+                .and_then(|grant| {
+                    (grant.nonce == nonce)
+                        .then(|| {
+                            grant
+                                .observed
+                                .clone()
+                                .map(|observed| (grant.request.clone(), observed))
+                        })
+                        .flatten()
+                });
+            if let Some(value) = value {
+                break value;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap binding is stale or incomplete",
+                    json!({"field": "bootstrapNonce"}),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        if !self
+            .illustrator_bootstrap_backend
+            .process_matches(&observed)
+        {
+            return Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "selected Illustrator process identity changed before bridge connection",
+                json!({"field": "host.processStartIdentity"}),
+            ));
+        }
+        let Some(mut identity) = identity else {
+            return Err(identity_error(
+                ERROR_IDENTITY_UNAVAILABLE,
+                "Illustrator CEP bridge omitted its plugin identity",
+                json!({"missingFields": ["identity.bridge"]}),
+            ));
+        };
+        let Some(profile_id) = identity.host.profile_id.as_ref() else {
+            return Err(identity_error(
+                ERROR_IDENTITY_UNAVAILABLE,
+                "Illustrator bootstrap connection omitted its host profile identity",
+                json!({"missingFields": ["identity.host.profileId"]}),
+            ));
+        };
+        let claimed_host_matches = identity.host.pid.is_none_or(|pid| pid == observed.pid)
+            && identity
+                .host
+                .process_start_identity
+                .as_ref()
+                .is_none_or(|value| value == &observed.process_start_identity)
+            && identity
+                .host
+                .executable_path
+                .as_deref()
+                .is_none_or(|value| normalized_paths_equal(value, &observed.executable_path))
+            && profile_id == &request.host.profile_id;
+        let bridge_matches = identity
+            .bridge
+            .installed_plugin_root
+            .as_deref()
+            .is_some_and(|value| {
+                normalized_paths_equal(value, &request.plugin.installed_plugin_root)
+            })
+            && identity
+                .bridge
+                .module_origin
+                .as_deref()
+                .is_some_and(|value| normalized_paths_equal(value, &request.plugin.module_origin))
+            && capabilities.host == HostKind::Illustrator
+            && capabilities.bridge_kind == adobepy_protocol::BridgeKind::Cep
+            && capabilities.bridge_version == request.plugin.bridge_version
+            && capabilities.host_version.as_deref() == Some(request.host.host_version.as_str());
+        if !claimed_host_matches || !bridge_matches {
+            return Err(identity_error(
+                ERROR_IDENTITY_MISMATCH,
+                "Illustrator bootstrap connection is foreign or mismatched",
+                json!({"field": "runtimeIdentity"}),
+            ));
+        }
+        let nonce_consumed = self
+            .bootstrap_grants
+            .lock()
+            .await
+            .get_mut(&key)
+            .is_some_and(|grant| {
+                if grant.nonce != nonce || grant.nonce_claimed {
+                    return false;
+                }
+                grant.nonce_claimed = true;
+                true
+            });
+        if !nonce_consumed {
+            return Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "Illustrator bootstrap nonce was already consumed",
+                json!({"field": "bootstrapNonce"}),
+            ));
+        }
+        identity.host.pid = Some(observed.pid);
+        identity.host.process_start_identity = Some(observed.process_start_identity);
+        identity.host.executable_path = Some(observed.executable_path);
+        identity.host.host_version = Some(request.host.host_version);
+        Ok(Some(identity))
+    }
+
     fn next_connection_id(&self) -> u64 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -1726,6 +2663,11 @@ fn broker_router(state: BrokerState) -> Router {
         .route(
             "/v1/photoshop/bootstrap/verify",
             post(verify_photoshop_bootstrap),
+        )
+        .route("/v1/illustrator/bootstrap", post(illustrator_bootstrap))
+        .route(
+            "/v1/illustrator/bootstrap/verify",
+            post(verify_illustrator_bootstrap),
         )
         .route("/v1/rpc", post(http_rpc))
         .route("/v1/client/ws", get(client_ws))
@@ -1792,6 +2734,37 @@ async fn verify_photoshop_bootstrap(
         return unauthorized_response();
     }
     match state.verify_photoshop_bootstrap(&request.receipt_id).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => Json(*error).into_response(),
+    }
+}
+
+async fn illustrator_bootstrap(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Json(request): Json<IllustratorBootstrapRequest>,
+) -> Response {
+    if !state.authorized(&headers) {
+        return unauthorized_response();
+    }
+    match state.bootstrap_illustrator(request).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => Json(*error).into_response(),
+    }
+}
+
+async fn verify_illustrator_bootstrap(
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Json(request): Json<IllustratorBootstrapVerifyRequest>,
+) -> Response {
+    if !state.authorized(&headers) {
+        return unauthorized_response();
+    }
+    match state
+        .verify_illustrator_bootstrap(&request.receipt_id)
+        .await
+    {
         Ok(result) => Json(result).into_response(),
         Err(error) => Json(*error).into_response(),
     }
@@ -1903,15 +2876,35 @@ async fn bridge_socket(mut socket: WebSocket, state: BrokerState, expected_host:
         return;
     }
     let target = target.unwrap_or_else(|| DEFAULT_TARGET.to_owned());
-    let identity = match state
-        .bind_photoshop_bootstrap_claim(
-            &target,
-            &capabilities,
-            identity,
-            bootstrap_nonce.as_deref(),
-        )
-        .await
-    {
+    let bound_identity = match expected_host {
+        HostKind::Photoshop => {
+            state
+                .bind_photoshop_bootstrap_claim(
+                    &target,
+                    &capabilities,
+                    identity,
+                    bootstrap_nonce.as_deref(),
+                )
+                .await
+        }
+        HostKind::Illustrator => {
+            state
+                .bind_illustrator_bootstrap_claim(
+                    &target,
+                    &capabilities,
+                    identity,
+                    bootstrap_nonce.as_deref(),
+                )
+                .await
+        }
+        _ if bootstrap_nonce.is_some() => Err(identity_error(
+            ERROR_IDENTITY_MISMATCH,
+            "bootstrap nonce was presented by an unsupported host",
+            json!({"field": "host"}),
+        )),
+        _ => Ok(identity),
+    };
+    let identity = match bound_identity {
         Ok(identity) => identity,
         Err(error) => {
             let _ = socket
@@ -2009,6 +3002,17 @@ fn bootstrap_timeout_error(
     )
 }
 
+fn illustrator_bootstrap_timeout_error(
+    request: &IllustratorBootstrapRequest,
+    stage: &str,
+) -> Box<RpcErrorResponse> {
+    identity_error(
+        ERROR_TIMEOUT,
+        "Illustrator CEP bootstrap exceeded its bounded operation deadline",
+        json!({"stage": stage, "timeoutMs": request.timeout_ms}),
+    )
+}
+
 fn bootstrap_recovery_error(message: &str) -> Box<RpcErrorResponse> {
     identity_error(ERROR_IDENTITY_STALE, message, json!({"stage": "recovery"}))
 }
@@ -2055,6 +3059,76 @@ fn validate_photoshop_bootstrap_request(
         ));
     }
     Ok(())
+}
+
+fn validate_illustrator_bootstrap_request(
+    request: &IllustratorBootstrapRequest,
+) -> ValidationResult {
+    let module_is_fixed = normalized_absolute_path(&request.plugin.installed_plugin_root)
+        .zip(normalized_absolute_path(&request.plugin.module_origin))
+        .is_some_and(|(root, module)| {
+            let case_insensitive = root.as_bytes().get(1) == Some(&b':');
+            let (root, module) = if case_insensitive {
+                (root.to_ascii_lowercase(), module.to_ascii_lowercase())
+            } else {
+                (root, module)
+            };
+            module == format!("{root}/dist/main.js")
+        });
+    if request.bootstrap_version != ILLUSTRATOR_BOOTSTRAP_VERSION
+        || !is_bounded_identifier(&request.target, 128)
+        || !(50..=30_000).contains(&request.timeout_ms)
+        || request.host.executable_bytes == 0
+        || request.host.executable_bytes > 4 * 1024 * 1024 * 1024
+        || normalized_absolute_path(&request.host.executable_path).is_none()
+        || !is_sha256(&request.host.executable_sha256)
+        || !is_canonical_version(&request.host.host_version)
+        || !is_bounded_text(&request.host.profile_id, 256)
+        || !module_is_fixed
+        || !is_canonical_version(&request.plugin.bridge_version)
+        || request.plugin.manifest_bytes == 0
+        || request.plugin.manifest_bytes > 1024 * 1024
+        || !is_sha256(&request.plugin.manifest_sha256)
+        || request.plugin.index_bytes == 0
+        || request.plugin.index_bytes > 1024 * 1024
+        || !is_sha256(&request.plugin.index_sha256)
+        || request.plugin.module_bytes == 0
+        || request.plugin.module_bytes > 256 * 1024 * 1024
+        || !is_sha256(&request.plugin.module_sha256)
+    {
+        return Err(identity_error(
+            ERROR_INVALID_REQUEST,
+            "Illustrator bootstrap request is malformed or unbounded",
+            json!({"field": "request"}),
+        ));
+    }
+    Ok(())
+}
+
+fn illustrator_backend_request(request: &IllustratorBootstrapRequest) -> PhotoshopBootstrapRequest {
+    PhotoshopBootstrapRequest {
+        bootstrap_version: request.bootstrap_version,
+        target: request.target.clone(),
+        timeout_ms: request.timeout_ms,
+        host: PhotoshopHostTarget {
+            executable_path: request.host.executable_path.clone(),
+            executable_bytes: request.host.executable_bytes,
+            executable_sha256: request.host.executable_sha256.clone(),
+            host_version: request.host.host_version.clone(),
+            profile_id: request.host.profile_id.clone(),
+        },
+        plugin: PhotoshopPluginTarget {
+            installed_plugin_root: request.plugin.installed_plugin_root.clone(),
+            module_origin: request.plugin.module_origin.clone(),
+            bridge_version: request.plugin.bridge_version.clone(),
+            manifest_bytes: request.plugin.manifest_bytes,
+            manifest_sha256: request.plugin.manifest_sha256.clone(),
+            index_bytes: request.plugin.index_bytes,
+            index_sha256: request.plugin.index_sha256.clone(),
+            module_bytes: request.plugin.module_bytes,
+            module_sha256: request.plugin.module_sha256.clone(),
+        },
+    }
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -3104,6 +4178,19 @@ mod tests {
         .expect("capture test broker identity")
     }
 
+    fn illustrator_bootstrap_state(backend: Arc<FakeBootstrapBackend>) -> BrokerState {
+        BrokerState::with_bootstrap_backends(
+            &BrokerConfig {
+                bind: SocketAddr::from(([127, 0, 0, 1], 47_391)),
+                token: "PRIVATE_TEST_TOKEN".into(),
+                default_timeout_ms: 1,
+            },
+            FakeBootstrapBackend::ready(),
+            backend,
+        )
+        .expect("capture test broker identity")
+    }
+
     fn bootstrap_request(timeout_ms: u64) -> PhotoshopBootstrapRequest {
         PhotoshopBootstrapRequest {
             bootstrap_version: PHOTOSHOP_BOOTSTRAP_VERSION,
@@ -3121,6 +4208,32 @@ mod tests {
                 module_origin: "C:/UXP/External/com.adobepy.bridge.photoshop/dist/main.js".into(),
                 bridge_version: "0.1.0".into(),
                 manifest_bytes: 640,
+                manifest_sha256: "d".repeat(64),
+                index_bytes: 180,
+                index_sha256: "e".repeat(64),
+                module_bytes: 47_901,
+                module_sha256: "f".repeat(64),
+            },
+        }
+    }
+
+    fn illustrator_bootstrap_request(timeout_ms: u64) -> IllustratorBootstrapRequest {
+        IllustratorBootstrapRequest {
+            bootstrap_version: ILLUSTRATOR_BOOTSTRAP_VERSION,
+            target: "illustration".into(),
+            timeout_ms,
+            host: adobepy_protocol::IllustratorHostTarget {
+                executable_path: "C:/Program Files/Adobe/Adobe Illustrator 2026/Support Files/Contents/Windows/Illustrator.exe".into(),
+                executable_bytes: 42,
+                executable_sha256: "a".repeat(64),
+                host_version: "30.0.0".into(),
+                profile_id: "illustrator-production".into(),
+            },
+            plugin: adobepy_protocol::IllustratorPluginTarget {
+                installed_plugin_root: "C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.illustrator".into(),
+                module_origin: "C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.illustrator/dist/main.js".into(),
+                bridge_version: "0.1.0".into(),
+                manifest_bytes: 663,
                 manifest_sha256: "d".repeat(64),
                 index_bytes: 180,
                 index_sha256: "e".repeat(64),
@@ -3213,6 +4326,82 @@ mod tests {
                 ),
             },
         }
+    }
+
+    fn illustrator_caps() -> Capabilities {
+        let mut methods = BTreeMap::new();
+        methods.insert("app".into(), vec!["getVersion".into()]);
+        Capabilities {
+            host: HostKind::Illustrator,
+            bridge_kind: BridgeKind::Cep,
+            bridge_version: "0.1.0".into(),
+            host_version: Some("30.0.0".into()),
+            namespaces: vec!["app".into()],
+            features: vec![],
+            methods,
+        }
+    }
+
+    fn illustrator_identity_claim() -> BridgeIdentityClaim {
+        BridgeIdentityClaim {
+            host: adobepy_protocol::HostIdentityClaim {
+                pid: Some(4200),
+                process_start_identity: Some("windows:133700000000000100".into()),
+                executable_path: Some("C:/Program Files/Adobe/Adobe Illustrator 2026/Support Files/Contents/Windows/Illustrator.exe".into()),
+                host_version: Some("30.0.0".into()),
+                profile_id: Some("illustrator-production".into()),
+            },
+            bridge: adobepy_protocol::BridgeInstanceClaim {
+                instance_id: Some("9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99".into()),
+                installed_plugin_root: Some("C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.illustrator".into()),
+                module_origin: Some("C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.illustrator/dist/main.js".into()),
+            },
+        }
+    }
+
+    async fn publish_matching_illustrator_session(state: &BrokerState) {
+        let (nonce, observed) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let value = state
+                    .bootstrap_grants
+                    .lock()
+                    .await
+                    .get(&session_key(HostKind::Illustrator, "illustration"))
+                    .and_then(|grant| {
+                        grant
+                            .observed
+                            .clone()
+                            .map(|observed| (grant.nonce.clone(), observed))
+                    });
+                if let Some(value) = value {
+                    return value;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("Illustrator bootstrap owner must publish its observed process");
+        let bound = state
+            .bind_illustrator_bootstrap_claim(
+                "illustration",
+                &illustrator_caps(),
+                Some(illustrator_identity_claim()),
+                Some(&nonce),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let key = session_key(HostKind::Illustrator, "illustration");
+        state.sessions.write().await.insert(
+            key.clone(),
+            BridgeSessionInfo {
+                target: "illustration".into(),
+                capabilities: illustrator_caps(),
+                connected_at_epoch_ms: 1_720_000_000_000,
+            },
+        );
+        state.session_identities.write().await.insert(key, bound);
+        assert_eq!(observed.pid, 4200);
     }
 
     async fn insert_identity_session(
@@ -3969,6 +5158,169 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn illustrator_bootstrap_binds_exact_instance_is_idempotent_and_detects_pid_reuse() {
+        let backend = FakeBootstrapBackend::ready();
+        let state = illustrator_bootstrap_state(backend.clone());
+        let request = illustrator_bootstrap_request(1_000);
+        let owner = tokio::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            async move { state.bootstrap_illustrator(request).await }
+        });
+        publish_matching_illustrator_session(&state).await;
+        let result = owner.await.unwrap().unwrap();
+        assert_eq!(result.status, IllustratorBootstrapStatus::Ready);
+        assert_eq!(result.host.pid, 4200);
+        assert_eq!(result.host.executable_sha256, "a".repeat(64));
+        assert_eq!(result.host.instance_id, result.plugin.instance_id);
+        assert_eq!(result.plugin.target, "illustration");
+        assert!(result.plugin.connected_at_epoch_ms > 0);
+        assert_eq!(result.plugin.module_sha256, "d".repeat(64));
+        assert_eq!(result.continuation.path, "/v1/illustrator/bootstrap/verify");
+        assert_eq!(
+            result.adapter_continuation.argv,
+            ["dcc-mcp-illustrator", "verify", "--json"]
+        );
+        assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.finalizes.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 0);
+
+        let repeated = state.bootstrap_illustrator(request.clone()).await.unwrap();
+        assert_eq!(repeated.status, IllustratorBootstrapStatus::AlreadyReady);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        state
+            .verify_illustrator_bootstrap(&result.continuation.receipt_id)
+            .await
+            .unwrap();
+
+        backend.process_valid.store(false, Ordering::SeqCst);
+        let error = state
+            .verify_illustrator_bootstrap(&result.continuation.receipt_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+        let public = serde_json::to_string(&error).unwrap();
+        assert!(!public.contains("PRIVATE_TEST_TOKEN"));
+        assert!(!public.contains("Program Files"));
+    }
+
+    #[tokio::test]
+    async fn illustrator_bootstrap_rejects_malformed_missing_late_and_competing_claims_without_extra_effects(
+    ) {
+        let backend = FakeBootstrapBackend::ready();
+        let state = illustrator_bootstrap_state(backend.clone());
+        let mut malformed = illustrator_bootstrap_request(1_000);
+        malformed.plugin.module_origin = "C:/foreign/shadow.js".into();
+        let error = state.bootstrap_illustrator(malformed).await.unwrap_err();
+        assert_eq!(error.error.code, ERROR_INVALID_REQUEST);
+        assert_eq!(backend.attest_arrivals.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.prepares.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 0);
+
+        let request = illustrator_bootstrap_request(1_000);
+        let owner = tokio::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            async move { state.bootstrap_illustrator(request).await }
+        });
+        let (nonce, _) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(value) = state
+                    .bootstrap_grants
+                    .lock()
+                    .await
+                    .get(&session_key(HostKind::Illustrator, "illustration"))
+                    .map(|grant| (grant.nonce.clone(), grant.observed.clone()))
+                    .filter(|(_, observed)| observed.is_some())
+                {
+                    return value;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let missing = state
+            .bind_illustrator_bootstrap_claim(
+                "illustration",
+                &illustrator_caps(),
+                Some(illustrator_identity_claim()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(missing.error.code, ERROR_IDENTITY_MISMATCH);
+
+        let mut shadow = illustrator_identity_claim();
+        shadow.bridge.module_origin = Some("C:/foreign/shadow.js".into());
+        let mismatched = state
+            .bind_illustrator_bootstrap_claim(
+                "illustration",
+                &illustrator_caps(),
+                Some(shadow),
+                Some(&nonce),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(mismatched.error.code, ERROR_IDENTITY_MISMATCH);
+
+        let mut wrong_process = illustrator_identity_claim();
+        wrong_process.host.pid = Some(9999);
+        let mismatched = state
+            .bind_illustrator_bootstrap_claim(
+                "illustration",
+                &illustrator_caps(),
+                Some(wrong_process),
+                Some(&nonce),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(mismatched.error.code, ERROR_IDENTITY_MISMATCH);
+
+        let competing = state
+            .bootstrap_illustrator(request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(competing.error.code, ERROR_IDENTITY_AMBIGUOUS);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+
+        publish_matching_illustrator_session(&state).await;
+        owner.await.unwrap().unwrap();
+        let late = state
+            .bind_illustrator_bootstrap_claim(
+                "illustration",
+                &illustrator_caps(),
+                Some(illustrator_identity_claim()),
+                Some(&nonce),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(late.error.code, ERROR_IDENTITY_STALE);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn illustrator_bootstrap_missing_claim_times_out_and_rolls_back() {
+        let backend = FakeBootstrapBackend::ready();
+        let state = illustrator_bootstrap_state(backend.clone());
+        let error = state
+            .bootstrap_illustrator(illustrator_bootstrap_request(50))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.finalizes.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        let public = serde_json::to_string(&error).unwrap();
+        assert!(!public.contains("PRIVATE_TEST_TOKEN"));
+        assert!(!public.contains("Program Files"));
     }
 
     #[tokio::test]

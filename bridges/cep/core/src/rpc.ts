@@ -1,4 +1,4 @@
-import type { Capabilities, RpcRequest } from "./protocol";
+import type { BridgeIdentityClaim, Capabilities, RpcRequest } from "./protocol";
 import { ERROR_CODES } from "./protocol";
 
 export interface CepConfig {
@@ -7,6 +7,7 @@ export interface CepConfig {
   token: string;
   target: string;
   capabilities: Capabilities;
+  identityProvider?: () => Promise<BridgeIdentityClaim | undefined>;
 }
 
 declare const WebSocket: any;
@@ -18,14 +19,33 @@ export function startCepBridge(config: CepConfig): void {
     throw new Error("ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
   }
   const extensionPath = cep.getSystemPath("extension").replace(/\\/g, "/");
-  const connect = () => {
+  const connect = async () => {
+    let identity: BridgeIdentityClaim | undefined;
+    if (config.identityProvider) {
+      try {
+        identity = await config.identityProvider();
+      } catch {
+        console.error("[adobepy] runtime identity is unavailable; exact-instance verification will fail closed.");
+      }
+    }
+    const bootstrapNonce = boundedBootstrapNonce((globalThis as any).__ADOBEPY_BOOTSTRAP_NONCE);
+    const capabilities = identity?.host.hostVersion
+      ? { ...config.capabilities, hostVersion: identity.host.hostVersion }
+      : config.capabilities;
     const socket = new WebSocket(config.brokerUrl);
     let greeted = false;
     const greet = () => {
       if (greeted || socket.readyState !== 1) return;
       greeted = true;
-      socket.send(JSON.stringify({ type: "hello", token: config.token, target: config.target, capabilities: config.capabilities }));
-      console.log("adobepy CEP bridge connected", config.capabilities);
+      socket.send(JSON.stringify({
+        type: "hello",
+        token: config.token,
+        target: config.target,
+        capabilities,
+        ...(identity ? { identity } : {}),
+        ...(bootstrapNonce ? { bootstrapNonce } : {})
+      }));
+      console.log("adobepy CEP bridge connected", capabilities);
     };
     socket.onopen = greet;
     setTimeout(greet, 0);
@@ -70,7 +90,7 @@ export function startCepBridge(config: CepConfig): void {
       'typeof JSON.stringify === "function"',
     ].join(" && ");
     cep.evalScript(`${probe} ? "ready" : "missing"`, (status: string) => {
-      if (status === "ready") connect();
+      if (status === "ready") void connect();
       else console.error("adobepy CEP host runtime failed to initialize", status);
     });
   };
@@ -81,6 +101,10 @@ export function startCepBridge(config: CepConfig): void {
     cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/dist/dom.jsx`)})`, loadDispatcher);
   };
   cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/dist/json.jsx`)})`, loadDomRuntime);
+}
+
+function boundedBootstrapNonce(value: unknown): string | undefined {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : undefined;
 }
 
 function hostScriptError(id: string | number, error: any) {

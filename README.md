@@ -17,6 +17,8 @@ Implemented pieces:
   exact-instance checks by DCC MCP adapters.
 - Bounded Photoshop UXP bootstrap with one-time exact-instance binding and a
   typed verification continuation; no arbitrary plug-in, command, script, or UI fallback.
+- Bounded Illustrator CEP bootstrap that binds the receipted bridge and selected
+  product process to a one-time claim and fixed adapter verification command.
 - Python SDK under `adobe.core`, `adobe.raw`, `adobe.photoshop`, `adobe.indesign`, `adobe.premiere`, `adobe.after_effects`, and `adobe.illustrator`.
 - Structured, non-eval access to the complete installed InDesign, Premiere,
   After Effects, and Illustrator object models.

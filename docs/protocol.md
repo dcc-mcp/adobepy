@@ -48,6 +48,7 @@ Every bridge must send a first WebSocket message:
 {
   "type": "hello",
   "token": "session-token",
+  "bootstrapNonce": "<one-time bootstrap nonce>",
   "target": "default",
   "capabilities": {
     "host": "photoshop",
@@ -153,6 +154,37 @@ request or when verification returns a different receipt.
 This contract does not prove live UXP loading on its own. Adapters must retain a
 not-ready result until the returned continuation succeeds against the same
 process and bridge connection.
+
+## Bounded Illustrator CEP bootstrap
+
+Illustrator adapters use `BrokerClient.bootstrap_illustrator_cep()` with a
+typed request that names one target, a bounded timeout, an independently
+observed Illustrator executable identity/version/profile, and the byte
+identities of the receipted CEP manifest, entry page, and `dist/main.js`.
+The broker accepts only the canonical Illustrator CEP tree and selected product
+path. It attests the request before writing configuration or launching a host.
+
+The installed Illustrator bridge obtains its version and extension root from
+CEP, accepts PID/start/executable/profile only from the bounded adapter launch
+context, creates one runtime instance ID, and sends those fields with a one-time
+bootstrap nonce in its first hello. The broker re-observes the product process
+and requires exact host, profile, target, CEP kind/version, extension root,
+module origin, nonce, and connection identity before registering the session.
+Missing, malformed, late, reused, foreign, or shadowed claims fail closed.
+
+The secret-free result binds broker and Illustrator process facts by digest,
+the runtime instance, target, connection epoch, and module digest. Its only
+broker continuation is authenticated
+`POST /v1/illustrator/bootstrap/verify`; its adapter continuation is exactly
+`dcc-mcp-illustrator verify --json`. Repeating an exact ready request is
+idempotent, while a competing bootstrap for the same target is rejected. The
+operation cannot select another plug-in, run JSX/ExtendScript, execute an
+arbitrary command, or fall back to UI automation.
+
+CI validates this contract with fake CEP/WebSocket and process-observation
+fixtures. It does not constitute licensed Illustrator acceptance, and adapters
+must keep readiness fail-closed until both fixed continuations succeed against
+the same live identity.
 
 ## Responses
 
