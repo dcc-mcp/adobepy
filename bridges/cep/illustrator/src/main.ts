@@ -1,10 +1,12 @@
 import { startCepBridge } from "../../core/src/rpc";
+import { illustratorRuntimeIdentity } from "./identity";
 
 startCepBridge({
   host: "illustrator",
   brokerUrl: (globalThis as any).__ADOBEPY_BROKER_URL || "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
   token: (globalThis as any).__ADOBEPY_TOKEN || "",
   target: (globalThis as any).__ADOBEPY_TARGET || "default",
+  identityProvider: illustratorRuntimeIdentity,
   capabilities: {
     host: "illustrator",
     bridgeKind: "cep",

@@ -141,6 +141,7 @@ export interface BridgeHello {
   target?: string;
   capabilities: Capabilities;
   identity?: BridgeIdentityClaim;
+  bootstrapNonce?: string;
 }
 
 export interface BridgeResponse {

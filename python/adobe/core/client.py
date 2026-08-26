@@ -10,6 +10,11 @@ import urllib.request
 from typing import Any, Iterable
 
 from .errors import BrokerConnectionError, error_from_rpc
+from .illustrator_bootstrap import (
+    IllustratorBootstrapContinuation,
+    IllustratorBootstrapRequest,
+    IllustratorBootstrapResult,
+)
 from .photoshop_bootstrap import (
     PhotoshopBootstrapContinuation,
     PhotoshopBootstrapRequest,
@@ -138,6 +143,36 @@ class BrokerClient:
         self, continuation: PhotoshopBootstrapContinuation
     ) -> PhotoshopBootstrapResult:
         return await _to_thread(self.verify_photoshop_bootstrap, continuation)
+
+    def bootstrap_illustrator_cep(
+        self, request: IllustratorBootstrapRequest
+    ) -> IllustratorBootstrapResult:
+        data = self._post_json("/v1/illustrator/bootstrap", request.to_wire())
+        if "error" in data:
+            raise error_from_rpc(data["error"], data)
+        return IllustratorBootstrapResult.from_broker(data).require_request(request)
+
+    async def bootstrap_illustrator_cep_async(
+        self, request: IllustratorBootstrapRequest
+    ) -> IllustratorBootstrapResult:
+        return await _to_thread(self.bootstrap_illustrator_cep, request)
+
+    def verify_illustrator_bootstrap(
+        self, continuation: IllustratorBootstrapContinuation
+    ) -> IllustratorBootstrapResult:
+        data = self._post_json(
+            continuation.path, {"receiptId": continuation.receipt_id}
+        )
+        if "error" in data:
+            raise error_from_rpc(data["error"], data)
+        return IllustratorBootstrapResult.from_broker(data).require_continuation(
+            continuation
+        )
+
+    async def verify_illustrator_bootstrap_async(
+        self, continuation: IllustratorBootstrapContinuation
+    ) -> IllustratorBootstrapResult:
+        return await _to_thread(self.verify_illustrator_bootstrap, continuation)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}

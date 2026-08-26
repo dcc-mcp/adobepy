@@ -24,6 +24,7 @@ pub const ERROR_IDENTITY_AMBIGUOUS: i32 = -32012;
 pub const ERROR_IDENTITY_MISMATCH: i32 = -32013;
 pub const RUNTIME_IDENTITY_VERSION: u8 = 1;
 pub const PHOTOSHOP_BOOTSTRAP_VERSION: u8 = 1;
+pub const ILLUSTRATOR_BOOTSTRAP_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HostKind {
@@ -416,6 +417,13 @@ pub struct PhotoshopBootstrapContinuation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BootstrapAdapterContinuation {
+    pub kind: String,
+    pub argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PhotoshopBootstrapResult {
     pub bootstrap_version: u8,
     pub status: PhotoshopBootstrapStatus,
@@ -424,11 +432,113 @@ pub struct PhotoshopBootstrapResult {
     pub host: BootstrapHostBinding,
     pub plugin: BootstrapPluginBinding,
     pub continuation: PhotoshopBootstrapContinuation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_continuation: Option<BootstrapAdapterContinuation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PhotoshopBootstrapVerifyRequest {
+    pub receipt_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IllustratorHostTarget {
+    pub executable_path: String,
+    pub executable_bytes: u64,
+    pub executable_sha256: String,
+    pub host_version: String,
+    pub profile_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IllustratorPluginTarget {
+    pub installed_plugin_root: String,
+    pub module_origin: String,
+    pub bridge_version: String,
+    pub manifest_bytes: u64,
+    pub manifest_sha256: String,
+    pub index_bytes: u64,
+    pub index_sha256: String,
+    pub module_bytes: u64,
+    pub module_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IllustratorBootstrapRequest {
+    pub bootstrap_version: u8,
+    pub target: String,
+    pub timeout_ms: u64,
+    pub host: IllustratorHostTarget,
+    pub plugin: IllustratorPluginTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IllustratorBootstrapStatus {
+    Ready,
+    AlreadyReady,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IllustratorBrokerBinding {
+    pub pid: u32,
+    pub process_start_identity: String,
+    pub runtime_version: String,
+    pub instance_id: String,
+    pub executable_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IllustratorHostBinding {
+    pub pid: u32,
+    pub process_start_identity: String,
+    pub host_version: String,
+    pub profile_id: String,
+    pub instance_id: String,
+    pub executable_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IllustratorPluginBinding {
+    pub target: String,
+    pub connected_at_epoch_ms: u128,
+    pub instance_id: String,
+    pub bridge_version: String,
+    pub module_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IllustratorBootstrapContinuation {
+    pub method: String,
+    pub path: String,
+    pub receipt_id: String,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IllustratorBootstrapResult {
+    pub bootstrap_version: u8,
+    pub status: IllustratorBootstrapStatus,
+    pub identity_fingerprint: String,
+    pub broker: IllustratorBrokerBinding,
+    pub host: IllustratorHostBinding,
+    pub plugin: IllustratorPluginBinding,
+    pub continuation: IllustratorBootstrapContinuation,
+    pub adapter_continuation: BootstrapAdapterContinuation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IllustratorBootstrapVerifyRequest {
     pub receipt_id: String,
 }
 
@@ -592,11 +702,65 @@ mod tests {
                 receipt_id: UuidForTest::VALUE.into(),
                 timeout_ms: 7_000,
             },
+            adapter_continuation: None,
         };
         let wire = serde_json::to_string(&result).unwrap();
         assert!(!wire.contains("executablePath"));
         assert!(!wire.contains("installedPluginRoot"));
         assert!(!wire.to_ascii_lowercase().contains("token"));
+    }
+
+    #[test]
+    fn illustrator_bootstrap_result_binds_target_epoch_and_fixed_continuation() {
+        let result = IllustratorBootstrapResult {
+            bootstrap_version: ILLUSTRATOR_BOOTSTRAP_VERSION,
+            status: IllustratorBootstrapStatus::Ready,
+            identity_fingerprint: "a".repeat(64),
+            broker: IllustratorBrokerBinding {
+                pid: 1,
+                process_start_identity: "windows:1".into(),
+                runtime_version: "0.8.0".into(),
+                instance_id: UuidForTest::VALUE.into(),
+                executable_sha256: "b".repeat(64),
+            },
+            host: IllustratorHostBinding {
+                pid: 2,
+                process_start_identity: "windows:2".into(),
+                host_version: "30.0.0".into(),
+                profile_id: "production".into(),
+                instance_id: UuidForTest::VALUE.into(),
+                executable_sha256: "c".repeat(64),
+            },
+            plugin: IllustratorPluginBinding {
+                target: "illustration".into(),
+                connected_at_epoch_ms: 1_775_000_000_000,
+                instance_id: UuidForTest::VALUE.into(),
+                bridge_version: "0.1.0".into(),
+                module_sha256: "d".repeat(64),
+            },
+            continuation: IllustratorBootstrapContinuation {
+                method: "POST".into(),
+                path: "/v1/illustrator/bootstrap/verify".into(),
+                receipt_id: UuidForTest::VALUE.into(),
+                timeout_ms: 7_000,
+            },
+            adapter_continuation: BootstrapAdapterContinuation {
+                kind: "command".into(),
+                argv: vec![
+                    "dcc-mcp-illustrator".into(),
+                    "verify".into(),
+                    "--json".into(),
+                ],
+            },
+        };
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["plugin"]["target"], "illustration");
+        assert_eq!(wire["plugin"]["connectedAtEpochMs"], 1_775_000_000_000u64);
+        assert_eq!(wire["adapterContinuation"]["argv"][1], "verify");
+        let text = wire.to_string();
+        assert!(!text.contains("executablePath"));
+        assert!(!text.contains("installedPluginRoot"));
+        assert!(!text.to_ascii_lowercase().contains("token"));
     }
 
     struct UuidForTest;

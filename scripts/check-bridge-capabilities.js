@@ -135,6 +135,7 @@ async function captureCapabilities(entry) {
     console: { ...console, log() {} },
     setImmediate,
     setTimeout,
+    clearTimeout,
     WebSocket: FakeWebSocket,
     __adobe_cep__: fakeCep,
     document: { getElementById() { return { textContent: "", addEventListener() {} }; } },
@@ -149,7 +150,9 @@ async function captureCapabilities(entry) {
 
   const code = bundleEntry(entry.entry);
   vm.runInNewContext(code, context, { filename: entry.entry });
-  await waitForMicrotasks();
+  for (let attempt = 0; attempt < 10 && !sent.some((message) => message.type === "hello"); attempt += 1) {
+    await waitForMicrotasks();
+  }
 
   assert.ok(socketInstance, `${entry.host}: bridge did not open a WebSocket`);
   const hello = sent.find((message) => message.type === "hello");

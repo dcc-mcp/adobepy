@@ -62,6 +62,14 @@ execution or UI automation as a discovery fallback.
 The broker port is separate from the MCP server port. The MCP server should not
 proxy raw WebSocket messages; it should call the Python facade.
 
+Illustrator adapters follow the same ownership boundary through the bounded
+`BrokerClient.bootstrap_illustrator_cep()` operation. They supply independently
+observed product facts and their owned CEP receipt, then execute only the
+returned fixed `dcc-mcp-illustrator verify --json` continuation. A health or
+version RPC is not readiness; target, process start, profile, runtime instance,
+connection epoch, and bridge byte identity must all remain bound. Licensed-host
+acceptance stays in the Illustrator adapter and is not replaced by adobepy CI.
+
 For `dcc-mcp-photoshop`, this replaces the adapter-owned
 `PhotoshopBridge` WebSocket server and `get_bridge().call("ps.*")` RPC dialect.
 The UXP plugin becomes an `adobepy` bridge client, the broker owns the

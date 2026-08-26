@@ -166,6 +166,13 @@ pub(crate) struct SystemPhotoshopBootstrapBackend {
     launch_arguments: Arc<[String]>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct SystemIllustratorBootstrapBackend {
+    config_owners: Mutex<HashMap<PathBuf, ConfigTransactionOwner>>,
+    host_owner: HostProcessBroker,
+    launch_arguments: Arc<[String]>,
+}
+
 impl SystemPhotoshopBootstrapBackend {
     #[cfg(all(test, windows))]
     fn with_launch_arguments(arguments: Vec<String>) -> Self {
@@ -552,6 +559,277 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
     }
 }
 
+impl PhotoshopBootstrapBackend for SystemIllustratorBootstrapBackend {
+    fn attest(&self, request: &PhotoshopBootstrapRequest) -> anyhow::Result<String> {
+        attest_illustrator_request(request)
+    }
+
+    fn prepare(
+        &self,
+        request: &PhotoshopBootstrapRequest,
+        nonce: &str,
+        token: &str,
+        websocket_url: &str,
+    ) -> anyhow::Result<PreparedBootstrap> {
+        let module_sha256 = attest_illustrator_request(request)?;
+        let plugin_root = fs::canonicalize(&request.plugin.installed_plugin_root)?;
+        let config_path = plugin_root.join(CONFIG_NAME);
+        let previous_config = match stable_file_bytes(&config_path, 64 * 1024) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).context("Illustrator bridge configuration is unavailable")
+            }
+        };
+        let transient_config = illustrator_bootstrap_config(
+            websocket_url,
+            token,
+            &request.target,
+            &request.host.profile_id,
+            Some(nonce),
+        )?
+        .into_bytes();
+        let committed_config = illustrator_bootstrap_config(
+            websocket_url,
+            token,
+            &request.target,
+            &request.host.profile_id,
+            None,
+        )?
+        .into_bytes();
+        Ok(PreparedBootstrap {
+            config_path: Some(config_path),
+            previous_config,
+            transient_config: Some(transient_config),
+            committed_config: Some(committed_config),
+            module_sha256,
+        })
+    }
+
+    fn begin_transaction(
+        &self,
+        prepared: PreparedBootstrap,
+    ) -> anyhow::Result<Arc<dyn PhotoshopBootstrapTransaction>> {
+        let path = prepared
+            .config_path
+            .context("prepared Illustrator configuration path is missing")?;
+        let transient = prepared
+            .transient_config
+            .context("prepared Illustrator transient configuration is missing")?;
+        let committed = prepared
+            .committed_config
+            .context("prepared Illustrator committed configuration is missing")?;
+        let expected = FileReceipt::capture(&path)?;
+        if expected.bytes() != prepared.previous_config.as_deref() {
+            return Err(anyhow!(
+                "Illustrator bridge configuration changed before transaction ownership"
+            ));
+        }
+        let owner = self
+            .config_owners
+            .lock()
+            .map_err(|_| anyhow!("Illustrator config owner lock failed"))?
+            .entry(path.clone())
+            .or_default()
+            .clone();
+        let lease = owner.begin(&path, &expected)?;
+        let staging_path = path
+            .parent()
+            .context("Illustrator configuration has no parent")?
+            .join(format!(".adobepy.{}.stage", Uuid::new_v4().simple()));
+        let mut staging = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)?;
+        staging.write_all(&transient)?;
+        staging.sync_all()?;
+        drop(staging);
+        let staged = match StagedArtifact::capture(lease.identity(), &staging_path) {
+            Ok(staged) => staged,
+            Err(error) => {
+                let _ = remove_staging_file(&staging_path);
+                let _ = lease.revoke();
+                return Err(error);
+            }
+        };
+        Ok(Arc::new(SystemBootstrapTransaction {
+            module_sha256: prepared.module_sha256,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            state: Mutex::new(SystemBootstrapTransactionState {
+                lease: Some(Arc::new(lease)),
+                staged,
+                committed_config: committed,
+                staging_path,
+                activated: false,
+                commit_receipt: None,
+            }),
+        }))
+    }
+
+    fn launch_owned(
+        &self,
+        target: &PhotoshopHostTarget,
+        cancelled: Arc<AtomicBool>,
+    ) -> anyhow::Result<LaunchedHostProcess> {
+        validate_illustrator_host_file(target)?;
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Illustrator launch ownership is revoked"));
+        }
+        let owned = self
+            .host_owner
+            .spawn_cancelable(
+                Path::new(&target.executable_path),
+                &self.launch_arguments,
+                cancelled.clone(),
+            )
+            .map_err(anyhow::Error::from)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let observed = loop {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(anyhow!("Illustrator launch ownership is revoked"));
+            }
+            match observe_process(owned.identity().pid()) {
+                Ok(observed) => break observed,
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if !same_path(
+            Path::new(&observed.executable_path),
+            Path::new(&target.executable_path),
+        ) {
+            return Err(anyhow!(
+                "the launched Illustrator process identity does not match the selected product"
+            ));
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Illustrator launch ownership is revoked"));
+        }
+        Ok(LaunchedHostProcess::owned(observed, owned))
+    }
+
+    fn process_matches(&self, observed: &ObservedHostProcess) -> bool {
+        observe_process(observed.pid).is_ok_and(|actual| actual == *observed)
+    }
+
+    fn executable_sha256(&self, path: &str) -> anyhow::Result<String> {
+        digest_file(Path::new(path))
+    }
+}
+
+fn attest_illustrator_request(request: &PhotoshopBootstrapRequest) -> anyhow::Result<String> {
+    validate_illustrator_host_file(&request.host)?;
+    let requested_root = Path::new(&request.plugin.installed_plugin_root);
+    ensure_no_redirects(requested_root)?;
+    let plugin_root =
+        fs::canonicalize(requested_root).context("installed Illustrator bridge is unavailable")?;
+    let requested_module = Path::new(&request.plugin.module_origin);
+    ensure_no_redirects(requested_module)?;
+    let module_origin = fs::canonicalize(requested_module)
+        .context("installed Illustrator bridge module is unavailable")?;
+    if !same_path(&module_origin, &plugin_root.join("dist").join("main.js")) {
+        return Err(anyhow!(
+            "installed Illustrator bridge module identity is invalid"
+        ));
+    }
+    let manifest = validate_exact_file(
+        &plugin_root.join("CSXS").join("manifest.xml"),
+        request.plugin.manifest_bytes,
+        &request.plugin.manifest_sha256,
+        1024 * 1024,
+    )?;
+    let index = validate_exact_file(
+        &plugin_root.join("index.html"),
+        request.plugin.index_bytes,
+        &request.plugin.index_sha256,
+        1024 * 1024,
+    )?;
+    validate_exact_file(
+        &module_origin,
+        request.plugin.module_bytes,
+        &request.plugin.module_sha256,
+        256 * 1024 * 1024,
+    )?;
+    if manifest != include_bytes!("../../../bridges/cep/illustrator/CSXS/manifest.xml")
+        || index != include_bytes!("../../../bridges/cep/illustrator/index.html")
+    {
+        return Err(anyhow!("Illustrator bridge manifest identity is invalid"));
+    }
+    Ok(request.plugin.module_sha256.clone())
+}
+
+fn validate_illustrator_host_file(target: &PhotoshopHostTarget) -> anyhow::Result<()> {
+    let requested_path = Path::new(&target.executable_path);
+    ensure_no_redirects(requested_path)?;
+    let path = fs::canonicalize(requested_path)
+        .context("selected Illustrator executable is unavailable")?;
+    if !is_illustrator_product_path(&path)
+        || validate_exact_file(
+            &path,
+            target.executable_bytes,
+            &target.executable_sha256,
+            MAX_HASH_BYTES,
+        )
+        .is_err()
+    {
+        return Err(anyhow!(
+            "selected Illustrator executable identity is invalid"
+        ));
+    }
+    Ok(())
+}
+
+fn is_illustrator_product_path(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let components = path
+            .ancestors()
+            .filter_map(|value| value.file_name().and_then(|name| name.to_str()))
+            .take(5)
+            .collect::<Vec<_>>();
+        components.len() == 5
+            && components[0].eq_ignore_ascii_case("Illustrator.exe")
+            && components[1].eq_ignore_ascii_case("Windows")
+            && components[2].eq_ignore_ascii_case("Contents")
+            && components[3].eq_ignore_ascii_case("Support Files")
+            && is_illustrator_install_dir(components[4])
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let components = path
+            .ancestors()
+            .filter_map(|value| value.file_name().and_then(|name| name.to_str()))
+            .take(5)
+            .collect::<Vec<_>>();
+        components.len() == 5
+            && components[0] == "Adobe Illustrator"
+            && components[1] == "MacOS"
+            && components[2] == "Contents"
+            && components[3] == "Adobe Illustrator.app"
+            && is_illustrator_install_dir(components[4])
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn is_illustrator_install_dir(value: &str) -> bool {
+    let Some(year) = value
+        .to_ascii_lowercase()
+        .strip_prefix("adobe illustrator ")
+        .map(str::to_owned)
+    else {
+        return false;
+    };
+    year.len() == 4 && year.starts_with("20") && year.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn attest_request(request: &PhotoshopBootstrapRequest) -> anyhow::Result<String> {
     validate_host_file(&request.host)?;
     let requested_root = Path::new(&request.plugin.installed_plugin_root);
@@ -684,6 +962,28 @@ fn bootstrap_config(
     ))
 }
 
+fn illustrator_bootstrap_config(
+    websocket_url: &str,
+    token: &str,
+    target: &str,
+    profile_id: &str,
+    nonce: Option<&str>,
+) -> anyhow::Result<String> {
+    let url = serde_json::to_string(websocket_url)?;
+    let token = serde_json::to_string(token)?;
+    let target = serde_json::to_string(target)?;
+    let profile_id = serde_json::to_string(profile_id)?;
+    let nonce_assignment = match nonce {
+        Some(value) => format!(
+            "globalThis.__ADOBEPY_BOOTSTRAP_NONCE={};",
+            serde_json::to_string(value)?
+        ),
+        None => "delete globalThis.__ADOBEPY_BOOTSTRAP_NONCE;".to_owned(),
+    };
+    Ok(format!(
+        "(function(){{globalThis.__ADOBEPY_BROKER_URL={url};globalThis.__ADOBEPY_TOKEN={token};globalThis.__ADOBEPY_TARGET={target};globalThis.__ADOBEPY_HOST_IDENTITY={{profileId:{profile_id}}};{nonce_assignment}}}());\n"
+    ))
+}
 fn validate_exact_file(
     path: &Path,
     expected_bytes: u64,
@@ -923,6 +1223,118 @@ fn observe_process(_pid: u32) -> anyhow::Result<ObservedHostProcess> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn illustrator_attestation_accepts_only_the_fixed_receipted_cep_tree() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("illustrator-bootstrap-{}", Uuid::new_v4().simple()));
+        let host = root
+            .join("Adobe Illustrator 2026")
+            .join("Support Files")
+            .join("Contents")
+            .join("Windows")
+            .join("Illustrator.exe");
+        let plugin = root.join("com.adobepy.bridge.illustrator");
+        fs::create_dir_all(host.parent().unwrap()).unwrap();
+        fs::create_dir_all(plugin.join("CSXS")).unwrap();
+        fs::create_dir_all(plugin.join("dist")).unwrap();
+        let executable = b"FAKE SIGNED ILLUSTRATOR FIXTURE";
+        let manifest = include_bytes!("../../../bridges/cep/illustrator/CSXS/manifest.xml");
+        let index = include_bytes!("../../../bridges/cep/illustrator/index.html");
+        let module = b"BOUNDED FAKE CEP MODULE";
+        fs::write(&host, executable).unwrap();
+        fs::write(plugin.join("CSXS").join("manifest.xml"), manifest).unwrap();
+        fs::write(plugin.join("index.html"), index).unwrap();
+        fs::write(plugin.join("dist").join("main.js"), module).unwrap();
+        let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let mut request = PhotoshopBootstrapRequest {
+            bootstrap_version: 1,
+            target: "illustration".into(),
+            timeout_ms: 1_000,
+            host: PhotoshopHostTarget {
+                executable_path: host.to_string_lossy().into_owned(),
+                executable_bytes: executable.len() as u64,
+                executable_sha256: hash(executable),
+                host_version: "30.0.0".into(),
+                profile_id: "illustrator-production".into(),
+            },
+            plugin: adobepy_protocol::PhotoshopPluginTarget {
+                installed_plugin_root: plugin.to_string_lossy().into_owned(),
+                module_origin: plugin
+                    .join("dist")
+                    .join("main.js")
+                    .to_string_lossy()
+                    .into_owned(),
+                bridge_version: "0.1.0".into(),
+                manifest_bytes: manifest.len() as u64,
+                manifest_sha256: hash(manifest),
+                index_bytes: index.len() as u64,
+                index_sha256: hash(index),
+                module_bytes: module.len() as u64,
+                module_sha256: hash(module),
+            },
+        };
+        let backend = SystemIllustratorBootstrapBackend::default();
+        assert_eq!(backend.attest(&request).unwrap(), hash(module));
+        assert!(!plugin.join(CONFIG_NAME).exists());
+        let shadow_host = root
+            .join("Adobe Illustrator Shadow")
+            .join("Support Files")
+            .join("Contents")
+            .join("Windows")
+            .join("Illustrator.exe");
+        fs::create_dir_all(shadow_host.parent().unwrap()).unwrap();
+        fs::write(&shadow_host, executable).unwrap();
+        let mut shadow_request = request.clone();
+        shadow_request.host.executable_path = shadow_host.to_string_lossy().into_owned();
+        assert!(backend.attest(&shadow_request).is_err());
+        assert!(!plugin.join(CONFIG_NAME).exists());
+        let prepared = backend
+            .prepare(
+                &request,
+                &"1".repeat(64),
+                "PRIVATE_TEST_TOKEN",
+                "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
+            )
+            .unwrap();
+        let transaction = backend.begin_transaction(prepared).unwrap();
+        transaction.activate().unwrap();
+        let transient = fs::read_to_string(plugin.join(CONFIG_NAME)).unwrap();
+        assert!(transient.contains("illustrator-production"));
+        assert!(transient.contains(&"1".repeat(64)));
+        transaction.rollback().unwrap();
+        assert!(!plugin.join(CONFIG_NAME).exists());
+
+        let prepared = backend
+            .prepare(
+                &request,
+                &"1".repeat(64),
+                "PRIVATE_TEST_TOKEN",
+                "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
+            )
+            .unwrap();
+        let transaction = backend.begin_transaction(prepared).unwrap();
+        transaction.activate().unwrap();
+        transaction.finalize_pending().unwrap();
+        let confirmation = transaction.clone().prepare_commit_confirmation().unwrap();
+        let publication = confirmation.confirm().unwrap();
+        publication.publish().unwrap();
+        let committed = fs::read_to_string(plugin.join(CONFIG_NAME)).unwrap();
+        assert!(committed.contains("illustrator-production"));
+        assert!(!committed.contains(&"1".repeat(64)));
+
+        let foreign_manifest =
+            b"<ExtensionManifest><ScriptPath>foreign.jsx</ScriptPath></ExtensionManifest>";
+        fs::write(plugin.join("CSXS").join("manifest.xml"), foreign_manifest).unwrap();
+        request.plugin.manifest_bytes = foreign_manifest.len() as u64;
+        request.plugin.manifest_sha256 = hash(foreign_manifest);
+        assert!(backend.attest(&request).is_err());
+        assert!(!plugin.join(CONFIG_NAME).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn atomic_config_replace_and_nonce_consumption_are_exact() {

@@ -8,6 +8,7 @@ const vm = require("vm");
 
 const root = path.resolve(__dirname, "..");
 const bundlePath = path.join(root, "bridges", "cep", "after-effects", "dist", "main.js");
+const illustratorBundlePath = path.join(root, "bridges", "cep", "illustrator", "dist", "main.js");
 const afterEffectsDispatcherPath = path.join(root, "bridges", "cep", "after-effects", "host", "dispatcher.jsx");
 const illustratorDispatcherPath = path.join(root, "bridges", "cep", "illustrator", "host", "dispatcher.jsx");
 const illustratorManifestPath = path.join(root, "bridges", "cep", "illustrator", "CSXS", "manifest.xml");
@@ -77,6 +78,7 @@ async function main() {
   const context = {
     console,
     setTimeout,
+    clearTimeout,
     setImmediate,
     WebSocket: FakeWebSocket,
     __adobe_cep__: fakeCep,
@@ -98,6 +100,7 @@ async function main() {
   assert.strictEqual(sent[0].capabilities.host, "after-effects");
   assert.ok(sent[0].capabilities.methods.dom.includes("snapshot"));
   assert.deepStrictEqual(sent[0].capabilities.methods.raw, ["evalExtendScript"]);
+  await testIllustratorIdentityHello();
   testIllustratorBackgroundLifecycle();
 
   const edgeCaseArgument = `quote ' " ${String.fromCharCode(0x2028)}`;
@@ -128,6 +131,90 @@ async function main() {
 
   testExtendScriptDispatchers();
   console.log("CEP bridge protocol test passed");
+}
+
+async function testIllustratorIdentityHello() {
+  assert.ok(fs.existsSync(illustratorBundlePath), `missing CEP bundle: ${illustratorBundlePath}`);
+  const sent = [];
+  class FakeWebSocket {
+    constructor() {
+      this.readyState = 0;
+      setImmediate(() => {
+        this.readyState = 1;
+        this.onopen?.({});
+      });
+    }
+    send(payload) {
+      sent.push(JSON.parse(payload));
+    }
+  }
+  const fakeCep = {
+    getSystemPath(name) {
+      assert.strictEqual(name, "extension");
+      return "C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.illustrator";
+    },
+    evalScript(script, callback) {
+      if (script.startsWith("$.evalFile(")) {
+        callback("true");
+        return;
+      }
+      if (script.includes("typeof adobepyDispatch")) {
+        callback("ready");
+        return;
+      }
+      if (script.includes("app.version")) {
+        callback("28.2.0");
+        return;
+      }
+      assert.fail(`unexpected Illustrator evalScript payload: ${script}`);
+    }
+  };
+  const context = {
+    console,
+    setTimeout,
+    clearTimeout,
+    setImmediate,
+    WebSocket: FakeWebSocket,
+    __adobe_cep__: fakeCep,
+    __ADOBEPY_TOKEN: "PRIVATE_TEST_TOKEN",
+    __ADOBEPY_TARGET: "illustration",
+    __ADOBEPY_BOOTSTRAP_NONCE: "a".repeat(64),
+    __ADOBEPY_HOST_IDENTITY: {
+      pid: 4242,
+      processStartIdentity: "windows:133700000000000100",
+      executablePath: "C:/Program Files/Adobe/Adobe Illustrator 2026/Support Files/Contents/Windows/Illustrator.exe",
+      profileId: "illustrator-production"
+    },
+    crypto: { randomUUID: () => "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99" }
+  };
+  context.globalThis = context;
+  vm.runInNewContext(fs.readFileSync(illustratorBundlePath, "utf8"), context, {
+    filename: illustratorBundlePath
+  });
+  await waitForMicrotasks();
+  await waitForMicrotasks();
+
+  assert.strictEqual(sent.length, 1);
+  const hello = sent[0];
+  assert.strictEqual(hello.type, "hello");
+  assert.strictEqual(hello.capabilities.bridgeVersion, "0.1.0");
+  assert.strictEqual(hello.capabilities.hostVersion, "28.2.0");
+  assert.strictEqual(hello.bootstrapNonce, "a".repeat(64));
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(hello.identity)), {
+    host: {
+      pid: 4242,
+      processStartIdentity: "windows:133700000000000100",
+      executablePath: "C:/Program Files/Adobe/Adobe Illustrator 2026/Support Files/Contents/Windows/Illustrator.exe",
+      hostVersion: "28.2.0",
+      profileId: "illustrator-production"
+    },
+    bridge: {
+      instanceId: "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99",
+      installedPluginRoot: "C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.illustrator",
+      moduleOrigin: "C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.illustrator/dist/main.js"
+    }
+  });
+  assert.ok(!JSON.stringify(hello.identity).includes("PRIVATE_TEST_TOKEN"));
 }
 
 function testIllustratorBackgroundLifecycle() {
