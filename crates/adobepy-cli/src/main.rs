@@ -117,6 +117,7 @@ fn doctor(args: DoctorArgs) -> Result<()> {
             args.python.as_deref(),
             args.python_home.as_deref(),
         ),
+        bootstrap_helper_check(),
         json!({"name": "bridge_templates", "ok": repo_root.as_ref().is_some_and(|root| root.join("bridges").is_dir()), "detail": repo_root.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "repository root not found".to_owned())}),
     ];
     if args.json {
@@ -133,6 +134,35 @@ fn doctor(args: DoctorArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn bootstrap_helper_check() -> serde_json::Value {
+    let result = (|| -> Result<PathBuf> {
+        let current = fs::canonicalize(std::env::current_exe()?)?;
+        let helper = current
+            .parent()
+            .context("adobepy executable has no parent")?
+            .join(if cfg!(windows) {
+                "adobepy-bootstrap-helper.exe"
+            } else {
+                "adobepy-bootstrap-helper"
+            });
+        let metadata = fs::symlink_metadata(&helper)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!("bootstrap helper is not a regular sibling executable");
+        }
+        let helper = fs::canonicalize(helper)?;
+        if helper.parent() != current.parent() {
+            bail!("bootstrap helper is not an exact executable sibling");
+        }
+        Ok(helper)
+    })();
+    match result {
+        Ok(path) => {
+            json!({"name": "bootstrap_helper", "ok": true, "detail": path.display().to_string()})
+        }
+        Err(error) => json!({"name": "bootstrap_helper", "ok": false, "detail": error.to_string()}),
+    }
 }
 
 fn python_runtime_check(

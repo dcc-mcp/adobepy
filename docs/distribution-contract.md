@@ -94,6 +94,7 @@ adobepy-<version>-windows-x64.zip.sha256
 adobepy-<version>-windows-x64/
   bin/
     adobepy.exe            # Rust CLI (broker, doctor, install-bridge, repl)
+    adobepy-bootstrap-helper.exe # Fixed sibling for bounded bootstrap work
     adobepy.pdb            # Debug symbols (optional)
   wheels/
     adobepy-<version>-py3-none-any.whl
@@ -132,6 +133,13 @@ vx just package
 # or directly:
 ./scripts/package-release.ps1
 ```
+
+The installer rejects an archive that is missing either native executable.
+`adobepy` resolves the helper only as a canonical, regular, non-reparse sibling;
+it never searches `PATH` or accepts an environment override for this boundary.
+The PyPI wheel remains pure Python and intentionally contains neither native
+executable. Native bootstrap transactions therefore require the GitHub Release
+runtime bundle.
 
 The CI gate (`release.yml` → `windows-package` job) runs after the Python
 package is built and verified. It uploads `.zip` + `.sha256` as a build artifact

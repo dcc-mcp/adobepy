@@ -40,6 +40,7 @@ ABI-specific wheels are published in Phase 1.
 | Binary | Source | Platform | Phase 1 |
 | --- | --- | --- | --- |
 | `adobepy.exe` (CLI + broker) | `crates/adobepy-cli` | Windows x86-64 | Bundled in release asset |
+| `adobepy-bootstrap-helper.exe` (bounded bootstrap worker) | `crates/adobepy-broker` | Windows x86-64 | Bundled beside `adobepy.exe`; not in the wheel |
 | Python wheel | `python/adobe/` | any (pure) | Published to PyPI |
 | UXP bridge bundles | `bridges/uxp/` | any | Bundled in release asset |
 | CEP bridge bundles | `bridges/cep/` | any | Bundled in release asset |

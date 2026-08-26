@@ -26,6 +26,7 @@ lint:
 
 build:
     cargo build --release -p adobepy-cli --bin adobepy
+    cargo build --release -p adobepy-broker --bin adobepy-bootstrap-helper
     npm run uxp:build
     npm run cep:build
 

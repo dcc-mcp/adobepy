@@ -67,6 +67,11 @@ finally:
 
 After locating `adobepy.exe`, the helper starts the broker as a child process.
 
+Bootstrap work performed by the broker uses a different executable,
+`adobepy-bootstrap-helper.exe`. It is an internal fixed sibling of
+`adobepy.exe`: adapters must not discover, invoke, or override it independently.
+The broker validates its canonical path and regular-file identity before use.
+
 ### 2.1 Command
 
 ```powershell
