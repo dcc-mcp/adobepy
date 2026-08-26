@@ -3,16 +3,18 @@ use anyhow::{anyhow, Context};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::bootstrap_transaction::{
-    read_bounded_sync, same_file_identity, ConfigCommitConfirmation, ConfigLease,
+    same_file_identity, ConfigCommitConfirmation, ConfigLease,
     ConfigPublicationPermit, ConfigTransactionOwner, FileReceipt, HostProcessBroker,
     OwnedHostProcess, StagedArtifact,
 };
@@ -27,13 +29,68 @@ pub(crate) struct ObservedHostProcess {
     pub executable_path: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PreparedBootstrap {
     config_path: Option<PathBuf>,
     previous_config: Option<Vec<u8>>,
     transient_config: Option<Vec<u8>>,
     committed_config: Option<Vec<u8>>,
     pub module_sha256: String,
+    illustrator_receipt: Option<IllustratorPluginReceipt>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BlockingDeadline {
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("bounded bootstrap operation was cancelled")]
+struct BlockingOperationCancelled;
+
+impl BlockingDeadline {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline: Instant::now() + timeout,
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn checkpoint(&self) -> anyhow::Result<()> {
+        if self.cancelled.load(Ordering::SeqCst) || Instant::now() >= self.deadline {
+            return Err(BlockingOperationCancelled.into());
+        }
+        Ok(())
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    pub(crate) fn interruptible_sleep(&self, duration: Duration) -> anyhow::Result<()> {
+        let sleep_deadline = Instant::now() + duration;
+        loop {
+            self.checkpoint()?;
+            let now = Instant::now();
+            if now >= sleep_deadline {
+                return Ok(());
+            }
+            thread::sleep((sleep_deadline - now).min(Duration::from_millis(2)));
+        }
+    }
+}
+
+pub(crate) fn is_blocking_deadline_error(error: &anyhow::Error) -> bool {
+    error.is::<BlockingOperationCancelled>()
+        || error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
 }
 
 impl PreparedBootstrap {
@@ -45,6 +102,7 @@ impl PreparedBootstrap {
             transient_config: None,
             committed_config: None,
             module_sha256: module_sha256.into(),
+            illustrator_receipt: None,
         }
     }
 
@@ -62,12 +120,19 @@ impl PreparedBootstrap {
             transient_config: Some(transient_config),
             committed_config: Some(committed_config),
             module_sha256: module_sha256.into(),
+            illustrator_receipt: None,
         }
     }
 }
 
 pub(crate) trait PhotoshopBootstrapTransaction: Send + Sync {
     fn module_sha256(&self) -> &str;
+    fn validate_prepared_identity_bounded(
+        &self,
+        deadline: &BlockingDeadline,
+    ) -> anyhow::Result<()> {
+        deadline.checkpoint()
+    }
     fn activate(&self) -> anyhow::Result<()>;
     fn finalize_pending(&self) -> anyhow::Result<()>;
     fn prepare_commit_confirmation(
@@ -90,6 +155,8 @@ pub(crate) struct LaunchedHostProcess {
     owned: Option<OwnedHostProcess>,
     #[cfg(test)]
     fake_live: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    fake_terminations: Option<Arc<AtomicUsize>>,
 }
 
 impl LaunchedHostProcess {
@@ -99,15 +166,22 @@ impl LaunchedHostProcess {
             owned: Some(owned),
             #[cfg(test)]
             fake_live: None,
+            #[cfg(test)]
+            fake_terminations: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn fake(observed: ObservedHostProcess, live: Arc<AtomicBool>) -> Self {
+    pub(crate) fn fake(
+        observed: ObservedHostProcess,
+        live: Arc<AtomicBool>,
+        terminations: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             observed,
             owned: None,
             fake_live: Some(live),
+            fake_terminations: Some(terminations),
         }
     }
 
@@ -118,6 +192,9 @@ impl LaunchedHostProcess {
         #[cfg(test)]
         if let Some(live) = self.fake_live.take() {
             live.store(false, Ordering::SeqCst);
+            if let Some(terminations) = self.fake_terminations.take() {
+                terminations.fetch_add(1, Ordering::SeqCst);
+            }
             return Ok(());
         }
         let owned = self
@@ -130,6 +207,28 @@ impl LaunchedHostProcess {
             .map(|_| ())
             .map_err(anyhow::Error::from)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathReceipt {
+    requested: PathBuf,
+    canonical: PathBuf,
+    filesystem_identity: (u64, u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IllustratorFileReceipt {
+    path: PathReceipt,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IllustratorPluginReceipt {
+    root: PathReceipt,
+    manifest: IllustratorFileReceipt,
+    index: IllustratorFileReceipt,
+    module: IllustratorFileReceipt,
 }
 
 pub(crate) trait PhotoshopBootstrapBackend: Send + Sync {
@@ -157,6 +256,48 @@ pub(crate) trait PhotoshopBootstrapBackend: Send + Sync {
     fn process_matches(&self, observed: &ObservedHostProcess) -> bool;
 
     fn executable_sha256(&self, path: &str) -> anyhow::Result<String>;
+
+    fn terminate(&self, _observed: &ObservedHostProcess) -> anyhow::Result<()> {
+        Err(anyhow!("host termination is unavailable"))
+    }
+
+    fn validate_prepared_identity(&self, _prepared: &PreparedBootstrap) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn attest_bounded(
+        &self,
+        request: &PhotoshopBootstrapRequest,
+        deadline: &BlockingDeadline,
+    ) -> anyhow::Result<String> {
+        deadline.checkpoint()?;
+        let result = self.attest(request);
+        deadline.checkpoint()?;
+        result
+    }
+
+    fn executable_sha256_bounded(
+        &self,
+        path: &str,
+        deadline: &BlockingDeadline,
+    ) -> anyhow::Result<String> {
+        deadline.checkpoint()?;
+        let result = self.executable_sha256(path);
+        deadline.checkpoint()?;
+        result
+    }
+
+    fn validate_prepared_identity_bounded(
+        &self,
+        prepared: &PreparedBootstrap,
+        deadline: &BlockingDeadline,
+    ) -> anyhow::Result<()> {
+        deadline.checkpoint()?;
+        let result = self.validate_prepared_identity(prepared);
+        deadline.checkpoint()?;
+        result
+    }
+
 }
 
 #[derive(Debug, Default)]
@@ -185,6 +326,7 @@ impl SystemPhotoshopBootstrapBackend {
 
 struct SystemBootstrapTransaction {
     module_sha256: String,
+    illustrator_receipt: Option<IllustratorPluginReceipt>,
     cancelled: Arc<AtomicBool>,
     state: Mutex<SystemBootstrapTransactionState>,
 }
@@ -253,6 +395,17 @@ impl PhotoshopBootstrapTransaction for SystemBootstrapTransaction {
         &self.module_sha256
     }
 
+    fn validate_prepared_identity_bounded(
+        &self,
+        deadline: &BlockingDeadline,
+    ) -> anyhow::Result<()> {
+        deadline.checkpoint()?;
+        if let Some(receipt) = self.illustrator_receipt.as_ref() {
+            recapture_illustrator_receipt_bounded(receipt, Some(deadline))?;
+        }
+        deadline.checkpoint()
+    }
+
     fn activate(&self) -> anyhow::Result<()> {
         if self.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
@@ -294,6 +447,9 @@ impl PhotoshopBootstrapTransaction for SystemBootstrapTransaction {
     fn finalize_pending(&self) -> anyhow::Result<()> {
         if self.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
+        if let Some(receipt) = self.illustrator_receipt.as_ref() {
+            recapture_illustrator_receipt(receipt)?;
         }
         let (lease, committed, staging_path) = {
             let state = self
@@ -442,6 +598,7 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
             transient_config: Some(transient_config),
             committed_config: Some(committed_config),
             module_sha256,
+            illustrator_receipt: None,
         })
     }
 
@@ -493,6 +650,7 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
         };
         Ok(Arc::new(SystemBootstrapTransaction {
             module_sha256: prepared.module_sha256,
+            illustrator_receipt: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             state: Mutex::new(SystemBootstrapTransactionState {
                 lease: Some(Arc::new(lease)),
@@ -571,7 +729,8 @@ impl PhotoshopBootstrapBackend for SystemIllustratorBootstrapBackend {
         token: &str,
         websocket_url: &str,
     ) -> anyhow::Result<PreparedBootstrap> {
-        let module_sha256 = attest_illustrator_request(request)?;
+        let illustrator_receipt = attest_illustrator_request_with_receipt(request)?;
+        let module_sha256 = illustrator_receipt.module.sha256.clone();
         let plugin_root = fs::canonicalize(&request.plugin.installed_plugin_root)?;
         let config_path = plugin_root.join(CONFIG_NAME);
         let previous_config = match stable_file_bytes(&config_path, 64 * 1024) {
@@ -603,6 +762,7 @@ impl PhotoshopBootstrapBackend for SystemIllustratorBootstrapBackend {
             transient_config: Some(transient_config),
             committed_config: Some(committed_config),
             module_sha256,
+            illustrator_receipt: Some(illustrator_receipt),
         })
     }
 
@@ -654,6 +814,7 @@ impl PhotoshopBootstrapBackend for SystemIllustratorBootstrapBackend {
         };
         Ok(Arc::new(SystemBootstrapTransaction {
             module_sha256: prepared.module_sha256,
+            illustrator_receipt: prepared.illustrator_receipt,
             cancelled: Arc::new(AtomicBool::new(false)),
             state: Mutex::new(SystemBootstrapTransactionState {
                 lease: Some(Arc::new(lease)),
@@ -718,16 +879,82 @@ impl PhotoshopBootstrapBackend for SystemIllustratorBootstrapBackend {
     fn executable_sha256(&self, path: &str) -> anyhow::Result<String> {
         digest_file(Path::new(path))
     }
+
+    fn validate_prepared_identity(&self, prepared: &PreparedBootstrap) -> anyhow::Result<()> {
+        let receipt = prepared
+            .illustrator_receipt
+            .as_ref()
+            .context("Illustrator bootstrap identity receipt is unavailable")?;
+        recapture_illustrator_receipt(receipt)
+    }
+
+    fn terminate(&self, observed: &ObservedHostProcess) -> anyhow::Result<()> {
+        let deadline = BlockingDeadline::new(Duration::from_secs(2));
+        terminate_observed_process(observed, &deadline)
+    }
+
+    fn attest_bounded(
+        &self,
+        request: &PhotoshopBootstrapRequest,
+        deadline: &BlockingDeadline,
+    ) -> anyhow::Result<String> {
+        Ok(
+            attest_illustrator_request_with_receipt_bounded(request, Some(deadline))?
+                .module
+                .sha256,
+        )
+    }
+
+    fn executable_sha256_bounded(
+        &self,
+        path: &str,
+        deadline: &BlockingDeadline,
+    ) -> anyhow::Result<String> {
+        let bytes = stable_file_bytes_bounded(Path::new(path), MAX_HASH_BYTES, Some(deadline))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    fn validate_prepared_identity_bounded(
+        &self,
+        prepared: &PreparedBootstrap,
+        deadline: &BlockingDeadline,
+    ) -> anyhow::Result<()> {
+        let receipt = prepared
+            .illustrator_receipt
+            .as_ref()
+            .context("Illustrator bootstrap identity receipt is unavailable")?;
+        recapture_illustrator_receipt_bounded(receipt, Some(deadline))
+    }
+
 }
 
 fn attest_illustrator_request(request: &PhotoshopBootstrapRequest) -> anyhow::Result<String> {
-    validate_illustrator_host_file(&request.host)?;
+    Ok(attest_illustrator_request_with_receipt(request)?
+        .module
+        .sha256)
+}
+
+fn attest_illustrator_request_with_receipt(
+    request: &PhotoshopBootstrapRequest,
+) -> anyhow::Result<IllustratorPluginReceipt> {
+    attest_illustrator_request_with_receipt_bounded(request, None)
+}
+
+fn attest_illustrator_request_with_receipt_bounded(
+    request: &PhotoshopBootstrapRequest,
+    deadline: Option<&BlockingDeadline>,
+) -> anyhow::Result<IllustratorPluginReceipt> {
+    deadline_checkpoint(deadline)?;
+    if let Some(deadline) = deadline {
+        validate_illustrator_host_file_bounded(&request.host, deadline)?;
+    } else {
+        validate_illustrator_host_file(&request.host)?;
+    }
     let requested_root = Path::new(&request.plugin.installed_plugin_root);
-    ensure_no_redirects(requested_root)?;
-    let plugin_root =
-        fs::canonicalize(requested_root).context("installed Illustrator bridge is unavailable")?;
+    let root = capture_path_receipt_bounded(requested_root, true, deadline)
+        .context("installed Illustrator bridge is unavailable")?;
+    let plugin_root = root.canonical.clone();
     let requested_module = Path::new(&request.plugin.module_origin);
-    ensure_no_redirects(requested_module)?;
     let module_origin = fs::canonicalize(requested_module)
         .context("installed Illustrator bridge module is unavailable")?;
     if !same_path(&module_origin, &plugin_root.join("dist").join("main.js")) {
@@ -735,30 +962,216 @@ fn attest_illustrator_request(request: &PhotoshopBootstrapRequest) -> anyhow::Re
             "installed Illustrator bridge module identity is invalid"
         ));
     }
-    let manifest = validate_exact_file(
+    let (manifest, manifest_receipt) = capture_exact_file_bounded(
         &plugin_root.join("CSXS").join("manifest.xml"),
         request.plugin.manifest_bytes,
         &request.plugin.manifest_sha256,
         1024 * 1024,
+        deadline,
     )?;
-    let index = validate_exact_file(
+    let (index, index_receipt) = capture_exact_file_bounded(
         &plugin_root.join("index.html"),
         request.plugin.index_bytes,
         &request.plugin.index_sha256,
         1024 * 1024,
+        deadline,
     )?;
-    validate_exact_file(
-        &module_origin,
+    let (_, module_receipt) = capture_exact_file_bounded(
+        requested_module,
         request.plugin.module_bytes,
         &request.plugin.module_sha256,
         256 * 1024 * 1024,
+        deadline,
     )?;
     if manifest != include_bytes!("../../../bridges/cep/illustrator/CSXS/manifest.xml")
         || index != include_bytes!("../../../bridges/cep/illustrator/index.html")
     {
         return Err(anyhow!("Illustrator bridge manifest identity is invalid"));
     }
-    Ok(request.plugin.module_sha256.clone())
+    Ok(IllustratorPluginReceipt {
+        root,
+        manifest: manifest_receipt,
+        index: index_receipt,
+        module: module_receipt,
+    })
+}
+
+fn recapture_illustrator_receipt(expected: &IllustratorPluginReceipt) -> anyhow::Result<()> {
+    recapture_illustrator_receipt_bounded(expected, None)
+}
+
+fn recapture_illustrator_receipt_bounded(
+    expected: &IllustratorPluginReceipt,
+    deadline: Option<&BlockingDeadline>,
+) -> anyhow::Result<()> {
+    let root = capture_path_receipt_bounded(&expected.root.requested, true, deadline)?;
+    let (_, manifest) = capture_exact_file_bounded(
+        &expected.manifest.path.requested,
+        expected.manifest.bytes,
+        &expected.manifest.sha256,
+        1024 * 1024,
+        deadline,
+    )?;
+    let (_, index) = capture_exact_file_bounded(
+        &expected.index.path.requested,
+        expected.index.bytes,
+        &expected.index.sha256,
+        1024 * 1024,
+        deadline,
+    )?;
+    let (_, module) = capture_exact_file_bounded(
+        &expected.module.path.requested,
+        expected.module.bytes,
+        &expected.module.sha256,
+        256 * 1024 * 1024,
+        deadline,
+    )?;
+    if root != expected.root
+        || manifest != expected.manifest
+        || index != expected.index
+        || module != expected.module
+    {
+        return Err(anyhow!(
+            "Illustrator bridge identity changed after attestation"
+        ));
+    }
+    Ok(())
+}
+
+fn capture_exact_file_bounded(
+    path: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    maximum: u64,
+    deadline: Option<&BlockingDeadline>,
+) -> anyhow::Result<(Vec<u8>, IllustratorFileReceipt)> {
+    let before = capture_path_receipt_bounded(path, false, deadline)?;
+    let bytes =
+        validate_exact_file_bounded(path, expected_bytes, expected_sha256, maximum, deadline)?;
+    let after = capture_path_receipt_bounded(path, false, deadline)?;
+    if before != after {
+        return Err(anyhow!("file identity changed during attestation"));
+    }
+    Ok((
+        bytes,
+        IllustratorFileReceipt {
+            path: after,
+            bytes: expected_bytes,
+            sha256: expected_sha256.to_owned(),
+        },
+    ))
+}
+
+fn capture_path_receipt_bounded(
+    path: &Path,
+    expect_directory: bool,
+    deadline: Option<&BlockingDeadline>,
+) -> std::io::Result<PathReceipt> {
+    deadline_checkpoint(deadline)?;
+    ensure_no_redirects(path)?;
+    let canonical = fs::canonicalize(path)?;
+    ensure_no_redirects(&canonical)?;
+    let metadata = fs::metadata(path)?;
+    if metadata.is_dir() != expect_directory || (!expect_directory && !metadata.is_file()) {
+        return Err(std::io::Error::other("filesystem object type is invalid"));
+    }
+    let filesystem_identity = filesystem_identity(path, &metadata)
+        .ok_or_else(|| std::io::Error::other("filesystem identity is unavailable"))?;
+    deadline_checkpoint(deadline)?;
+    Ok(PathReceipt {
+        requested: path.to_path_buf(),
+        canonical,
+        filesystem_identity,
+    })
+}
+
+fn deadline_checkpoint(deadline: Option<&BlockingDeadline>) -> std::io::Result<()> {
+    deadline
+        .map(BlockingDeadline::checkpoint)
+        .transpose()
+        .map(|_| ())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out"))
+}
+
+#[cfg(windows)]
+fn filesystem_identity(path: &Path, _metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    handle_filesystem_identity(&file, &metadata)
+}
+
+#[cfg(windows)]
+fn handle_filesystem_identity(file: &fs::File, _metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            handle: isize,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut information = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
+    if unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as isize, information.as_mut_ptr())
+    } == 0
+    {
+        return None;
+    }
+    let information = unsafe { information.assume_init() };
+    Some((
+        u64::from(information.volume_serial_number),
+        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low),
+    ))
+}
+
+#[cfg(unix)]
+fn filesystem_identity(_path: &Path, metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn handle_filesystem_identity(_file: &fs::File, metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    filesystem_identity(Path::new(""), metadata)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn filesystem_identity(_path: &Path, _metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(not(any(windows, unix)))]
+fn handle_filesystem_identity(_file: &fs::File, _metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 fn validate_illustrator_host_file(target: &PhotoshopHostTarget) -> anyhow::Result<()> {
@@ -780,6 +1193,32 @@ fn validate_illustrator_host_file(target: &PhotoshopHostTarget) -> anyhow::Resul
         ));
     }
     Ok(())
+}
+
+fn validate_illustrator_host_file_bounded(
+    target: &PhotoshopHostTarget,
+    deadline: &BlockingDeadline,
+) -> anyhow::Result<()> {
+    deadline.checkpoint()?;
+    let requested_path = Path::new(&target.executable_path);
+    ensure_no_redirects(requested_path)?;
+    let path = fs::canonicalize(requested_path)
+        .context("selected Illustrator executable is unavailable")?;
+    if !is_illustrator_product_path(&path)
+        || validate_exact_file_bounded(
+            &path,
+            target.executable_bytes,
+            &target.executable_sha256,
+            MAX_HASH_BYTES,
+            Some(deadline),
+        )
+        .is_err()
+    {
+        return Err(anyhow!(
+            "selected Illustrator executable identity is invalid"
+        ));
+    }
+    deadline.checkpoint()
 }
 
 fn is_illustrator_product_path(path: &Path) -> bool {
@@ -990,10 +1429,20 @@ fn validate_exact_file(
     expected_sha256: &str,
     maximum: u64,
 ) -> anyhow::Result<Vec<u8>> {
+    validate_exact_file_bounded(path, expected_bytes, expected_sha256, maximum, None)
+}
+
+fn validate_exact_file_bounded(
+    path: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    maximum: u64,
+    deadline: Option<&BlockingDeadline>,
+) -> anyhow::Result<Vec<u8>> {
     if expected_bytes == 0 || expected_bytes > maximum || !is_sha256(expected_sha256) {
         return Err(anyhow!("file identity is invalid"));
     }
-    let bytes = stable_file_bytes(path, maximum)?;
+    let bytes = stable_file_bytes_bounded(path, maximum, deadline)?;
     if u64::try_from(bytes.len())? != expected_bytes
         || format!("{:x}", Sha256::digest(&bytes)) != expected_sha256
     {
@@ -1003,17 +1452,46 @@ fn validate_exact_file(
 }
 
 fn stable_file_bytes(path: &Path, maximum: u64) -> std::io::Result<Vec<u8>> {
+    stable_file_bytes_bounded(path, maximum, None)
+}
+
+fn stable_file_bytes_bounded(
+    path: &Path,
+    maximum: u64,
+    deadline: Option<&BlockingDeadline>,
+) -> std::io::Result<Vec<u8>> {
+    deadline_checkpoint(deadline)?;
     ensure_no_redirects(path)?;
     let mut file = fs::File::open(path)?;
     let before = file.metadata()?;
+    let handle_identity = handle_filesystem_identity(&file, &before)
+        .ok_or_else(|| std::io::Error::other("file handle identity is unavailable"))?;
     if !before.is_file() || before.len() == 0 || before.len() > maximum {
         return Err(std::io::Error::other("file is empty or unbounded"));
     }
-    let bytes = read_bounded_sync(&mut file, maximum)?;
+    let capacity =
+        usize::try_from(before.len()).map_err(|_| std::io::Error::other("file is too large"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        deadline_checkpoint(deadline)?;
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.len() > capacity {
+            return Err(std::io::Error::other("file grew during attestation"));
+        }
+    }
     let handle_after = file.metadata()?;
     ensure_no_redirects(path)?;
     let path_after = fs::symlink_metadata(path)?;
     let path_after_handle = fs::File::open(path)?;
+    let handle_identity_after = handle_filesystem_identity(&file, &handle_after)
+        .ok_or_else(|| std::io::Error::other("file handle identity is unavailable"))?;
+    let path_identity_after = filesystem_identity(path, &path_after)
+        .ok_or_else(|| std::io::Error::other("file path identity is unavailable"))?;
     if before.len() != handle_after.len()
         || before.modified()? != handle_after.modified()?
         || before.len() != path_after.len()
@@ -1022,11 +1500,13 @@ fn stable_file_bytes(path: &Path, maximum: u64) -> std::io::Result<Vec<u8>> {
         || is_windows_reparse(&path_after)
         || !same_file_identity(&file, &path_after_handle)
             .map_err(|_| std::io::Error::other("file identity is unavailable"))?
-        || u64::try_from(bytes.len()).map_err(|_| std::io::Error::other("file is too large"))?
-            != before.len()
+        || handle_identity != handle_identity_after
+        || handle_identity != path_identity_after
+        || bytes.len() != capacity
     {
         return Err(std::io::Error::other("file changed during attestation"));
     }
+    deadline_checkpoint(deadline)?;
     Ok(bytes)
 }
 
@@ -1083,6 +1563,135 @@ fn same_path(left: &Path, right: &Path) -> bool {
         (Some(left), Some(right)) => left == right,
         _ => false,
     }
+}
+
+#[cfg(windows)]
+fn terminate_observed_process(
+    observed: &ObservedHostProcess,
+    deadline: &BlockingDeadline,
+) -> anyhow::Result<()> {
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn QueryFullProcessImageNameW(
+            process: isize,
+            flags: u32,
+            buffer: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+        fn GetProcessTimes(
+            process: isize,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn TerminateProcess(process: isize, exit_code: u32) -> i32;
+        fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0;
+
+    deadline.checkpoint()?;
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+            0,
+            observed.pid,
+        )
+    };
+    if handle == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let outcome = (|| {
+        let mut path = vec![0_u16; 32_768];
+        let mut path_len = u32::try_from(path.len())?;
+        if unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut path_len) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut creation = FileTime { low: 0, high: 0 };
+        let mut exit = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let creation_ticks = (u64::from(creation.high) << 32) | u64::from(creation.low);
+        let actual = ObservedHostProcess {
+            pid: observed.pid,
+            process_start_identity: format!("windows:{creation_ticks}"),
+            executable_path: String::from_utf16(&path[..usize::try_from(path_len)?])?,
+        };
+        if &actual != observed {
+            return Err(anyhow!(
+                "Illustrator process identity changed before cleanup"
+            ));
+        }
+        if unsafe { TerminateProcess(handle, 1) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let milliseconds = u32::try_from(deadline.remaining().as_millis())
+            .unwrap_or(u32::MAX)
+            .max(1);
+        if unsafe { WaitForSingleObject(handle, milliseconds) } != WAIT_OBJECT_0 {
+            return Err(anyhow!("Illustrator process cleanup timed out"));
+        }
+        Ok(())
+    })();
+    unsafe {
+        CloseHandle(handle);
+    }
+    outcome
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_observed_process(
+    observed: &ObservedHostProcess,
+    deadline: &BlockingDeadline,
+) -> anyhow::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    const SIGTERM: i32 = 15;
+    const SIGKILL: i32 = 9;
+
+    deadline.checkpoint()?;
+    if observe_process(observed.pid).ok().as_ref() != Some(observed) {
+        return Err(anyhow!(
+            "Illustrator process identity changed before cleanup"
+        ));
+    }
+    if unsafe { kill(i32::try_from(observed.pid)?, SIGTERM) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let hard_kill_at = Instant::now() + deadline.remaining() / 2;
+    loop {
+        if observe_process(observed.pid).is_err() {
+            return Ok(());
+        }
+        deadline.checkpoint()?;
+        if Instant::now() >= hard_kill_at {
+            let _ = unsafe { kill(i32::try_from(observed.pid)?, SIGKILL) };
+        }
+        deadline.interruptible_sleep(Duration::from_millis(10))?;
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn terminate_observed_process(
+    _observed: &ObservedHostProcess,
+    _deadline: &BlockingDeadline,
+) -> anyhow::Result<()> {
+    Err(anyhow!("Illustrator process cleanup is unsupported"))
 }
 
 #[cfg(windows)]
@@ -1316,6 +1925,40 @@ mod tests {
                 "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
             )
             .unwrap();
+        let replaced_module = b"REPLACED FAKE CEP MODUL";
+        assert_eq!(replaced_module.len(), module.len());
+        fs::write(plugin.join("dist").join("main.js"), replaced_module).unwrap();
+        assert!(
+            backend.validate_prepared_identity(&prepared).is_err(),
+            "a module replaced after prepare must fail before nonce consumption"
+        );
+        fs::write(plugin.join("dist").join("main.js"), module).unwrap();
+
+        let prepared = backend
+            .prepare(
+                &request,
+                &"1".repeat(64),
+                "PRIVATE_TEST_TOKEN",
+                "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
+            )
+            .unwrap();
+        let replacement = plugin.join("dist").join("main.replacement.js");
+        fs::write(&replacement, module).unwrap();
+        fs::remove_file(plugin.join("dist").join("main.js")).unwrap();
+        fs::rename(&replacement, plugin.join("dist").join("main.js")).unwrap();
+        assert!(
+            backend.validate_prepared_identity(&prepared).is_err(),
+            "same bytes at a different filesystem identity must fail closed"
+        );
+
+        let prepared = backend
+            .prepare(
+                &request,
+                &"1".repeat(64),
+                "PRIVATE_TEST_TOKEN",
+                "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
+            )
+            .unwrap();
         let transaction = backend.begin_transaction(prepared).unwrap();
         transaction.activate().unwrap();
         transaction.finalize_pending().unwrap();
@@ -1332,7 +1975,7 @@ mod tests {
         request.plugin.manifest_bytes = foreign_manifest.len() as u64;
         request.plugin.manifest_sha256 = hash(foreign_manifest);
         assert!(backend.attest(&request).is_err());
-        assert!(!plugin.join(CONFIG_NAME).exists());
+        assert_eq!(fs::read_to_string(plugin.join(CONFIG_NAME)).unwrap(), committed);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1386,6 +2029,7 @@ mod tests {
             transient_config: Some(b"transient-config".to_vec()),
             committed_config: Some(b"committed-config".to_vec()),
             module_sha256: "a".repeat(64),
+            illustrator_receipt: None,
         };
         let transaction = backend.begin_transaction(prepared).unwrap();
         transaction.activate().unwrap();
@@ -1417,6 +2061,7 @@ mod tests {
             transient_config: Some(b"transient-config".to_vec()),
             committed_config: Some(b"committed-config".to_vec()),
             module_sha256: "a".repeat(64),
+            illustrator_receipt: None,
         };
         let backend = SystemPhotoshopBootstrapBackend::default();
         let transaction = backend.begin_transaction(prepared).unwrap();
@@ -1449,6 +2094,7 @@ mod tests {
             transient_config: Some(b"transient-config".to_vec()),
             committed_config: Some(b"committed-config".to_vec()),
             module_sha256: "a".repeat(64),
+            illustrator_receipt: None,
         };
         let swap_path = config.clone();
         crate::bootstrap_transaction::set_before_activate_write(config.clone(), move || {
@@ -1482,6 +2128,7 @@ mod tests {
             transient_config: Some(b"transient-config".to_vec()),
             committed_config: Some(b"committed-config".to_vec()),
             module_sha256: "a".repeat(64),
+            illustrator_receipt: None,
         };
         let backend = SystemPhotoshopBootstrapBackend::default();
         let transaction = backend.begin_transaction(prepared).unwrap();

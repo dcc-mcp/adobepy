@@ -42,7 +42,8 @@ mod photoshop_bootstrap;
 #[cfg(test)]
 use photoshop_bootstrap::PreparedBootstrap;
 use photoshop_bootstrap::{
-    LaunchedHostProcess, ObservedHostProcess, PhotoshopBootstrapBackend,
+    is_blocking_deadline_error, BlockingDeadline, LaunchedHostProcess, ObservedHostProcess,
+    PhotoshopBootstrapBackend,
     PhotoshopBootstrapTransaction, SystemIllustratorBootstrapBackend,
     SystemPhotoshopBootstrapBackend,
 };
@@ -311,6 +312,51 @@ impl BootstrapBlockingBoundary {
                 }
                 Ok(outcome)
             }
+        }
+    }
+}
+
+enum BlockingCall<T> {
+    Completed(anyhow::Result<T>),
+    Panicked,
+    TimedOut,
+}
+
+async fn run_blocking_until<T, F>(deadline: tokio::time::Instant, operation: F) -> BlockingCall<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&BlockingDeadline) -> anyhow::Result<T> + Send + 'static,
+{
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return BlockingCall::TimedOut;
+    }
+    let control = BlockingDeadline::new(remaining);
+    let worker_control = control.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(&worker_control)))
+    });
+    tokio::select! {
+        result = &mut worker => {
+            if tokio::time::Instant::now() >= deadline {
+                control.cancel();
+                BlockingCall::TimedOut
+            } else {
+                match result {
+                    Ok(Ok(Err(error))) if is_blocking_deadline_error(&error) => {
+                        BlockingCall::TimedOut
+                    }
+                    Ok(Ok(value)) => BlockingCall::Completed(value),
+                    Ok(Err(_)) | Err(_) => BlockingCall::Panicked,
+                }
+            }
+        },
+        _ = tokio::time::sleep_until(deadline) => {
+            control.cancel();
+            // Every internal backend operation is cancellation-aware. Joining here prevents a
+            // late worker from mutating host/configuration state after the request returns.
+            let _ = worker.await;
+            BlockingCall::TimedOut
         }
     }
 }
@@ -1164,29 +1210,27 @@ impl BrokerState {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(request.timeout_ms);
         validate_illustrator_bootstrap_request(&request)?;
         let backend_request = illustrator_backend_request(&request);
-        let attestation = {
+        let module_sha256 = {
             let backend = self.illustrator_bootstrap_backend.clone();
-            let backend_request = backend_request.clone();
-            self.bootstrap_blocking
-                .execute(deadline, move || backend.attest(&backend_request))
-                .await
-        };
-        let attestation = match attestation {
-            Err(BlockingBoundaryError::TimedOut) => {
-                return Err(illustrator_bootstrap_timeout_error(&request, "attestation"));
+            let blocking_request = backend_request.clone();
+            match run_blocking_until(deadline, move |control| {
+                backend.attest_bounded(&blocking_request, control)
+            })
+            .await
+            {
+                BlockingCall::Completed(Ok(module_sha256)) => module_sha256,
+                BlockingCall::TimedOut => {
+                    return Err(illustrator_bootstrap_timeout_error(&request, "attestation"));
+                }
+                BlockingCall::Completed(Err(_)) | BlockingCall::Panicked => {
+                    return Err(identity_error(
+                        ERROR_IDENTITY_UNAVAILABLE,
+                        "the authenticated Illustrator product or fixed CEP bridge is unavailable",
+                        json!({"stage": "attestation"}),
+                    ));
+                }
             }
-            Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
-                Err(anyhow!("Illustrator attestation worker failed closed"))
-            }
-            Ok(attestation) => attestation,
         };
-        let module_sha256 = attestation.map_err(|_| {
-                identity_error(
-                    ERROR_IDENTITY_UNAVAILABLE,
-                    "the authenticated Illustrator product or fixed CEP bridge is unavailable",
-                    json!({"stage": "attestation"}),
-                )
-            })?;
         if tokio::time::Instant::now() >= deadline {
             return Err(illustrator_bootstrap_timeout_error(&request, "attestation"));
         }
@@ -1553,7 +1597,7 @@ impl BrokerState {
     async fn complete_illustrator_bootstrap_failure(
         &self,
         key: &str,
-        primary_error: Box<RpcErrorResponse>,
+        mut primary_error: Box<RpcErrorResponse>,
     ) -> IllustratorResult {
         let (transaction, launched) = {
             let mut grants = self.bootstrap_grants.lock().await;
@@ -1583,14 +1627,30 @@ impl BrokerState {
         } else {
             false
         };
-        let error = if rollback_failed || host_failed {
-            bootstrap_recovery_error("Illustrator bootstrap state could not be recovered")
-        } else {
-            primary_error
-        };
+        let mut failed_components = Vec::new();
+        if host_failed {
+            failed_components.push("host");
+        }
+        if rollback_failed {
+            failed_components.push("configuration");
+        }
+        if !failed_components.is_empty() {
+            let data = primary_error.error.data.get_or_insert_with(|| json!({}));
+            if let Some(data) = data.as_object_mut() {
+                data.insert(
+                    "secondaryDiagnostic".into(),
+                    json!({
+                        "code": ERROR_IDENTITY_STALE,
+                        "stage": "recovery",
+                        "status": "failed",
+                        "failedComponents": failed_components
+                    }),
+                );
+            }
+        }
         let mut grants = self.bootstrap_grants.lock().await;
         grants.remove(key);
-        Err(error)
+        Err(primary_error)
     }
 
     fn validate_illustrator_bootstrap_identity(
@@ -1652,32 +1712,30 @@ impl BrokerState {
         deadline: tokio::time::Instant,
         owner_key: Option<&str>,
     ) -> IllustratorResult {
-        let broker_attestation = {
+        let broker_sha256 = {
             let backend = self.illustrator_bootstrap_backend.clone();
-            let path = identity.broker.executable_path.clone();
-            self.bootstrap_blocking
-                .execute(deadline, move || backend.executable_sha256(&path))
-                .await
-        };
-        let broker_attestation = match broker_attestation {
-            Err(BlockingBoundaryError::TimedOut) => {
-                return Err(illustrator_bootstrap_timeout_error(
-                    request,
-                    "broker_attestation",
-                ));
+            let executable_path = identity.broker.executable_path.clone();
+            match run_blocking_until(deadline, move |control| {
+                backend.executable_sha256_bounded(&executable_path, control)
+            })
+            .await
+            {
+                BlockingCall::Completed(Ok(sha256)) => sha256,
+                BlockingCall::TimedOut => {
+                    return Err(illustrator_bootstrap_timeout_error(
+                        request,
+                        "broker_attestation",
+                    ));
+                }
+                BlockingCall::Completed(Err(_)) | BlockingCall::Panicked => {
+                    return Err(identity_error(
+                        ERROR_IDENTITY_UNAVAILABLE,
+                        "broker executable identity is unavailable",
+                        json!({"stage": "broker_attestation"}),
+                    ));
+                }
             }
-            Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
-                Err(anyhow!("Illustrator broker attestation worker failed closed"))
-            }
-            Ok(attestation) => attestation,
         };
-        let broker_sha256 = broker_attestation.map_err(|_| {
-                identity_error(
-                    ERROR_IDENTITY_UNAVAILABLE,
-                    "broker executable identity is unavailable",
-                    json!({"stage": "broker_attestation"}),
-                )
-            })?;
         if tokio::time::Instant::now() >= deadline {
             return Err(illustrator_bootstrap_timeout_error(
                 request,
@@ -2575,6 +2633,33 @@ impl BrokerState {
                 "Illustrator bootstrap connection is foreign or mismatched",
                 json!({"field": "runtimeIdentity"}),
             ));
+        }
+        let transaction = self
+            .bootstrap_grants
+            .lock()
+            .await
+            .get(&key)
+            .and_then(|grant| grant.transaction.clone())
+            .ok_or_else(|| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap identity receipt is unavailable",
+                    json!({"stage": "claim_attestation"}),
+                )
+            })?;
+        match run_blocking_until(deadline, move |control| {
+            transaction.validate_prepared_identity_bounded(control)
+        })
+        .await
+        {
+            BlockingCall::Completed(Ok(())) => {}
+            BlockingCall::Completed(Err(_)) | BlockingCall::Panicked | BlockingCall::TimedOut => {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bridge identity changed before nonce claim",
+                    json!({"stage": "claim_attestation"}),
+                ));
+            }
         }
         let nonce_consumed = self
             .bootstrap_grants
@@ -3818,6 +3903,7 @@ mod tests {
         prepares: AtomicUsize,
         prepare_delay_ms: AtomicU64,
         prepare_fails: AtomicBool,
+        prepare_panics: AtomicBool,
         activate_delay_ms: Arc<AtomicU64>,
         launches: AtomicUsize,
         launch_delay_ms: AtomicU64,
@@ -3833,6 +3919,8 @@ mod tests {
         rollbacks: Arc<AtomicUsize>,
         rollback_delay_ms: Arc<AtomicU64>,
         rollback_fails: Arc<AtomicBool>,
+        terminations: Arc<AtomicUsize>,
+        rollback_panics: Arc<AtomicBool>,
         process_valid: AtomicBool,
         config_state: Arc<AtomicUsize>,
         executable_sha256_delay_ms: AtomicU64,
@@ -3863,6 +3951,7 @@ mod tests {
         rollbacks: Arc<AtomicUsize>,
         rollback_delay_ms: Arc<AtomicU64>,
         rollback_fails: Arc<AtomicBool>,
+        rollback_panics: Arc<AtomicBool>,
         commit_pending: AtomicBool,
     }
 
@@ -3970,6 +4059,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(
                 self.rollback_delay_ms.load(Ordering::SeqCst),
             ));
+            if self.rollback_panics.load(Ordering::SeqCst) {
+                panic!("PRIVATE_HOSTILE_ROLLBACK_PANIC");
+            }
             if self.rollback_fails.load(Ordering::SeqCst) {
                 return Err(anyhow!("deterministic rollback failure"));
             }
@@ -4005,6 +4097,9 @@ mod tests {
             _websocket_url: &str,
         ) -> anyhow::Result<PreparedBootstrap> {
             self.prepares.fetch_add(1, Ordering::SeqCst);
+            if self.prepare_panics.load(Ordering::SeqCst) {
+                panic!("PRIVATE_HOSTILE_PREPARE_PANIC");
+            }
             std::thread::sleep(Duration::from_millis(
                 self.prepare_delay_ms.load(Ordering::SeqCst),
             ));
@@ -4033,6 +4128,7 @@ mod tests {
                 rollbacks: self.rollbacks.clone(),
                 rollback_delay_ms: self.rollback_delay_ms.clone(),
                 rollback_fails: self.rollback_fails.clone(),
+                rollback_panics: self.rollback_panics.clone(),
                 commit_pending: AtomicBool::new(false),
             }))
         }
@@ -4060,6 +4156,7 @@ mod tests {
                     executable_path: target.executable_path.clone(),
                 },
                 self.launch_live.clone(),
+                self.terminations.clone(),
             ))
         }
 
@@ -4073,6 +4170,45 @@ mod tests {
             ));
             Ok("c".repeat(64))
         }
+
+        fn terminate(&self, _observed: &ObservedHostProcess) -> anyhow::Result<()> {
+            self.terminations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn attest_bounded(
+            &self,
+            _request: &PhotoshopBootstrapRequest,
+            deadline: &BlockingDeadline,
+        ) -> anyhow::Result<String> {
+            let arrival = self.attest_arrivals.fetch_add(1, Ordering::SeqCst) + 1;
+            let wait_for = self.attest_wait_for.load(Ordering::SeqCst);
+            while wait_for > 0 && self.attest_arrivals.load(Ordering::SeqCst) < wait_for {
+                deadline.checkpoint()?;
+                std::thread::yield_now();
+            }
+            let delay_ms = if arrival == 1 {
+                self.first_attest_delay_ms
+                    .load(Ordering::SeqCst)
+                    .max(self.attest_delay_ms.load(Ordering::SeqCst))
+            } else {
+                self.attest_delay_ms.load(Ordering::SeqCst)
+            };
+            deadline.interruptible_sleep(Duration::from_millis(delay_ms))?;
+            Ok("d".repeat(64))
+        }
+
+        fn executable_sha256_bounded(
+            &self,
+            _path: &str,
+            deadline: &BlockingDeadline,
+        ) -> anyhow::Result<String> {
+            deadline.interruptible_sleep(Duration::from_millis(
+                self.executable_sha256_delay_ms.load(Ordering::SeqCst),
+            ))?;
+            Ok("c".repeat(64))
+        }
+
     }
 
     struct CountingBootstrapTransaction {
@@ -5315,12 +5451,255 @@ mod tests {
         assert_eq!(error.error.code, ERROR_TIMEOUT);
         assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
         assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.terminations.load(Ordering::SeqCst), 1);
         assert_eq!(backend.finalizes.load(Ordering::SeqCst), 0);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
         assert!(state.bootstrap_grants.lock().await.is_empty());
         let public = serde_json::to_string(&error).unwrap();
         assert!(!public.contains("PRIVATE_TEST_TOKEN"));
         assert!(!public.contains("Program Files"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn illustrator_prepare_deadline_returns_without_blocking_the_runtime_or_late_mutation() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.prepare_delay_ms.store(1_000, Ordering::SeqCst);
+        let state = illustrator_bootstrap_state(backend.clone());
+        let started = std::time::Instant::now();
+        let request_state = state.clone();
+        let request = tokio::spawn(async move {
+            request_state
+                .bootstrap_illustrator(illustrator_bootstrap_request(50))
+                .await
+        });
+        while backend.prepares.load(Ordering::SeqCst) != 1 {
+            assert!(
+                started.elapsed() < Duration::from_millis(250),
+                "the current-thread runtime could not observe the blocking prepare stage"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !request.is_finished(),
+            "the request completed before runtime progress was observed during prepare"
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "the blocking prepare occupied the current-thread runtime"
+        );
+
+        let error = request
+            .await
+            .expect("bootstrap task must join")
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(
+            error
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("prepare")
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "50 ms request waited {elapsed:?} for a one-second backend"
+        );
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 0);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .bootstrap_blocking
+                .active_workers
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn illustrator_recovery_failure_or_panic_never_replaces_the_primary_timeout() {
+        for panic_in_recovery in [false, true] {
+            let backend = FakeBootstrapBackend::ready();
+            backend
+                .rollback_fails
+                .store(!panic_in_recovery, Ordering::SeqCst);
+            backend
+                .rollback_panics
+                .store(panic_in_recovery, Ordering::SeqCst);
+            let state = illustrator_bootstrap_state(backend.clone());
+
+            let error = state
+                .bootstrap_illustrator(illustrator_bootstrap_request(50))
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.error.code, ERROR_TIMEOUT);
+            assert_eq!(
+                error
+                    .error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data["stage"].as_str()),
+                Some("verify")
+            );
+            assert_eq!(
+                error
+                    .error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data["secondaryDiagnostic"]["code"].as_i64()),
+                Some(i64::from(ERROR_IDENTITY_STALE))
+            );
+            assert_eq!(
+                error
+                    .error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data["secondaryDiagnostic"]["stage"].as_str()),
+                Some("recovery")
+            );
+            assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+            assert!(state.bootstrap_grants.lock().await.is_empty());
+            let public = serde_json::to_string(&error).unwrap();
+            assert!(!public.contains("PRIVATE_HOSTILE_ROLLBACK_PANIC"));
+            assert!(!public.contains("deterministic rollback failure"));
+            assert!(!public.contains("PRIVATE_TEST_TOKEN"));
+            assert!(!public.contains("Program Files"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn illustrator_attestation_and_launch_obey_the_request_deadline() {
+        let attest_backend = FakeBootstrapBackend::ready();
+        attest_backend
+            .attest_delay_ms
+            .store(1_000, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let error = illustrator_bootstrap_state(attest_backend.clone())
+            .bootstrap_illustrator(illustrator_bootstrap_request(50))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(
+            error
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("attestation")
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(attest_backend.prepares.load(Ordering::SeqCst), 0);
+
+        let launch_backend = FakeBootstrapBackend::ready();
+        launch_backend
+            .launch_delay_ms
+            .store(1_000, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let error = illustrator_bootstrap_state(launch_backend.clone())
+            .bootstrap_illustrator(illustrator_bootstrap_request(50))
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(
+            error
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("launch")
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(launch_backend.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(launch_backend.launches.load(Ordering::SeqCst), 1);
+        assert!(!launch_backend.launch_live.load(Ordering::SeqCst));
+        assert_eq!(launch_backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(launch_backend.config_state.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        assert!(!launch_backend.launch_live.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn illustrator_blocking_worker_panic_is_redacted_and_closes_the_transaction() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.prepare_panics.store(true, Ordering::SeqCst);
+        let state = illustrator_bootstrap_state(backend.clone());
+
+        let error = state
+            .bootstrap_illustrator(illustrator_bootstrap_request(1_000))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.error.code, ERROR_IDENTITY_UNAVAILABLE);
+        assert_eq!(
+            error
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["stage"].as_str()),
+            Some("prepare")
+        );
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        let public = serde_json::to_string(&error).unwrap();
+        assert!(!public.contains("PRIVATE_HOSTILE_PREPARE_PANIC"));
+        assert!(!public.contains("PRIVATE_TEST_TOKEN"));
+        assert!(!public.contains("Program Files"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn illustrator_commit_and_hash_obey_the_request_deadline_and_recover() {
+        for hash_stage in [false, true] {
+            let backend = FakeBootstrapBackend::ready();
+            if hash_stage {
+                backend
+                    .executable_sha256_delay_ms
+                    .store(1_000, Ordering::SeqCst);
+            } else {
+                backend.finalize_delay_ms.store(1_000, Ordering::SeqCst);
+            }
+            let state = illustrator_bootstrap_state(backend.clone());
+            let started = std::time::Instant::now();
+            let owner = tokio::spawn({
+                let state = state.clone();
+                async move {
+                    state
+                        .bootstrap_illustrator(illustrator_bootstrap_request(100))
+                        .await
+                }
+            });
+            publish_matching_illustrator_session(&state).await;
+            let error = owner.await.unwrap().unwrap_err();
+            assert_eq!(error.error.code, ERROR_TIMEOUT);
+            assert_eq!(
+                error
+                    .error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data["stage"].as_str()),
+                Some(if hash_stage {
+                    "broker_attestation"
+                } else {
+                    "commit"
+                })
+            );
+            assert!(started.elapsed() < Duration::from_millis(300));
+            assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.terminations.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.finalizes.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+            assert!(state.bootstrap_grants.lock().await.is_empty());
+            assert!(state.illustrator_bootstrap_receipts.lock().await.is_empty());
+        }
     }
 
     #[tokio::test]
