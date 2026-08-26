@@ -543,6 +543,32 @@ fn config_finalize_commits_the_exact_receipt_and_quiesces_the_owner() {
 }
 
 #[test]
+fn config_commit_remains_rollback_capable_until_confirmation() {
+    let root = isolated_dir("config-commit-pending");
+    let destination = root.join("config.js");
+    std::fs::write(&destination, b"old").unwrap();
+    let owner = ConfigTransactionOwner::default();
+    let expected = FileReceipt::capture(&destination).unwrap();
+    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let staged_path = root.join("staged.js");
+    std::fs::write(&staged_path, b"transient").unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+    lease.activate(&staged).unwrap();
+
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    lease
+        .prepare_commit_cancellable(b"committed", &cancelled)
+        .unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), b"committed");
+    assert!(!owner.is_quiescent());
+
+    lease.rollback().unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+    assert!(owner.is_quiescent());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn config_rollback_only_restores_the_receipt_it_owns() {
     let root = isolated_dir("config-rollback");
     let config = root.join("config.js");
