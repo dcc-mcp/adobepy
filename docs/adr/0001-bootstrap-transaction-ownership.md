@@ -97,6 +97,15 @@ public launch terminates and reaps that original ownership; a successful launch
 is transferred into the broker's committed-host registry instead of being
 reconstructed from an observed PID.
 
+Host children are admitted through one fixed-capacity supervisor per broker.
+The supervisor owns every child and Job/process-group handle independently of a
+request's Tokio runtime; token drop only requests termination, and active
+ownership is released after the supervisor observes and reaps the original
+child. On Windows the host starts suspended, joins its kill-on-close Job, and is
+resumed only after that assignment succeeds, so an early descendant cannot
+escape ownership. Closing the broker fail-stops admission and the supervisor
+terminates every remaining owned child before its lifecycle ends.
+
 The helper is packaged beside `adobepy.exe` in the native runtime archive. The
 pure-Python wheel remains SDK-only. The CLI resolves only the canonical sibling,
 never `PATH` or an environment override.

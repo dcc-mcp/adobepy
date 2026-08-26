@@ -292,6 +292,97 @@ async fn host_owner_drop_is_nonblocking_and_keeps_reap_ownership() {
 }
 
 #[tokio::test]
+async fn host_supervisor_bounds_capacity_and_shutdown_reaps_every_owned_child() {
+    let broker = HostProcessBroker::default();
+    let mut processes = Vec::new();
+    for _ in 0..8 {
+        processes.push(
+            broker
+                .spawn(
+                    std::path::Path::new(env!("CARGO_BIN_EXE_adobepy-bootstrap-helper")),
+                    &["--hold-ms".into(), "10000".into()],
+                )
+                .unwrap(),
+        );
+    }
+    assert_eq!(broker.snapshot().active_processes, 8);
+    assert_eq!(broker.snapshot().maximum_active_processes, 8);
+    assert_eq!(broker.snapshot().capacity, 8);
+    assert!(broker
+        .spawn(
+            std::path::Path::new(env!("CARGO_BIN_EXE_adobepy-bootstrap-helper")),
+            &["--hold-ms".into(), "10000".into()],
+        )
+        .is_err());
+
+    assert!(
+        broker
+            .shutdown(tokio::time::Instant::now() + Duration::from_millis(500))
+            .await,
+        "bounded host shutdown did not retain ownership through wait/reap"
+    );
+    let snapshot = broker.snapshot();
+    assert_eq!(snapshot.active_processes, 0);
+    assert_eq!(snapshot.platform_process_owners, 0);
+    assert!(snapshot.closed);
+    drop(processes);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_host_supervisor_closes_every_job_and_child_handle_across_reuse() {
+    let broker = HostProcessBroker::default();
+    for _ in 0..20 {
+        let process = broker
+            .spawn(
+                std::path::Path::new(env!("CARGO_BIN_EXE_adobepy-bootstrap-helper")),
+                &["--hold-ms".into(), "1000".into()],
+            )
+            .unwrap();
+        process
+            .terminate_and_reap(tokio::time::Instant::now() + Duration::from_millis(500))
+            .await
+            .unwrap();
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.active_processes, 0);
+        assert_eq!(snapshot.platform_process_owners, 0);
+    }
+    assert_eq!(broker.snapshot().maximum_active_processes, 1);
+}
+
+#[test]
+fn host_owner_drop_outside_an_entered_runtime_still_reaps_and_quiesces() {
+    let broker = HostProcessBroker::default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let process = {
+        let _entered = runtime.enter();
+        broker
+            .spawn(
+                std::path::Path::new(env!("CARGO_BIN_EXE_adobepy-bootstrap-helper")),
+                &["--hold-ms".into(), "1000".into()],
+            )
+            .unwrap()
+    };
+    drop(runtime);
+
+    let started = std::time::Instant::now();
+    drop(process);
+    assert!(started.elapsed() < Duration::from_millis(50));
+
+    let verifier = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert!(
+        verifier.block_on(broker.quiesce(tokio::time::Instant::now() + Duration::from_millis(500))),
+        "runtime-independent host ownership did not reach actual wait/reap"
+    );
+}
+
+#[tokio::test]
 async fn host_ownership_cannot_be_redirected_to_a_foreign_process_identity() {
     let broker = HostProcessBroker::default();
     let first = broker

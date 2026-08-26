@@ -2,11 +2,15 @@ use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader as StdBufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex, Once, Weak};
 use std::time::Duration;
 use tokio::io::BufReader as TokioBufReader;
@@ -22,6 +26,29 @@ const MAX_HELPER_STDERR_BYTES: usize = 4096;
 const HELPER_REAP_BUDGET: Duration = Duration::from_millis(150);
 const SENSITIVE_PANIC_MESSAGE: &str = "sensitive bootstrap worker panicked";
 
+pub(crate) fn read_max_plus_one(reader: impl Read, maximum_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let sentinel = maximum_bytes.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bounded input size is not representable",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    reader.take(sentinel).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+pub(crate) fn read_bounded_sync(reader: impl Read, maximum_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let bytes = read_max_plus_one(reader, maximum_bytes)?;
+    if u64::try_from(bytes.len()).map_or(true, |length| length > maximum_bytes) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bounded input exceeded its maximum size",
+        ));
+    }
+    Ok(bytes)
+}
+
 #[cfg(windows)]
 type PlatformProcessOwner = WindowsJob;
 #[cfg(not(windows))]
@@ -32,6 +59,33 @@ thread_local! {
 }
 
 static INSTALL_PANIC_HOOK: Once = Once::new();
+
+#[cfg(test)]
+type StableFileGrowthHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+type StableFileReadHook = Box<dyn FnOnce(usize) + Send>;
+#[cfg(test)]
+static AFTER_STABLE_FILE_METADATA: LazyLock<Mutex<HashMap<PathBuf, StableFileGrowthHook>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static AFTER_STABLE_FILE_READ: LazyLock<Mutex<HashMap<PathBuf, StableFileReadHook>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn set_after_stable_file_metadata(path: PathBuf, hook: impl FnOnce() + Send + 'static) {
+    AFTER_STABLE_FILE_METADATA
+        .lock()
+        .unwrap()
+        .insert(path, Box::new(hook));
+}
+
+#[cfg(test)]
+fn set_after_stable_file_read(path: PathBuf, hook: impl FnOnce(usize) + Send + 'static) {
+    AFTER_STABLE_FILE_READ
+        .lock()
+        .unwrap()
+        .insert(path, Box::new(hook));
+}
 
 pub fn install_sensitive_panic_hook() {
     INSTALL_PANIC_HOOK.call_once(|| {
@@ -809,10 +863,16 @@ impl Drop for FailStopReaperOwnership {
 
 async fn read_limited(reader: impl AsyncRead + Unpin, maximum: usize) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    reader
-        .take(u64::try_from(maximum).unwrap_or(u64::MAX) + 1)
-        .read_to_end(&mut bytes)
-        .await?;
+    let sentinel = u64::try_from(maximum)
+        .ok()
+        .and_then(|maximum| maximum.checked_add(1))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bootstrap helper output bound is not representable",
+            )
+        })?;
+    reader.take(sentinel).read_to_end(&mut bytes).await?;
     if bytes.len() > maximum {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1034,9 +1094,22 @@ fn stable_file_bytes(path: &Path, maximum_bytes: u64) -> anyhow::Result<Vec<u8>>
         ));
     }
     let identity = config::file_identity(&file)?;
-    let mut bytes = Vec::with_capacity(usize::try_from(before.len())?);
-    file.read_to_end(&mut bytes)?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_STABLE_FILE_METADATA.lock().unwrap().remove(path) {
+        hook();
+    }
+    let bytes = read_max_plus_one(&mut file, maximum_bytes)?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_STABLE_FILE_READ.lock().unwrap().remove(path) {
+        hook(bytes.len());
+    }
+    if u64::try_from(bytes.len())? > maximum_bytes {
+        return Err(anyhow!(
+            "bootstrap helper input is not a bounded regular file"
+        ));
+    }
     let after = file.metadata()?;
+    ensure_no_redirects(path)?;
     let path_file = fs::File::open(path)?;
     if config::file_identity(&file)? != identity
         || config::file_identity(&path_file)? != identity
@@ -1074,3 +1147,45 @@ use host::terminate_process_tree;
 #[cfg(windows)]
 use host::WindowsJob;
 pub use host::*;
+
+pub(crate) fn same_file_identity(first: &fs::File, second: &fs::File) -> anyhow::Result<bool> {
+    Ok(config::file_identity(first)? == config::file_identity(second)?)
+}
+
+#[cfg(test)]
+mod bounded_file_tests {
+    use super::*;
+
+    #[test]
+    fn helper_file_read_stops_at_max_plus_one_after_concurrent_growth() {
+        let root = std::env::temp_dir().join(format!(
+            "adobepy-helper-file-growth-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("module.js");
+        fs::write(&path, b"x").unwrap();
+        let maximum = 512_u64;
+        let grow_path = path.clone();
+        set_after_stable_file_metadata(path.clone(), move || {
+            let mut file = fs::OpenOptions::new().append(true).open(grow_path).unwrap();
+            file.write_all(&vec![b'y'; 4096]).unwrap();
+            file.sync_all().unwrap();
+        });
+        let observed = Arc::new(AtomicUsize::new(0));
+        let hook_observed = observed.clone();
+        set_after_stable_file_read(path.clone(), move |bytes| {
+            hook_observed.store(bytes, Ordering::SeqCst);
+        });
+
+        let result = stable_file_bytes(&path, maximum);
+        let observed = observed.load(Ordering::SeqCst);
+        fs::remove_dir_all(root).unwrap();
+
+        assert!(result.is_err());
+        assert!(
+            observed <= usize::try_from(maximum).unwrap() + 1,
+            "helper file read buffered {observed} bytes beyond max+1"
+        );
+    }
+}
