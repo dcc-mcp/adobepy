@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::bootstrap_transaction::{
-    read_bounded_sync, same_file_identity, ConfigLease, ConfigTransactionOwner, FileReceipt,
-    HostProcessBroker, OwnedHostProcess, StagedArtifact,
+    read_bounded_sync, same_file_identity, ConfigCommitConfirmation, ConfigLease,
+    ConfigTransactionOwner, FileReceipt, HostProcessBroker, OwnedHostProcess, StagedArtifact,
 };
 
 const MAX_HASH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -52,9 +52,15 @@ pub(crate) trait PhotoshopBootstrapTransaction: Send + Sync {
     fn module_sha256(&self) -> &str;
     fn activate(&self) -> anyhow::Result<()>;
     fn finalize_pending(&self) -> anyhow::Result<()>;
-    fn confirm_commit(&self) -> anyhow::Result<()>;
+    fn prepare_commit_confirmation(
+        self: Arc<Self>,
+    ) -> anyhow::Result<Box<dyn PhotoshopBootstrapCommitConfirmation>>;
     fn revoke(&self);
     fn rollback(&self) -> anyhow::Result<()>;
+}
+
+pub(crate) trait PhotoshopBootstrapCommitConfirmation: Send {
+    fn commit(self: Box<Self>) -> anyhow::Result<()>;
 }
 
 pub(crate) struct LaunchedHostProcess {
@@ -163,6 +169,34 @@ struct SystemBootstrapTransactionState {
     commit_receipt: Option<FileReceipt>,
 }
 
+struct SystemBootstrapCommitConfirmation {
+    transaction: Arc<SystemBootstrapTransaction>,
+    confirmation: ConfigCommitConfirmation,
+}
+
+impl PhotoshopBootstrapCommitConfirmation for SystemBootstrapCommitConfirmation {
+    fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        if self.transaction.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
+        let mut state = self
+            .transaction
+            .state
+            .lock()
+            .map_err(|_| anyhow!("transaction lock failed"))?;
+        if self.transaction.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
+        state
+            .lease
+            .as_mut()
+            .context("Photoshop config lease is unavailable")?
+            .confirm_prevalidated(self.confirmation)?;
+        state.lease = None;
+        Ok(())
+    }
+}
+
 impl PhotoshopBootstrapTransaction for SystemBootstrapTransaction {
     fn module_sha256(&self) -> &str {
         &self.module_sha256
@@ -206,27 +240,39 @@ impl PhotoshopBootstrapTransaction for SystemBootstrapTransaction {
             .as_mut()
             .context("Photoshop config lease is unavailable")?
             .prepare_commit_cancellable(&committed, &self.cancelled)?;
+        remove_staging_file(&state.staging_path)?;
         state.commit_receipt = Some(receipt);
         Ok(())
     }
 
-    fn confirm_commit(&self) -> anyhow::Result<()> {
+    fn prepare_commit_confirmation(
+        self: Arc<Self>,
+    ) -> anyhow::Result<Box<dyn PhotoshopBootstrapCommitConfirmation>> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("transaction lock failed"))?;
         let receipt = state
             .commit_receipt
-            .take()
-            .context("Photoshop commit receipt is unavailable")?;
-        state
+            .as_ref()
+            .context("Photoshop commit receipt is unavailable")?
+            .clone();
+        let confirmation = state
             .lease
             .as_mut()
             .context("Photoshop config lease is unavailable")?
-            .confirm_commit(&receipt)?;
-        state.lease = None;
-        remove_staging_file(&state.staging_path)?;
-        Ok(())
+            .prepare_commit_confirmation(&receipt)?;
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
+        drop(state);
+        Ok(Box::new(SystemBootstrapCommitConfirmation {
+            transaction: self,
+            confirmation,
+        }))
     }
 
     fn revoke(&self) {
