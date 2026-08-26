@@ -6,7 +6,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::sync::{LazyLock, Mutex as TestMutex};
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -18,13 +18,13 @@ const HOST_ADMISSION_CAPACITY: usize = 8;
 const HOST_SUPERVISOR_POLL: Duration = Duration::from_millis(5);
 const HOST_SPAWN_REPLY_BUDGET: Duration = Duration::from_secs(5);
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 type AfterHostSpawnHook = Box<dyn FnOnce(u32) + Send>;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 static AFTER_HOST_SPAWN: LazyLock<TestMutex<HashMap<PathBuf, AfterHostSpawnHook>>> =
     LazyLock::new(|| TestMutex::new(HashMap::new()));
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn set_after_host_spawn(executable: PathBuf, hook: impl FnOnce(u32) + Send + 'static) {
     AFTER_HOST_SPAWN
         .lock()
@@ -180,12 +180,18 @@ impl ManagedHostProcess {
         job
     }
 
-    fn complete(mut self) {
+    fn complete(self) {
         #[cfg(windows)]
-        drop(self.take_job());
-        let completion = self.completion.clone();
-        let broker = self.broker.clone();
-        drop(self);
+        let process = {
+            let mut process = self;
+            drop(process.take_job());
+            process
+        };
+        #[cfg(not(windows))]
+        let process = self;
+        let completion = process.completion.clone();
+        let broker = process.broker.clone();
+        drop(process);
         completion.complete();
         broker.release();
     }
@@ -490,7 +496,7 @@ fn spawn_managed_host(
     arguments: Vec<String>,
     cancelled: Option<Arc<AtomicBool>>,
 ) -> Result<ManagedHostSpawn, HostProcessError> {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     let hook_key = executable.clone();
     let mut command = Command::new(executable);
     command
@@ -562,7 +568,7 @@ fn spawn_managed_host(
             terminating: true,
         }));
     }
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     if let Some(hook) = AFTER_HOST_SPAWN.lock().unwrap().remove(&hook_key) {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(pid))).is_err() {
             #[cfg(windows)]
