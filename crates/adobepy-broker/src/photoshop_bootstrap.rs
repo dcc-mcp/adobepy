@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use crate::bootstrap_transaction::{
     read_bounded_sync, same_file_identity, ConfigCommitConfirmation, ConfigLease,
-    ConfigTransactionOwner, FileReceipt, HostProcessBroker, OwnedHostProcess, StagedArtifact,
+    ConfigPublicationPermit, ConfigTransactionOwner, FileReceipt, HostProcessBroker,
+    OwnedHostProcess, StagedArtifact,
 };
 
 const MAX_HASH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -46,6 +47,23 @@ impl PreparedBootstrap {
             module_sha256: module_sha256.into(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn config_test(
+        config_path: PathBuf,
+        previous_config: Option<Vec<u8>>,
+        transient_config: Vec<u8>,
+        committed_config: Vec<u8>,
+        module_sha256: impl Into<String>,
+    ) -> Self {
+        Self {
+            config_path: Some(config_path),
+            previous_config,
+            transient_config: Some(transient_config),
+            committed_config: Some(committed_config),
+            module_sha256: module_sha256.into(),
+        }
+    }
 }
 
 pub(crate) trait PhotoshopBootstrapTransaction: Send + Sync {
@@ -60,7 +78,11 @@ pub(crate) trait PhotoshopBootstrapTransaction: Send + Sync {
 }
 
 pub(crate) trait PhotoshopBootstrapCommitConfirmation: Send {
-    fn commit(self: Box<Self>) -> anyhow::Result<()>;
+    fn confirm(self: Box<Self>) -> anyhow::Result<Box<dyn PhotoshopBootstrapPublicationPermit>>;
+}
+
+pub(crate) trait PhotoshopBootstrapPublicationPermit: Send {
+    fn publish(self: Box<Self>) -> anyhow::Result<()>;
 }
 
 pub(crate) struct LaunchedHostProcess {
@@ -174,8 +196,13 @@ struct SystemBootstrapCommitConfirmation {
     confirmation: ConfigCommitConfirmation,
 }
 
+struct SystemBootstrapPublicationPermit {
+    transaction: Arc<SystemBootstrapTransaction>,
+    publication: ConfigPublicationPermit,
+}
+
 impl PhotoshopBootstrapCommitConfirmation for SystemBootstrapCommitConfirmation {
-    fn commit(self: Box<Self>) -> anyhow::Result<()> {
+    fn confirm(self: Box<Self>) -> anyhow::Result<Box<dyn PhotoshopBootstrapPublicationPermit>> {
         if self.transaction.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
         }
@@ -187,12 +214,25 @@ impl PhotoshopBootstrapCommitConfirmation for SystemBootstrapCommitConfirmation 
         if self.transaction.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
         }
-        state
+        let publication = state
             .lease
             .as_mut()
             .context("Photoshop config lease is unavailable")?
             .confirm_prevalidated(self.confirmation)?;
-        state.lease = None;
+        drop(state);
+        Ok(Box::new(SystemBootstrapPublicationPermit {
+            transaction: self.transaction,
+            publication,
+        }))
+    }
+}
+
+impl PhotoshopBootstrapPublicationPermit for SystemBootstrapPublicationPermit {
+    fn publish(self: Box<Self>) -> anyhow::Result<()> {
+        if self.transaction.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
+        self.publication.publish()?;
         Ok(())
     }
 }
