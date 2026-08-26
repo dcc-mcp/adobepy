@@ -1,15 +1,30 @@
 use super::is_windows_reparse;
 use anyhow::{anyhow, Context};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 #[cfg(test)]
-static BEFORE_ACTIVATE_WRITE: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+type ActivateHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static BEFORE_ACTIVATE_WRITE: LazyLock<Mutex<HashMap<PathBuf, ActivateHook>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn set_before_activate_write(path: PathBuf, intervene: impl FnOnce() + Send + 'static) {
+    BEFORE_ACTIVATE_WRITE
+        .lock()
+        .unwrap()
+        .insert(path, Box::new(intervene));
+}
 
 const MAX_CONFIG_BYTES: u64 = 512 * 1024;
 
@@ -80,6 +95,10 @@ impl FileReceipt {
 
     pub fn sha256(&self) -> Option<&str> {
         self.sha256.as_deref()
+    }
+
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.bytes.as_deref()
     }
 }
 
@@ -355,6 +374,14 @@ impl ConfigLease {
         &mut self,
         staged: &StagedArtifact,
     ) -> Result<FileReceipt, ConfigTransactionError> {
+        self.activate_cancellable(staged, &AtomicBool::new(false))
+    }
+
+    pub fn activate_cancellable(
+        &mut self,
+        staged: &StagedArtifact,
+        cancelled: &AtomicBool,
+    ) -> Result<FileReceipt, ConfigTransactionError> {
         if staged.transaction != self.identity() || !self.valid.load(Ordering::SeqCst) {
             return Err(ConfigTransactionError::Stale);
         }
@@ -378,12 +405,16 @@ impl ConfigLease {
             return Err(ConfigTransactionError::IdentityChanged);
         }
         #[cfg(test)]
-        if let Some(intervene) = BEFORE_ACTIVATE_WRITE
-            .lock()
-            .map_err(|_| ConfigTransactionError::Io)?
-            .take()
         {
-            intervene();
+            let mut hook = BEFORE_ACTIVATE_WRITE
+                .lock()
+                .map_err(|_| ConfigTransactionError::Io)?;
+            if let Some(intervene) = hook.remove(&active.destination) {
+                intervene();
+            }
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(ConfigTransactionError::Stale);
         }
         active.attempted = Some(bytes.clone());
         let written = owned_config_write(&active.destination, &active.expected, &bytes)
@@ -393,6 +424,16 @@ impl ConfigLease {
     }
 
     pub fn finalize(&mut self, committed: &[u8]) -> Result<FileReceipt, ConfigTransactionError> {
+        let receipt = self.prepare_commit_cancellable(committed, &AtomicBool::new(false))?;
+        self.confirm_commit(&receipt)?;
+        Ok(receipt)
+    }
+
+    pub fn prepare_commit_cancellable(
+        &mut self,
+        committed: &[u8],
+        cancelled: &AtomicBool,
+    ) -> Result<FileReceipt, ConfigTransactionError> {
         if !self.valid.load(Ordering::SeqCst) {
             return Err(ConfigTransactionError::Stale);
         }
@@ -417,15 +458,49 @@ impl ConfigLease {
             if &current != written {
                 return Err(ConfigTransactionError::IdentityChanged);
             }
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(ConfigTransactionError::Stale);
+            }
             active.attempted = Some(committed.to_vec());
             let receipt = owned_config_write(&active.destination, written, committed)
                 .map_err(|_| ConfigTransactionError::IdentityChanged)?;
-            state.active = None;
+            active.written = Some(receipt.clone());
             receipt
+        };
+        Ok(receipt)
+    }
+
+    pub fn confirm_commit(
+        &mut self,
+        expected: &FileReceipt,
+    ) -> Result<QuiescenceAck, ConfigTransactionError> {
+        let acknowledgement = {
+            let mut state = self
+                .owner
+                .state
+                .lock()
+                .map_err(|_| ConfigTransactionError::Io)?;
+            let active = matching_active(
+                &mut state,
+                self.generation,
+                self.transaction_id,
+                &self.valid,
+            )?;
+            if active.written.as_ref() != Some(expected)
+                || FileReceipt::capture(&active.destination)
+                    .map_err(|_| ConfigTransactionError::Io)?
+                    != *expected
+            {
+                return Err(ConfigTransactionError::IdentityChanged);
+            }
+            state.active = None;
+            QuiescenceAck {
+                generation: self.generation,
+            }
         };
         self.valid.store(false, Ordering::SeqCst);
         self.closed = true;
-        Ok(receipt)
+        Ok(acknowledgement)
     }
 
     pub fn rollback(mut self) -> Result<QuiescenceAck, ConfigTransactionError> {
@@ -714,10 +789,10 @@ mod tests {
         let replacement = root.join("replacement.js");
         fs::write(&replacement, b"external").unwrap();
         let swap_path = config.clone();
-        *BEFORE_ACTIVATE_WRITE.lock().unwrap() = Some(Box::new(move || {
+        set_before_activate_write(config.clone(), move || {
             fs::remove_file(&swap_path).unwrap();
             fs::rename(&replacement, &swap_path).unwrap();
-        }));
+        });
 
         assert_eq!(
             lease.activate(&staged).unwrap_err(),

@@ -66,8 +66,11 @@ Helper output is inert. It may create only a UUID-scoped staging artifact. A
 separate `ConfigTransactionOwner` grants one non-clone lease after an exact
 path/handle/byte receipt comparison. The lease identity combines the local
 generation with a random transaction UUID; each staged artifact also carries a
-different staging UUID. Activation, finalization, rollback, and revocation
-compare the complete transaction identity and receipt under one owner lock.
+different staging UUID. Activation, commit preparation, rollback, and
+revocation compare the complete transaction identity and receipt under one
+owner lock. Commit is two phase: the owner first writes and retains a
+rollback-capable exact receipt, then confirms it only while the broker persists
+the success receipt.
 Configuration writes reacquire the expected OS file identity, keep that handle
 through the conditional write, and bind the post-write receipt to the same
 handle. A path replacement in the recapture-to-write window therefore fails
@@ -75,19 +78,24 @@ closed instead of overwriting the replacement. Lease Drop performs a single
 atomic revocation; explicit methods return a quiescence acknowledgement.
 Rollback refuses to overwrite an external edit.
 
-The existing public Photoshop bootstrap places each synchronous backend phase
-behind one fixed-capacity admission boundary instead of a Tokio worker. Its
-preparation phase produces an inert plan; a separate ownership transition is
-the only point that may activate authoritative configuration. A timed-out
-preparation can finish late, but it cannot redeem its result or mutate the
-configuration. The fixed thread boundary is limited to trusted, in-repository
-read-only planning and bounded ownership transitions. Arbitrary extension work
-continues to require the killable helper-process boundary described above.
+The public Photoshop bootstrap stores an
+`Arc<dyn PhotoshopBootstrapTransaction>` in the grant before activation. The
+transaction is only a shared control plane: its `ConfigLease`, staged artifact,
+and process ownership remain non-clone capabilities. Timeout performs a
+lock-free revoke before recovery; late activation or commit work rechecks that
+fence while holding the config owner lock. A timed-out preparation may finish
+only as inert staging and cannot redeem its result. The fixed blocking boundary
+fail-stops new forward work until every timed-out trusted worker has quiesced;
+cleanup has a reserved path so rollback is not starved. Arbitrary extension
+work continues to require the killable helper-process boundary.
 
 `HostProcessBroker` retains the original child and an unforgeable ownership ID.
 Windows ownership includes a kill-on-close Job handle. Unix ownership includes
 the original direct child and process group. PID lookup is never used to regain
-authority, so PID reuse cannot redirect termination.
+authority, so PID reuse cannot redirect termination. A failed or cancelled
+public launch terminates and reaps that original ownership; a successful launch
+is transferred into the broker's committed-host registry instead of being
+reconstructed from an observed PID.
 
 The helper is packaged beside `adobepy.exe` in the native runtime archive. The
 pure-Python wheel remains SDK-only. The CLI resolves only the canonical sibling,

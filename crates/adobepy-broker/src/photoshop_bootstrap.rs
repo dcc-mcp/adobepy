@@ -1,13 +1,20 @@
 use adobepy_protocol::{PhotoshopBootstrapRequest, PhotoshopHostTarget};
 use anyhow::{anyhow, Context};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+use crate::bootstrap_transaction::{
+    ConfigLease, ConfigTransactionOwner, FileReceipt, HostProcessBroker, OwnedHostProcess,
+    StagedArtifact,
+};
 
 const MAX_HASH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const CONFIG_NAME: &str = "adobepy.config.js";
@@ -19,14 +26,13 @@ pub(crate) struct ObservedHostProcess {
     pub executable_path: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct PreparedBootstrap {
     config_path: Option<PathBuf>,
     previous_config: Option<Vec<u8>>,
     transient_config: Option<Vec<u8>>,
     committed_config: Option<Vec<u8>>,
     pub module_sha256: String,
-    pub(crate) activated: bool,
 }
 
 impl PreparedBootstrap {
@@ -38,8 +44,63 @@ impl PreparedBootstrap {
             transient_config: None,
             committed_config: None,
             module_sha256: module_sha256.into(),
-            activated: false,
         }
+    }
+}
+
+pub(crate) trait PhotoshopBootstrapTransaction: Send + Sync {
+    fn module_sha256(&self) -> &str;
+    fn activate(&self) -> anyhow::Result<()>;
+    fn finalize_pending(&self) -> anyhow::Result<()>;
+    fn confirm_commit(&self) -> anyhow::Result<()>;
+    fn revoke(&self);
+    fn rollback(&self) -> anyhow::Result<()>;
+}
+
+pub(crate) struct LaunchedHostProcess {
+    pub observed: ObservedHostProcess,
+    owned: Option<OwnedHostProcess>,
+    #[cfg(test)]
+    fake_live: Option<Arc<AtomicBool>>,
+}
+
+impl LaunchedHostProcess {
+    fn owned(observed: ObservedHostProcess, owned: OwnedHostProcess) -> Self {
+        Self {
+            observed,
+            owned: Some(owned),
+            #[cfg(test)]
+            fake_live: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake(observed: ObservedHostProcess, live: Arc<AtomicBool>) -> Self {
+        Self {
+            observed,
+            owned: None,
+            fake_live: Some(live),
+        }
+    }
+
+    pub(crate) async fn terminate_and_reap(
+        mut self,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(live) = self.fake_live.take() {
+            live.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+        let owned = self
+            .owned
+            .take()
+            .context("host process ownership is missing")?;
+        owned
+            .terminate_and_reap(deadline)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
     }
 }
 
@@ -54,45 +115,144 @@ pub(crate) trait PhotoshopBootstrapBackend: Send + Sync {
         websocket_url: &str,
     ) -> anyhow::Result<PreparedBootstrap>;
 
-    /// Activates a previously prepared inert plan. Implementations must not
-    /// perform unbounded discovery or waiting in this ownership transition.
-    fn activate(&self, prepared: &mut PreparedBootstrap) -> anyhow::Result<()>;
+    fn begin_transaction(
+        &self,
+        prepared: PreparedBootstrap,
+    ) -> anyhow::Result<Arc<dyn PhotoshopBootstrapTransaction>>;
 
-    fn launch(&self, target: &PhotoshopHostTarget) -> anyhow::Result<ObservedHostProcess>;
+    fn launch_owned(
+        &self,
+        target: &PhotoshopHostTarget,
+        cancelled: Arc<AtomicBool>,
+    ) -> anyhow::Result<LaunchedHostProcess>;
 
     fn process_matches(&self, observed: &ObservedHostProcess) -> bool;
-
-    fn rollback(&self, prepared: PreparedBootstrap) -> anyhow::Result<()>;
-
-    fn finalize(&self, prepared: &PreparedBootstrap) -> anyhow::Result<()>;
 
     fn executable_sha256(&self, path: &str) -> anyhow::Result<String>;
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct SystemPhotoshopBootstrapBackend;
+pub(crate) struct SystemPhotoshopBootstrapBackend {
+    config_owners: Mutex<HashMap<PathBuf, ConfigTransactionOwner>>,
+    host_owner: HostProcessBroker,
+    launch_arguments: Arc<[String]>,
+}
 
 impl SystemPhotoshopBootstrapBackend {
     #[cfg(test)]
-    fn verify_prepared_configuration(
-        &self,
-        prepared: PreparedBootstrap,
-    ) -> anyhow::Result<PreparedBootstrap> {
-        let verification = prepared
-            .config_path
-            .as_deref()
-            .zip(prepared.transient_config.as_deref())
-            .context("prepared Photoshop configuration is incomplete")
-            .and_then(|(path, transient)| exact_config_matches(path, transient));
-        match verification {
-            Ok(()) => Ok(prepared),
-            Err(error) => match self.rollback(prepared) {
-                Ok(()) => Err(error),
-                Err(recovery) => Err(anyhow!(
-                    "Photoshop bootstrap preparation failed and could not be recovered: {recovery}"
-                )),
-            },
+    fn with_launch_arguments(arguments: Vec<String>) -> Self {
+        Self {
+            launch_arguments: arguments.into(),
+            ..Self::default()
         }
+    }
+}
+
+struct SystemBootstrapTransaction {
+    module_sha256: String,
+    cancelled: Arc<AtomicBool>,
+    state: Mutex<SystemBootstrapTransactionState>,
+}
+
+struct SystemBootstrapTransactionState {
+    lease: Option<ConfigLease>,
+    staged: StagedArtifact,
+    committed_config: Vec<u8>,
+    staging_path: PathBuf,
+    activated: bool,
+    commit_receipt: Option<FileReceipt>,
+}
+
+impl PhotoshopBootstrapTransaction for SystemBootstrapTransaction {
+    fn module_sha256(&self) -> &str {
+        &self.module_sha256
+    }
+
+    fn activate(&self) -> anyhow::Result<()> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("transaction lock failed"))?;
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
+        let staged = state.staged.clone();
+        state
+            .lease
+            .as_mut()
+            .context("Photoshop config lease is unavailable")?
+            .activate_cancellable(&staged, &self.cancelled)?;
+        state.activated = true;
+        Ok(())
+    }
+
+    fn finalize_pending(&self) -> anyhow::Result<()> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("transaction lock failed"))?;
+        if !state.activated || self.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop bootstrap transaction is not active"));
+        }
+        let committed = state.committed_config.clone();
+        let receipt = state
+            .lease
+            .as_mut()
+            .context("Photoshop config lease is unavailable")?
+            .prepare_commit_cancellable(&committed, &self.cancelled)?;
+        state.commit_receipt = Some(receipt);
+        Ok(())
+    }
+
+    fn confirm_commit(&self) -> anyhow::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("transaction lock failed"))?;
+        let receipt = state
+            .commit_receipt
+            .take()
+            .context("Photoshop commit receipt is unavailable")?;
+        state
+            .lease
+            .as_mut()
+            .context("Photoshop config lease is unavailable")?
+            .confirm_commit(&receipt)?;
+        state.lease = None;
+        remove_staging_file(&state.staging_path)?;
+        Ok(())
+    }
+
+    fn revoke(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    fn rollback(&self) -> anyhow::Result<()> {
+        self.revoke();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("transaction lock failed"))?;
+        if let Some(lease) = state.lease.take() {
+            lease.rollback()?;
+        }
+        remove_staging_file(&state.staging_path)?;
+        state.activated = false;
+        Ok(())
+    }
+}
+
+fn remove_staging_file(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -128,45 +288,88 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
             transient_config: Some(transient_config),
             committed_config: Some(committed_config),
             module_sha256,
-            activated: false,
         })
     }
 
-    fn activate(&self, prepared: &mut PreparedBootstrap) -> anyhow::Result<()> {
+    fn begin_transaction(
+        &self,
+        prepared: PreparedBootstrap,
+    ) -> anyhow::Result<Arc<dyn PhotoshopBootstrapTransaction>> {
         let path = prepared
             .config_path
-            .as_deref()
             .context("prepared Photoshop configuration path is missing")?;
-        match prepared.previous_config.as_deref() {
-            Some(bytes) => exact_config_matches(path, bytes)?,
-            None => match fs::symlink_metadata(path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Ok(_) => {
-                    return Err(anyhow!(
-                        "Photoshop bridge configuration appeared during bootstrap"
-                    ))
-                }
-                Err(error) => return Err(error.into()),
-            },
-        }
         let transient = prepared
             .transient_config
-            .as_deref()
             .context("prepared Photoshop transient configuration is missing")?;
-        atomic_write(path, transient)?;
-        exact_config_matches(path, transient)?;
-        prepared.activated = true;
-        Ok(())
+        let committed = prepared
+            .committed_config
+            .context("prepared Photoshop committed configuration is missing")?;
+        let expected = FileReceipt::capture(&path)?;
+        if expected.bytes() != prepared.previous_config.as_deref() {
+            return Err(anyhow!(
+                "Photoshop bridge configuration changed before transaction ownership"
+            ));
+        }
+        let owner = self
+            .config_owners
+            .lock()
+            .map_err(|_| anyhow!("Photoshop config owner lock failed"))?
+            .entry(path.clone())
+            .or_default()
+            .clone();
+        let lease = owner.begin(&path, &expected)?;
+        let staging_path = path
+            .parent()
+            .context("Photoshop configuration has no parent")?
+            .join(format!(".adobepy.{}.stage", Uuid::new_v4().simple()));
+        let mut staging = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)?;
+        staging.write_all(&transient)?;
+        staging.sync_all()?;
+        drop(staging);
+        let staged = match StagedArtifact::capture(lease.identity(), &staging_path) {
+            Ok(staged) => staged,
+            Err(error) => {
+                let _ = remove_staging_file(&staging_path);
+                let _ = lease.revoke();
+                return Err(error);
+            }
+        };
+        Ok(Arc::new(SystemBootstrapTransaction {
+            module_sha256: prepared.module_sha256,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            state: Mutex::new(SystemBootstrapTransactionState {
+                lease: Some(lease),
+                staged,
+                committed_config: committed,
+                staging_path,
+                activated: false,
+                commit_receipt: None,
+            }),
+        }))
     }
 
-    fn launch(&self, target: &PhotoshopHostTarget) -> anyhow::Result<ObservedHostProcess> {
+    fn launch_owned(
+        &self,
+        target: &PhotoshopHostTarget,
+        cancelled: Arc<AtomicBool>,
+    ) -> anyhow::Result<LaunchedHostProcess> {
         validate_host_file(target)?;
-        let child = Command::new(&target.executable_path)
-            .spawn()
-            .context("the selected Photoshop process could not be launched")?;
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop launch ownership is revoked"));
+        }
+        let owned = self
+            .host_owner
+            .spawn(Path::new(&target.executable_path), &self.launch_arguments)
+            .map_err(anyhow::Error::from)?;
         let deadline = Instant::now() + Duration::from_secs(2);
         let observed = loop {
-            match observe_process(child.id()) {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(anyhow!("Photoshop launch ownership is revoked"));
+            }
+            match observe_process(owned.identity().pid()) {
                 Ok(observed) => break observed,
                 Err(error) if Instant::now() < deadline => {
                     let _ = error;
@@ -183,74 +386,14 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
                 "the launched Photoshop process identity does not match the selected product"
             ));
         }
-        Ok(observed)
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop launch ownership is revoked"));
+        }
+        Ok(LaunchedHostProcess::owned(observed, owned))
     }
 
     fn process_matches(&self, observed: &ObservedHostProcess) -> bool {
         observe_process(observed.pid).is_ok_and(|actual| actual == *observed)
-    }
-
-    fn rollback(&self, prepared: PreparedBootstrap) -> anyhow::Result<()> {
-        if !prepared.activated {
-            return Ok(());
-        }
-        let Some(path) = prepared.config_path else {
-            return Ok(());
-        };
-        let current = match stable_file_bytes(&path, 64 * 1024) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        if current.as_ref().is_some_and(|bytes| {
-            prepared.transient_config.as_ref() != Some(bytes)
-                && prepared.committed_config.as_ref() != Some(bytes)
-        }) {
-            return Err(anyhow!(
-                "Photoshop bridge configuration changed outside the bootstrap transaction"
-            ));
-        }
-        match prepared.previous_config {
-            Some(bytes) => {
-                atomic_write(&path, &bytes)?;
-                exact_config_matches(&path, &bytes)
-            }
-            None => {
-                if current.is_some() {
-                    match fs::remove_file(&path) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                match fs::symlink_metadata(path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Ok(_) => Err(anyhow!(
-                        "Photoshop bridge configuration rollback is incomplete"
-                    )),
-                    Err(error) => Err(error.into()),
-                }
-            }
-        }
-    }
-
-    fn finalize(&self, prepared: &PreparedBootstrap) -> anyhow::Result<()> {
-        if !prepared.activated {
-            return Err(anyhow!("Photoshop bootstrap plan is not active"));
-        }
-        match (
-            &prepared.config_path,
-            &prepared.transient_config,
-            &prepared.committed_config,
-        ) {
-            (Some(path), Some(transient), Some(committed)) => {
-                exact_config_matches(path, transient)?;
-                atomic_write(path, committed)?;
-                exact_config_matches(path, committed)
-            }
-            (None, None, None) => Ok(()),
-            _ => Err(anyhow!("Photoshop bootstrap commit state is incomplete")),
-        }
     }
 
     fn executable_sha256(&self, path: &str) -> anyhow::Result<String> {
@@ -388,86 +531,6 @@ fn bootstrap_config(
     Ok(format!(
         "(function(){{globalThis.__ADOBEPY_BROKER_URL={url};globalThis.__ADOBEPY_TOKEN={token};globalThis.__ADOBEPY_TARGET={target};{nonce_assignment}}}());\n"
     ))
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let parent = path.parent().context("configuration path has no parent")?;
-    ensure_no_redirects(parent)?;
-    match fs::symlink_metadata(path) {
-        Ok(_) => ensure_no_redirects(path)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let temporary = parent.join(format!(".{CONFIG_NAME}.{}.tmp", Uuid::new_v4().simple()));
-    fs::write(&temporary, bytes)?;
-    match atomic_replace(&temporary, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            Err(error.into())
-        }
-    }
-}
-
-fn exact_config_matches(path: &Path, expected: &[u8]) -> anyhow::Result<()> {
-    if stable_file_bytes(path, 64 * 1024)? != expected {
-        return Err(anyhow!(
-            "Photoshop bridge configuration changed outside the bootstrap transaction"
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
-    }
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    const TRANSIENT_REPLACE_ERRORS: [i32; 3] = [5, 32, 33];
-    const MAX_REPLACE_ATTEMPTS: usize = 20;
-
-    for attempt in 0..MAX_REPLACE_ATTEMPTS {
-        if unsafe {
-            MoveFileExW(
-                source.as_ptr(),
-                destination.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } != 0
-        {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if attempt + 1 == MAX_REPLACE_ATTEMPTS
-            || !error
-                .raw_os_error()
-                .is_some_and(|code| TRANSIENT_REPLACE_ERRORS.contains(&code))
-        {
-            return Err(error);
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    unreachable!("bounded atomic replace loop always returns")
-}
-
-#[cfg(not(windows))]
-fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::rename(source, destination)
 }
 
 fn validate_exact_file(
@@ -716,8 +779,6 @@ mod tests {
         let config = root.join(CONFIG_NAME);
         fs::write(&config, b"old-config").unwrap();
 
-        atomic_write(&config, b"new-config").unwrap();
-        assert_eq!(fs::read(&config).unwrap(), b"new-config");
         let transient = bootstrap_config(
             "ws://127.0.0.1:47391/v1/bridge/photoshop/ws",
             "secret",
@@ -750,28 +811,29 @@ mod tests {
             ));
         fs::create_dir_all(&root).unwrap();
         let config = root.join(CONFIG_NAME);
-        fs::write(&config, b"transient-config").unwrap();
-        let backend = SystemPhotoshopBootstrapBackend;
+        fs::write(&config, b"prior-config").unwrap();
+        let backend = SystemPhotoshopBootstrapBackend::default();
         let prepared = PreparedBootstrap {
             config_path: Some(config.clone()),
             previous_config: Some(b"prior-config".to_vec()),
             transient_config: Some(b"transient-config".to_vec()),
             committed_config: Some(b"committed-config".to_vec()),
             module_sha256: "a".repeat(64),
-            activated: true,
         };
+        let transaction = backend.begin_transaction(prepared).unwrap();
+        transaction.activate().unwrap();
 
         fs::write(&config, b"operator-change").unwrap();
-        assert!(backend.finalize(&prepared).is_err());
+        assert!(transaction.finalize_pending().is_err());
         assert_eq!(fs::read(&config).unwrap(), b"operator-change");
-        assert!(backend.rollback(prepared).is_err());
+        assert!(transaction.rollback().is_err());
         assert_eq!(fs::read(&config).unwrap(), b"operator-change");
 
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn prepare_verification_failure_restores_the_prior_configuration() {
+    fn missing_config_after_activation_is_not_recreated_by_rollback() {
         let root = std::env::current_dir()
             .unwrap()
             .join("target")
@@ -781,21 +843,111 @@ mod tests {
             ));
         fs::create_dir_all(&root).unwrap();
         let config = root.join(CONFIG_NAME);
-        fs::write(&config, b"transient-config").unwrap();
+        fs::write(&config, b"prior-config").unwrap();
         let prepared = PreparedBootstrap {
             config_path: Some(config.clone()),
             previous_config: Some(b"prior-config".to_vec()),
             transient_config: Some(b"transient-config".to_vec()),
             committed_config: Some(b"committed-config".to_vec()),
             module_sha256: "a".repeat(64),
-            activated: true,
         };
+        let backend = SystemPhotoshopBootstrapBackend::default();
+        let transaction = backend.begin_transaction(prepared).unwrap();
+        transaction.activate().unwrap();
         fs::remove_file(&config).unwrap();
 
-        let backend = SystemPhotoshopBootstrapBackend;
-        assert!(backend.verify_prepared_configuration(prepared).is_err());
-        assert_eq!(fs::read(&config).unwrap(), b"prior-config");
+        assert!(transaction.rollback().is_err());
+        assert!(!config.exists());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn public_activation_rejects_a_swap_after_its_final_recapture() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "photoshop-bootstrap-public-swap-{}",
+                Uuid::new_v4().simple()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join(CONFIG_NAME);
+        fs::write(&config, b"prior-config").unwrap();
+        let replacement = root.join("replacement.js");
+        fs::write(&replacement, b"external-config").unwrap();
+        let prepared = PreparedBootstrap {
+            config_path: Some(config.clone()),
+            previous_config: Some(b"prior-config".to_vec()),
+            transient_config: Some(b"transient-config".to_vec()),
+            committed_config: Some(b"committed-config".to_vec()),
+            module_sha256: "a".repeat(64),
+        };
+        let swap_path = config.clone();
+        crate::bootstrap_transaction::set_before_activate_write(config.clone(), move || {
+            fs::remove_file(&swap_path).unwrap();
+            fs::rename(&replacement, &swap_path).unwrap();
+        });
+
+        let backend = SystemPhotoshopBootstrapBackend::default();
+        let transaction = backend.begin_transaction(prepared).unwrap();
+        assert!(transaction.activate().is_err());
+        assert_eq!(fs::read(&config).unwrap(), b"external-config");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "launched only by the owned-host integration regression"]
+    fn owned_host_fixture() {
+        std::thread::sleep(Duration::from_secs(10));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn public_system_launch_retains_and_reaps_the_original_process_owner() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("owned-public-host-{}", Uuid::new_v4().simple()))
+            .join("Adobe Photoshop Test");
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("Photoshop.exe");
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let bytes = fs::metadata(&executable).unwrap().len();
+        let sha256 = digest_file(&executable).unwrap();
+        let backend = SystemPhotoshopBootstrapBackend::with_launch_arguments(vec![
+            "--ignored".into(),
+            "--exact".into(),
+            "photoshop_bootstrap::tests::owned_host_fixture".into(),
+            "--nocapture".into(),
+        ]);
+        let target = PhotoshopHostTarget {
+            executable_path: executable.to_string_lossy().into_owned(),
+            executable_bytes: bytes,
+            executable_sha256: sha256,
+            host_version: "test".into(),
+            profile_id: "test".into(),
+        };
+
+        let launched = backend
+            .launch_owned(&target, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        let observed = launched.observed.clone();
+        assert!(backend.process_matches(&observed));
+        launched
+            .terminate_and_reap(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(!backend.process_matches(&observed));
+        assert!(
+            backend
+                .host_owner
+                .quiesce(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+        );
+
+        fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 }

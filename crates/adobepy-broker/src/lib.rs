@@ -24,20 +24,22 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify, RwLock, Semaphore};
 use uuid::Uuid;
 
 #[doc(hidden)]
 pub mod bootstrap_transaction;
 mod photoshop_bootstrap;
 
+#[cfg(test)]
+use photoshop_bootstrap::PreparedBootstrap;
 use photoshop_bootstrap::{
-    ObservedHostProcess, PhotoshopBootstrapBackend, PreparedBootstrap,
-    SystemPhotoshopBootstrapBackend,
+    LaunchedHostProcess, ObservedHostProcess, PhotoshopBootstrapBackend,
+    PhotoshopBootstrapTransaction, SystemPhotoshopBootstrapBackend,
 };
 
 type DispatchResult = Result<RpcResponse, Box<RpcErrorResponse>>;
@@ -59,6 +61,8 @@ struct BootstrapBlockingBoundary {
     admission: Arc<Semaphore>,
     workers: Arc<Semaphore>,
     active_workers: Arc<AtomicUsize>,
+    poisoned: Arc<AtomicBool>,
+    quiesced: Arc<Notify>,
 }
 
 impl Default for BootstrapBlockingBoundary {
@@ -69,6 +73,8 @@ impl Default for BootstrapBlockingBoundary {
             )),
             workers: Arc::new(Semaphore::new(BOOTSTRAP_BLOCKING_CAPACITY)),
             active_workers: Arc::new(AtomicUsize::new(0)),
+            poisoned: Arc::new(AtomicBool::new(false)),
+            quiesced: Arc::new(Notify::new()),
         }
     }
 }
@@ -83,6 +89,40 @@ impl BootstrapBlockingBoundary {
         T: Send + 'static,
         F: FnOnce() -> anyhow::Result<T> + Send + 'static,
     {
+        self.execute_inner(deadline, false, operation).await
+    }
+
+    async fn execute_cleanup<T, F>(
+        &self,
+        deadline: tokio::time::Instant,
+        operation: F,
+    ) -> Result<anyhow::Result<T>, BlockingBoundaryError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    {
+        self.execute_inner(deadline, true, operation).await
+    }
+
+    async fn execute_inner<T, F>(
+        &self,
+        deadline: tokio::time::Instant,
+        cleanup: bool,
+        operation: F,
+    ) -> Result<anyhow::Result<T>, BlockingBoundaryError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    {
+        while !cleanup && self.poisoned.load(Ordering::SeqCst) {
+            let notified = self.quiesced.notified();
+            if !self.poisoned.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::timeout_at(deadline, notified)
+                .await
+                .map_err(|_| BlockingBoundaryError::TimedOut)?;
+        }
         let admission = tokio::time::timeout_at(deadline, self.admission.clone().acquire_owned())
             .await
             .map_err(|_| BlockingBoundaryError::TimedOut)?
@@ -92,6 +132,8 @@ impl BootstrapBlockingBoundary {
             .map_err(|_| BlockingBoundaryError::TimedOut)?
             .map_err(|_| BlockingBoundaryError::Overloaded)?;
         let active = self.active_workers.clone();
+        let poisoned = self.poisoned.clone();
+        let quiesced = self.quiesced.clone();
         let (sender, receiver) = oneshot::channel();
         tokio::task::spawn_blocking(move || {
             let _admission = admission;
@@ -101,11 +143,21 @@ impl BootstrapBlockingBoundary {
             let _sensitive = bootstrap_transaction::SensitivePanicGuard::enter();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
                 .map_err(|_| BlockingBoundaryError::Panicked);
-            active.fetch_sub(1, Ordering::SeqCst);
+            if active.fetch_sub(1, Ordering::SeqCst) == 1 {
+                poisoned.store(false, Ordering::SeqCst);
+                quiesced.notify_waiters();
+            }
             let _ = sender.send(outcome);
         });
         match tokio::time::timeout_at(deadline, receiver).await {
-            Err(_) => Err(BlockingBoundaryError::TimedOut),
+            Err(_) => {
+                self.poisoned.store(true, Ordering::SeqCst);
+                if self.active_workers.load(Ordering::SeqCst) == 0 {
+                    self.poisoned.store(false, Ordering::SeqCst);
+                    self.quiesced.notify_waiters();
+                }
+                Err(BlockingBoundaryError::TimedOut)
+            }
             Ok(Err(_)) => Err(BlockingBoundaryError::Panicked),
             Ok(Ok(Err(error))) => Err(error),
             Ok(Ok(Ok(outcome))) => Ok(outcome),
@@ -136,15 +188,16 @@ struct BootstrapGrant {
     nonce: String,
     nonce_claimed: bool,
     observed: Option<ObservedHostProcess>,
+    launched: Option<LaunchedHostProcess>,
+    launch_cancelled: Arc<AtomicBool>,
     module_sha256: String,
-    prepared: Option<PreparedBootstrap>,
+    transaction: Option<Arc<dyn PhotoshopBootstrapTransaction>>,
     completion: watch::Sender<Option<BootstrapResult>>,
 }
 
 struct BootstrapTransactionGuard {
     key: String,
     grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
-    backend: Arc<dyn PhotoshopBootstrapBackend>,
     blocking: BootstrapBlockingBoundary,
     armed: bool,
 }
@@ -153,13 +206,11 @@ impl BootstrapTransactionGuard {
     fn new(
         key: String,
         grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
-        backend: Arc<dyn PhotoshopBootstrapBackend>,
         blocking: BootstrapBlockingBoundary,
     ) -> Self {
         Self {
             key,
             grants,
-            backend,
             blocking,
             armed: true,
         }
@@ -178,11 +229,10 @@ impl Drop for BootstrapTransactionGuard {
         self.armed = false;
         let key = self.key.clone();
         let grants = self.grants.clone();
-        let backend = self.backend.clone();
         let blocking = self.blocking.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                cancel_bootstrap_grant(grants, &key, backend, blocking).await;
+                cancel_bootstrap_grant(grants, &key, blocking).await;
             });
         }
     }
@@ -191,28 +241,37 @@ impl Drop for BootstrapTransactionGuard {
 async fn cancel_bootstrap_grant(
     grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
     key: &str,
-    backend: Arc<dyn PhotoshopBootstrapBackend>,
     blocking: BootstrapBlockingBoundary,
 ) {
-    let prepared = {
+    let (transaction, launched) = {
         let mut grants = grants.lock().await;
         let Some(grant) = grants.get_mut(key) else {
             return;
         };
-        grant.prepared.take()
+        grant.launch_cancelled.store(true, Ordering::SeqCst);
+        if let Some(transaction) = grant.transaction.as_ref() {
+            transaction.revoke();
+        }
+        (grant.transaction.take(), grant.launched.take())
     };
-    let rollback_failed = if let Some(prepared) = prepared {
+    let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+    let host_failed = if let Some(launched) = launched {
+        launched.terminate_and_reap(cleanup_deadline).await.is_err()
+    } else {
+        false
+    };
+    let rollback_failed = if let Some(transaction) = transaction {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(175);
         !matches!(
             blocking
-                .execute(deadline, move || backend.rollback(prepared))
+                .execute_cleanup(deadline, move || transaction.rollback())
                 .await,
             Ok(Ok(()))
         )
     } else {
         false
     };
-    let error = if rollback_failed {
+    let error = if rollback_failed || host_failed {
         bootstrap_recovery_error("cancelled Photoshop bootstrap state could not be recovered")
     } else {
         identity_error(
@@ -266,13 +325,14 @@ struct BrokerState {
     bootstrap_backend: Arc<dyn PhotoshopBootstrapBackend>,
     bootstrap_blocking: BootstrapBlockingBoundary,
     bootstrap_grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
+    bootstrap_owned_hosts: Arc<Mutex<HashMap<String, LaunchedHostProcess>>>,
     bootstrap_receipts: Arc<Mutex<HashMap<String, BootstrapReceipt>>>,
     photoshop_websocket_url: String,
 }
 
 impl BrokerState {
     fn new(config: &BrokerConfig) -> anyhow::Result<Self> {
-        Self::with_bootstrap_backend(config, Arc::new(SystemPhotoshopBootstrapBackend))
+        Self::with_bootstrap_backend(config, Arc::new(SystemPhotoshopBootstrapBackend::default()))
     }
 
     fn with_bootstrap_backend(
@@ -301,6 +361,7 @@ impl BrokerState {
             bootstrap_backend,
             bootstrap_blocking: BootstrapBlockingBoundary::default(),
             bootstrap_grants: Arc::new(Mutex::new(HashMap::new())),
+            bootstrap_owned_hosts: Arc::new(Mutex::new(HashMap::new())),
             bootstrap_receipts: Arc::new(Mutex::new(HashMap::new())),
             photoshop_websocket_url: format!(
                 "ws://{host}:{}/v1/bridge/photoshop/ws",
@@ -582,8 +643,10 @@ impl BrokerState {
                             nonce: nonce.clone(),
                             nonce_claimed: false,
                             observed: None,
+                            launched: None,
+                            launch_cancelled: Arc::new(AtomicBool::new(false)),
                             module_sha256: module_sha256.clone(),
-                            prepared: None,
+                            transaction: None,
                             completion,
                         },
                     );
@@ -599,7 +662,6 @@ impl BrokerState {
         let mut transaction_guard = BootstrapTransactionGuard::new(
             key.clone(),
             self.bootstrap_grants.clone(),
-            self.bootstrap_backend.clone(),
             self.bootstrap_blocking.clone(),
         );
 
@@ -632,53 +694,59 @@ impl BrokerState {
                     json!({"stage": "prepare"}),
                 )
             })?;
-            let prepared = {
+            let ownership_cancelled = Arc::new(AtomicBool::new(false));
+            let transaction = {
                 let backend = self.bootstrap_backend.clone();
+                let ownership_cancelled = ownership_cancelled.clone();
                 self.bootstrap_blocking
                     .execute(deadline, move || {
-                        let mut prepared = prepared;
-                        backend.activate(&mut prepared)?;
-                        Ok(prepared)
+                        let transaction = backend.begin_transaction(prepared)?;
+                        if ownership_cancelled.load(Ordering::SeqCst) {
+                            transaction.revoke();
+                            transaction.rollback()?;
+                            return Err(anyhow!("bootstrap transaction ownership was revoked"));
+                        }
+                        Ok(transaction)
                     })
                     .await
             };
-            let prepared = match prepared {
+            let transaction = match transaction {
                 Err(BlockingBoundaryError::TimedOut) => {
-                    return Err(bootstrap_timeout_error(&request, "prepare_activation"));
+                    ownership_cancelled.store(true, Ordering::SeqCst);
+                    return Err(bootstrap_timeout_error(&request, "transaction_ownership"));
                 }
                 Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
-                    Err(anyhow!("bootstrap activation worker failed closed"))
+                    ownership_cancelled.store(true, Ordering::SeqCst);
+                    Err(anyhow!(
+                        "bootstrap transaction ownership worker failed closed"
+                    ))
                 }
-                Ok(prepared) => prepared,
+                Ok(transaction) => transaction,
             }
             .map_err(|_| {
                 identity_error(
                     ERROR_IDENTITY_UNAVAILABLE,
-                    "the fixed Photoshop UXP bridge could not be activated",
-                    json!({"stage": "prepare_activation"}),
+                    "the fixed Photoshop UXP bridge transaction could not be owned",
+                    json!({"stage": "transaction_ownership"}),
                 )
             })?;
-            let mut prepared = Some(prepared);
             let inserted = {
                 let mut grants = self.bootstrap_grants.lock().await;
                 if let Some(grant) = grants.get_mut(&key) {
-                    let prepared = prepared.take().expect("prepared bootstrap is present");
-                    grant.module_sha256 = prepared.module_sha256.clone();
-                    grant.prepared = Some(prepared);
+                    grant.module_sha256 = transaction.module_sha256().to_owned();
+                    grant.transaction = Some(transaction.clone());
                     true
                 } else {
                     false
                 }
             };
             if !inserted {
-                if let Some(prepared) = prepared {
-                    let backend = self.bootstrap_backend.clone();
-                    let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
-                    let _ = self
-                        .bootstrap_blocking
-                        .execute(cleanup_deadline, move || backend.rollback(prepared))
-                        .await;
-                }
+                transaction.revoke();
+                let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+                let _ = self
+                    .bootstrap_blocking
+                    .execute_cleanup(cleanup_deadline, move || transaction.rollback())
+                    .await;
                 return Err(identity_error(
                     ERROR_IDENTITY_STALE,
                     "Photoshop bootstrap reservation was cancelled",
@@ -688,39 +756,99 @@ impl BrokerState {
             if tokio::time::Instant::now() >= deadline {
                 return Err(bootstrap_timeout_error(&request, "prepare"));
             }
-            let observed = {
-                let backend = self.bootstrap_backend.clone();
-                let target = request.host.clone();
+            let activation = {
+                let transaction = transaction.clone();
                 self.bootstrap_blocking
-                    .execute(deadline, move || backend.launch(&target))
+                    .execute(deadline, move || transaction.activate())
                     .await
             };
-            let observed = match observed {
+            let activation = match activation {
                 Err(BlockingBoundaryError::TimedOut) => {
+                    transaction.revoke();
+                    return Err(bootstrap_timeout_error(&request, "prepare_activation"));
+                }
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    transaction.revoke();
+                    Err(anyhow!("bootstrap activation worker failed closed"))
+                }
+                Ok(activation) => activation,
+            };
+            activation.map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_UNAVAILABLE,
+                    "the fixed Photoshop UXP bridge could not be activated",
+                    json!({"stage": "prepare_activation"}),
+                )
+            })?;
+            if tokio::time::Instant::now() >= deadline {
+                transaction.revoke();
+                return Err(bootstrap_timeout_error(&request, "prepare_activation"));
+            }
+            let launch_cancelled = {
+                let grants = self.bootstrap_grants.lock().await;
+                grants
+                    .get(&key)
+                    .map(|grant| grant.launch_cancelled.clone())
+                    .ok_or_else(|| {
+                        identity_error(
+                            ERROR_IDENTITY_STALE,
+                            "Photoshop bootstrap reservation was cancelled",
+                            json!({"stage": "launch"}),
+                        )
+                    })?
+            };
+            let launched = {
+                let backend = self.bootstrap_backend.clone();
+                let target = request.host.clone();
+                let launch_cancelled = launch_cancelled.clone();
+                self.bootstrap_blocking
+                    .execute(deadline, move || {
+                        backend.launch_owned(&target, launch_cancelled)
+                    })
+                    .await
+            };
+            let launched = match launched {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    launch_cancelled.store(true, Ordering::SeqCst);
                     return Err(bootstrap_timeout_error(&request, "launch"));
                 }
                 Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    launch_cancelled.store(true, Ordering::SeqCst);
                     Err(anyhow!("bootstrap launch worker failed closed"))
                 }
-                Ok(observed) => observed,
+                Ok(launched) => launched,
             };
-            let observed = observed.map_err(|_| {
+            let launched = launched.map_err(|_| {
                 identity_error(
                     ERROR_IDENTITY_UNAVAILABLE,
                     "the selected Photoshop instance could not be launched",
                     json!({"stage": "launch"}),
                 )
             })?;
-            {
+            let mut launched = Some(launched);
+            let inserted_launch = {
                 let mut grants = self.bootstrap_grants.lock().await;
-                let Some(grant) = grants.get_mut(&key) else {
-                    return Err(identity_error(
-                        ERROR_IDENTITY_STALE,
-                        "Photoshop bootstrap reservation was cancelled",
-                        json!({"stage": "launch"}),
-                    ));
-                };
-                grant.observed = Some(observed);
+                if let Some(grant) = grants.get_mut(&key) {
+                    let launched = launched.take().expect("launched host is present");
+                    grant.observed = Some(launched.observed.clone());
+                    grant.launched = Some(launched);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !inserted_launch {
+                let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+                let _ = launched
+                    .take()
+                    .expect("unclaimed launched host is present")
+                    .terminate_and_reap(cleanup_deadline)
+                    .await;
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Photoshop bootstrap reservation was cancelled",
+                    json!({"stage": "launch"}),
+                ));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(bootstrap_timeout_error(&request, "launch"));
@@ -755,10 +883,10 @@ impl BrokerState {
                             deadline,
                         )
                         .await?;
-                        let prepared = {
+                        let transaction = {
                             let grants = self.bootstrap_grants.lock().await;
-                            let Some(prepared) =
-                                grants.get(&key).and_then(|grant| grant.prepared.as_ref())
+                            let Some(transaction) =
+                                grants.get(&key).and_then(|grant| grant.transaction.clone())
                             else {
                                 return Err(identity_error(
                                     ERROR_IDENTITY_STALE,
@@ -766,21 +894,25 @@ impl BrokerState {
                                     json!({"stage": "commit"}),
                                 ));
                             };
-                            prepared.clone()
+                            transaction
                         };
                         let finalize = {
-                            let backend = self.bootstrap_backend.clone();
+                            let transaction = transaction.clone();
                             self.bootstrap_blocking
-                                .execute(deadline, move || backend.finalize(&prepared))
+                                .execute(deadline, move || transaction.finalize_pending())
                                 .await
                         };
                         let finalize = match finalize {
                             Err(BlockingBoundaryError::TimedOut) => {
+                                transaction.revoke();
                                 return Err(bootstrap_timeout_error(&request, "commit"));
                             }
                             Err(
                                 BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked,
-                            ) => Err(anyhow!("bootstrap commit worker failed closed")),
+                            ) => {
+                                transaction.revoke();
+                                Err(anyhow!("bootstrap commit worker failed closed"))
+                            }
                             Ok(finalize) => finalize,
                         };
                         finalize.map_err(|_| {
@@ -869,26 +1001,35 @@ impl BrokerState {
         key: &str,
         primary_error: Box<RpcErrorResponse>,
     ) -> BootstrapResult {
-        let prepared = {
+        let (transaction, launched) = {
             let mut grants = self.bootstrap_grants.lock().await;
             let Some(grant) = grants.get_mut(key) else {
                 return Err(primary_error);
             };
-            grant.prepared.take()
+            grant.launch_cancelled.store(true, Ordering::SeqCst);
+            if let Some(transaction) = grant.transaction.as_ref() {
+                transaction.revoke();
+            }
+            (grant.transaction.take(), grant.launched.take())
         };
-        let rollback_failed = if let Some(prepared) = prepared {
-            let backend = self.bootstrap_backend.clone();
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+        let host_failed = if let Some(launched) = launched {
+            launched.terminate_and_reap(cleanup_deadline).await.is_err()
+        } else {
+            false
+        };
+        let rollback_failed = if let Some(transaction) = transaction {
             let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
             !matches!(
                 self.bootstrap_blocking
-                    .execute(cleanup_deadline, move || backend.rollback(prepared))
+                    .execute_cleanup(cleanup_deadline, move || transaction.rollback())
                     .await,
                 Ok(Ok(()))
             )
         } else {
             false
         };
-        let error = if rollback_failed {
+        let error = if rollback_failed || host_failed {
             bootstrap_recovery_error("Photoshop bootstrap state could not be recovered")
         } else {
             primary_error
@@ -1038,13 +1179,14 @@ impl BrokerState {
             expires_at_epoch_ms: epoch_ms() + 120_000,
         };
         if let Some(key) = owner_key {
+            let mut owned_hosts = self.bootstrap_owned_hosts.lock().await;
             let mut grants = self.bootstrap_grants.lock().await;
             if tokio::time::Instant::now() >= deadline {
                 return Err(bootstrap_timeout_error(request, "receipt"));
             }
             if grants
                 .get(key)
-                .and_then(|grant| grant.prepared.as_ref())
+                .and_then(|grant| grant.transaction.as_ref())
                 .is_none()
             {
                 return Err(identity_error(
@@ -1059,15 +1201,26 @@ impl BrokerState {
             }
             let now = epoch_ms();
             receipts.retain(|_, receipt| receipt.expires_at_epoch_ms >= now);
-            receipts.insert(receipt_id, receipt);
             let grant = grants
                 .get_mut(key)
                 .expect("owner grant remains locked through receipt persistence");
-            let prepared = grant
-                .prepared
-                .take()
-                .expect("owner prepared state remains locked through receipt persistence");
-            drop(prepared);
+            grant
+                .transaction
+                .as_ref()
+                .expect("owner transaction remains locked through receipt persistence")
+                .confirm_commit()
+                .map_err(|_| {
+                    identity_error(
+                        ERROR_IDENTITY_STALE,
+                        "Photoshop bootstrap commit ownership is stale",
+                        json!({"stage": "receipt"}),
+                    )
+                })?;
+            grant.transaction.take();
+            if let Some(launched) = grant.launched.take() {
+                owned_hosts.insert(key.to_owned(), launched);
+            }
+            receipts.insert(receipt_id, receipt);
             grant.completion.send_replace(Some(Ok(result.clone())));
             grants.remove(key);
         } else {
@@ -2342,17 +2495,19 @@ mod tests {
         prepares: AtomicUsize,
         prepare_delay_ms: AtomicU64,
         prepare_fails: AtomicBool,
+        activate_delay_ms: Arc<AtomicU64>,
         launches: AtomicUsize,
         launch_delay_ms: AtomicU64,
         launch_fails: AtomicBool,
-        finalizes: AtomicUsize,
-        finalize_delay_ms: AtomicU64,
-        finalize_fails: AtomicBool,
-        rollbacks: AtomicUsize,
-        rollback_delay_ms: AtomicU64,
-        rollback_fails: AtomicBool,
+        launch_live: Arc<AtomicBool>,
+        finalizes: Arc<AtomicUsize>,
+        finalize_delay_ms: Arc<AtomicU64>,
+        finalize_fails: Arc<AtomicBool>,
+        rollbacks: Arc<AtomicUsize>,
+        rollback_delay_ms: Arc<AtomicU64>,
+        rollback_fails: Arc<AtomicBool>,
         process_valid: AtomicBool,
-        config_state: AtomicUsize,
+        config_state: Arc<AtomicUsize>,
         executable_sha256_delay_ms: AtomicU64,
     }
 
@@ -2360,9 +2515,81 @@ mod tests {
         fn ready() -> Arc<Self> {
             Arc::new(Self {
                 process_valid: AtomicBool::new(true),
-                config_state: AtomicUsize::new(1),
+                config_state: Arc::new(AtomicUsize::new(1)),
                 ..Self::default()
             })
+        }
+    }
+
+    struct FakeBootstrapTransaction {
+        module_sha256: String,
+        cancelled: AtomicBool,
+        activate_delay_ms: Arc<AtomicU64>,
+        config_state: Arc<AtomicUsize>,
+        finalizes: Arc<AtomicUsize>,
+        finalize_delay_ms: Arc<AtomicU64>,
+        finalize_fails: Arc<AtomicBool>,
+        rollbacks: Arc<AtomicUsize>,
+        rollback_delay_ms: Arc<AtomicU64>,
+        rollback_fails: Arc<AtomicBool>,
+        commit_pending: AtomicBool,
+    }
+
+    impl PhotoshopBootstrapTransaction for FakeBootstrapTransaction {
+        fn module_sha256(&self) -> &str {
+            &self.module_sha256
+        }
+
+        fn activate(&self) -> anyhow::Result<()> {
+            std::thread::sleep(Duration::from_millis(
+                self.activate_delay_ms.load(Ordering::SeqCst),
+            ));
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(anyhow!("fake bootstrap transaction was revoked"));
+            }
+            self.config_state.store(2, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn finalize_pending(&self) -> anyhow::Result<()> {
+            self.finalizes.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(
+                self.finalize_delay_ms.load(Ordering::SeqCst),
+            ));
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(anyhow!("fake bootstrap transaction was revoked"));
+            }
+            if self.finalize_fails.load(Ordering::SeqCst) {
+                return Err(anyhow!("deterministic finalize failure"));
+            }
+            self.config_state.store(3, Ordering::SeqCst);
+            self.commit_pending.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn confirm_commit(&self) -> anyhow::Result<()> {
+            if !self.commit_pending.swap(false, Ordering::SeqCst) {
+                return Err(anyhow!("fake commit is not pending"));
+            }
+            Ok(())
+        }
+
+        fn revoke(&self) {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+
+        fn rollback(&self) -> anyhow::Result<()> {
+            self.revoke();
+            self.rollbacks.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(
+                self.rollback_delay_ms.load(Ordering::SeqCst),
+            ));
+            if self.rollback_fails.load(Ordering::SeqCst) {
+                return Err(anyhow!("deterministic rollback failure"));
+            }
+            self.commit_pending.store(false, Ordering::SeqCst);
+            self.config_state.store(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -2401,16 +2628,30 @@ mod tests {
             Ok(PreparedBootstrap::fake("d".repeat(64)))
         }
 
-        fn activate(&self, prepared: &mut PreparedBootstrap) -> anyhow::Result<()> {
-            prepared.activated = true;
-            self.config_state.store(2, Ordering::SeqCst);
-            Ok(())
+        fn begin_transaction(
+            &self,
+            prepared: PreparedBootstrap,
+        ) -> anyhow::Result<Arc<dyn PhotoshopBootstrapTransaction>> {
+            Ok(Arc::new(FakeBootstrapTransaction {
+                module_sha256: prepared.module_sha256,
+                cancelled: AtomicBool::new(false),
+                activate_delay_ms: self.activate_delay_ms.clone(),
+                config_state: self.config_state.clone(),
+                finalizes: self.finalizes.clone(),
+                finalize_delay_ms: self.finalize_delay_ms.clone(),
+                finalize_fails: self.finalize_fails.clone(),
+                rollbacks: self.rollbacks.clone(),
+                rollback_delay_ms: self.rollback_delay_ms.clone(),
+                rollback_fails: self.rollback_fails.clone(),
+                commit_pending: AtomicBool::new(false),
+            }))
         }
 
-        fn launch(
+        fn launch_owned(
             &self,
             target: &adobepy_protocol::PhotoshopHostTarget,
-        ) -> anyhow::Result<ObservedHostProcess> {
+            cancelled: Arc<AtomicBool>,
+        ) -> anyhow::Result<LaunchedHostProcess> {
             self.launches.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(
                 self.launch_delay_ms.load(Ordering::SeqCst),
@@ -2418,39 +2659,22 @@ mod tests {
             if self.launch_fails.load(Ordering::SeqCst) {
                 return Err(anyhow!("deterministic launch failure"));
             }
-            Ok(ObservedHostProcess {
-                pid: 4200,
-                process_start_identity: "windows:133700000000000100".into(),
-                executable_path: target.executable_path.clone(),
-            })
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(anyhow!("fake launch ownership was revoked"));
+            }
+            self.launch_live.store(true, Ordering::SeqCst);
+            Ok(LaunchedHostProcess::fake(
+                ObservedHostProcess {
+                    pid: 4200,
+                    process_start_identity: "windows:133700000000000100".into(),
+                    executable_path: target.executable_path.clone(),
+                },
+                self.launch_live.clone(),
+            ))
         }
 
         fn process_matches(&self, _observed: &ObservedHostProcess) -> bool {
             self.process_valid.load(Ordering::SeqCst)
-        }
-
-        fn rollback(&self, _prepared: PreparedBootstrap) -> anyhow::Result<()> {
-            self.rollbacks.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(
-                self.rollback_delay_ms.load(Ordering::SeqCst),
-            ));
-            if self.rollback_fails.load(Ordering::SeqCst) {
-                return Err(anyhow!("deterministic rollback failure"));
-            }
-            self.config_state.store(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn finalize(&self, _prepared: &PreparedBootstrap) -> anyhow::Result<()> {
-            self.finalizes.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(
-                self.finalize_delay_ms.load(Ordering::SeqCst),
-            ));
-            if self.finalize_fails.load(Ordering::SeqCst) {
-                return Err(anyhow!("deterministic finalize failure"));
-            }
-            self.config_state.store(3, Ordering::SeqCst);
-            Ok(())
         }
 
         fn executable_sha256(&self, _path: &str) -> anyhow::Result<String> {
@@ -3749,6 +3973,72 @@ mod tests {
                 .active_workers
                 .load(Ordering::SeqCst),
             0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_activation_cannot_mutate_after_the_public_return() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.activate_delay_ms.store(250, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+
+        let error = state
+            .bootstrap_photoshop(bootstrap_request(50))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        tokio::time::sleep(Duration::from_millis(275)).await;
+        assert_eq!(
+            backend.config_state.load(Ordering::SeqCst),
+            1,
+            "a revoked activation must not mutate authoritative config late"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn timed_out_finalize_cannot_commit_after_failure_rollback() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.finalize_delay_ms.store(250, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(100);
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        publish_matching_bootstrap_session(&state).await;
+
+        let error = task.await.unwrap().unwrap_err();
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(275)).await;
+        assert_eq!(
+            backend.config_state.load(Ordering::SeqCst),
+            1,
+            "a revoked finalize must not race recovery and commit late"
+        );
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_launch_cannot_create_an_unowned_late_process() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.launch_delay_ms.store(250, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+
+        let error = state
+            .bootstrap_photoshop(bootstrap_request(50))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert!(!backend.launch_live.load(Ordering::SeqCst));
+        tokio::time::sleep(Duration::from_millis(275)).await;
+        assert!(
+            !backend.launch_live.load(Ordering::SeqCst),
+            "a late launch must remain owned and be terminated before it becomes live"
         );
     }
 
