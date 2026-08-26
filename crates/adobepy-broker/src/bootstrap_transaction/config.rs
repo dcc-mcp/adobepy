@@ -2,11 +2,14 @@ use super::is_windows_reparse;
 use anyhow::{anyhow, Context};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+#[cfg(test)]
+static BEFORE_ACTIVATE_WRITE: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
 const MAX_CONFIG_BYTES: u64 = 512 * 1024;
 
@@ -148,7 +151,8 @@ pub(super) fn file_identity(file: &fs::File) -> anyhow::Result<FileIdentity> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedArtifact {
-    pub generation: u64,
+    transaction: ConfigTransactionIdentity,
+    staging_id: Uuid,
     pub path: PathBuf,
     pub bytes: u64,
     pub sha256: String,
@@ -158,16 +162,23 @@ impl StagedArtifact {
     pub fn from_helper(response: super::HelperResponse) -> anyhow::Result<Self> {
         let super::HelperResponse::Staged {
             generation,
+            transaction_id,
+            staging_id,
             path,
             bytes,
             sha256,
-            ..
         } = response
         else {
             return Err(anyhow!("helper response is not a staged artifact"));
         };
         let artifact = Self {
-            generation,
+            transaction: ConfigTransactionIdentity {
+                generation,
+                transaction_id: Uuid::parse_str(&transaction_id)
+                    .context("staged transaction identity is invalid")?,
+            },
+            staging_id: Uuid::parse_str(&staging_id)
+                .context("staged artifact identity is invalid")?,
             path,
             bytes,
             sha256,
@@ -176,14 +187,15 @@ impl StagedArtifact {
         Ok(artifact)
     }
 
-    pub fn capture(generation: u64, path: &Path) -> anyhow::Result<Self> {
+    pub fn capture(transaction: ConfigTransactionIdentity, path: &Path) -> anyhow::Result<Self> {
         let receipt = FileReceipt::capture(path)?;
         let bytes = receipt
             .bytes
             .as_ref()
             .context("staged artifact is missing")?;
         Ok(Self {
-            generation,
+            transaction,
+            staging_id: Uuid::new_v4(),
             path: receipt.path,
             bytes: u64::try_from(bytes.len())?,
             sha256: receipt.sha256.context("staged artifact hash is missing")?,
@@ -199,6 +211,22 @@ impl StagedArtifact {
             return Err(anyhow!("staged artifact identity changed"));
         }
         Ok(bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigTransactionIdentity {
+    generation: u64,
+    transaction_id: Uuid,
+}
+
+impl ConfigTransactionIdentity {
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(super) fn transaction_id(self) -> Uuid {
+        self.transaction_id
     }
 }
 
@@ -222,6 +250,7 @@ pub enum ConfigTransactionError {
 #[derive(Debug)]
 struct ActiveConfigLease {
     generation: u64,
+    transaction_id: Uuid,
     valid: Arc<AtomicBool>,
     destination: PathBuf,
     expected: FileReceipt,
@@ -281,8 +310,10 @@ impl ConfigTransactionOwner {
             .checked_add(1)
             .ok_or(ConfigTransactionError::Io)?;
         let valid = Arc::new(AtomicBool::new(true));
+        let transaction_id = Uuid::new_v4();
         state.active = Some(ActiveConfigLease {
             generation,
+            transaction_id,
             valid: valid.clone(),
             destination: destination.clone(),
             expected: expected.clone(),
@@ -292,6 +323,7 @@ impl ConfigTransactionOwner {
         Ok(ConfigLease {
             owner: self.clone(),
             generation,
+            transaction_id,
             valid,
             closed: false,
         })
@@ -302,6 +334,7 @@ impl ConfigTransactionOwner {
 pub struct ConfigLease {
     owner: ConfigTransactionOwner,
     generation: u64,
+    transaction_id: Uuid,
     valid: Arc<AtomicBool>,
     closed: bool,
 }
@@ -311,11 +344,18 @@ impl ConfigLease {
         self.generation
     }
 
+    pub fn identity(&self) -> ConfigTransactionIdentity {
+        ConfigTransactionIdentity {
+            generation: self.generation,
+            transaction_id: self.transaction_id,
+        }
+    }
+
     pub fn activate(
         &mut self,
         staged: &StagedArtifact,
     ) -> Result<FileReceipt, ConfigTransactionError> {
-        if staged.generation != self.generation || !self.valid.load(Ordering::SeqCst) {
+        if staged.transaction != self.identity() || !self.valid.load(Ordering::SeqCst) {
             return Err(ConfigTransactionError::Stale);
         }
         let bytes = staged
@@ -326,14 +366,27 @@ impl ConfigLease {
             .state
             .lock()
             .map_err(|_| ConfigTransactionError::Io)?;
-        let active = matching_active(&mut state, self.generation, &self.valid)?;
+        let active = matching_active(
+            &mut state,
+            self.generation,
+            self.transaction_id,
+            &self.valid,
+        )?;
         let current =
             FileReceipt::capture(&active.destination).map_err(|_| ConfigTransactionError::Io)?;
         if current != active.expected {
             return Err(ConfigTransactionError::IdentityChanged);
         }
+        #[cfg(test)]
+        if let Some(intervene) = BEFORE_ACTIVATE_WRITE
+            .lock()
+            .map_err(|_| ConfigTransactionError::Io)?
+            .take()
+        {
+            intervene();
+        }
         active.attempted = Some(bytes.clone());
-        let written = atomic_config_write(&active.destination, &bytes)
+        let written = owned_config_write(&active.destination, &active.expected, &bytes)
             .map_err(|_| ConfigTransactionError::IdentityChanged)?;
         active.written = Some(written.clone());
         Ok(written)
@@ -349,7 +402,12 @@ impl ConfigLease {
                 .state
                 .lock()
                 .map_err(|_| ConfigTransactionError::Io)?;
-            let active = matching_active(&mut state, self.generation, &self.valid)?;
+            let active = matching_active(
+                &mut state,
+                self.generation,
+                self.transaction_id,
+                &self.valid,
+            )?;
             let written = active
                 .written
                 .as_ref()
@@ -360,7 +418,7 @@ impl ConfigLease {
                 return Err(ConfigTransactionError::IdentityChanged);
             }
             active.attempted = Some(committed.to_vec());
-            let receipt = atomic_config_write(&active.destination, committed)
+            let receipt = owned_config_write(&active.destination, written, committed)
                 .map_err(|_| ConfigTransactionError::IdentityChanged)?;
             state.active = None;
             receipt
@@ -377,14 +435,19 @@ impl ConfigLease {
                 .state
                 .lock()
                 .map_err(|_| ConfigTransactionError::Io)?;
-            let active = matching_active(&mut state, self.generation, &self.valid)?;
+            let active = matching_active(
+                &mut state,
+                self.generation,
+                self.transaction_id,
+                &self.valid,
+            )?;
             if let Some(written) = active.written.as_ref() {
                 let current = FileReceipt::capture(&active.destination)
                     .map_err(|_| ConfigTransactionError::Io)?;
                 if &current != written {
                     return Err(ConfigTransactionError::IdentityChanged);
                 }
-                restore_expected(&active.destination, &active.expected)?;
+                restore_expected(&active.destination, written, &active.expected)?;
             } else if active.attempted.is_some() {
                 // An attempted mutation without an exact written receipt is
                 // ambiguous. Never infer ownership from equal bytes alone.
@@ -406,7 +469,12 @@ impl ConfigLease {
             .state
             .lock()
             .map_err(|_| ConfigTransactionError::Io)?;
-        let active = matching_active(&mut state, self.generation, &self.valid)?;
+        let active = matching_active(
+            &mut state,
+            self.generation,
+            self.transaction_id,
+            &self.valid,
+        )?;
         if active.written.is_some() || active.attempted.is_some() {
             return Err(ConfigTransactionError::Busy);
         }
@@ -432,6 +500,7 @@ impl Drop for ConfigLease {
 fn matching_active<'a>(
     state: &'a mut ConfigOwnerState,
     generation: u64,
+    transaction_id: Uuid,
     valid: &Arc<AtomicBool>,
 ) -> Result<&'a mut ActiveConfigLease, ConfigTransactionError> {
     if !valid.load(Ordering::SeqCst) {
@@ -442,6 +511,7 @@ fn matching_active<'a>(
         .as_mut()
         .filter(|active| {
             active.generation == generation
+                && active.transaction_id == transaction_id
                 && Arc::ptr_eq(&active.valid, valid)
                 && active.valid.load(Ordering::SeqCst)
         })
@@ -450,17 +520,14 @@ fn matching_active<'a>(
 
 fn restore_expected(
     destination: &Path,
+    written: &FileReceipt,
     expected: &FileReceipt,
 ) -> Result<(), ConfigTransactionError> {
     match expected.bytes.as_deref() {
-        Some(bytes) => atomic_config_write(destination, bytes)
+        Some(bytes) => owned_config_write(destination, written, bytes)
             .map(|_| ())
             .map_err(|_| ConfigTransactionError::Io),
-        None => match fs::remove_file(destination) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(ConfigTransactionError::Io),
-        },
+        None => remove_owned_config(destination, written).map_err(|_| ConfigTransactionError::Io),
     }
 }
 
@@ -492,65 +559,171 @@ fn ensure_no_redirects_to_parent(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn atomic_config_write(path: &Path, bytes: &[u8]) -> anyhow::Result<FileReceipt> {
+fn owned_config_write(
+    path: &Path,
+    expected: &FileReceipt,
+    bytes: &[u8],
+) -> anyhow::Result<FileReceipt> {
     if u64::try_from(bytes.len())? > MAX_CONFIG_BYTES {
         return Err(anyhow!("configuration exceeds its bound"));
     }
     ensure_no_redirects_to_parent(path)?;
-    let parent = path.parent().context("configuration path has no parent")?;
-    let temporary = parent.join(format!(".adobepy.{}.tmp", Uuid::new_v4().simple()));
-    let mut options = fs::OpenOptions::new();
-    let mut file = options.write(true).create_new(true).open(&temporary)?;
+    if expected.path != path {
+        return Err(anyhow!("configuration ownership path changed"));
+    }
+    let mut file = match expected.identity.as_ref() {
+        Some(expected_identity) => {
+            let file = owned_open_options(false).open(path)?;
+            if &file_identity(&file)? != expected_identity
+                || FileReceipt::capture(path)? != *expected
+            {
+                return Err(anyhow!("configuration identity changed before write"));
+            }
+            file
+        }
+        None => {
+            if FileReceipt::capture(path)? != *expected {
+                return Err(anyhow!("configuration appeared before creation"));
+            }
+            owned_open_options(true).open(path)?
+        }
+    };
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    let temporary_identity = file_identity(&file)?;
-    let result = atomic_config_replace(&temporary, path);
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result?;
+    let owned_identity = file_identity(&file)?;
     let receipt = FileReceipt::capture(path)?;
-    if receipt.identity.as_ref() != Some(&temporary_identity)
-        || receipt.bytes.as_deref() != Some(bytes)
+    if receipt.identity.as_ref() != Some(&owned_identity) || receipt.bytes.as_deref() != Some(bytes)
     {
-        return Err(anyhow!("configuration path changed during atomic replace"));
+        return Err(anyhow!("configuration path changed during owned write"));
     }
     Ok(receipt)
 }
 
-#[cfg(windows)]
-fn atomic_config_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
-    }
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    if unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
+fn remove_owned_config(path: &Path, expected: &FileReceipt) -> anyhow::Result<()> {
+    let file = owned_open_options(false).open(path)?;
+    if FileReceipt::capture(path)? != *expected
+        || file_identity(&file)? != expected.identity.clone().context("missing identity")?
     {
-        return Err(std::io::Error::last_os_error());
+        return Err(anyhow!("configuration identity changed before removal"));
+    }
+    remove_owned_config_platform(file, path)?;
+    if FileReceipt::capture(path)?.identity.is_some() {
+        return Err(anyhow!("configuration path remained after owned removal"));
     }
     Ok(())
 }
 
+#[cfg(windows)]
+fn owned_open_options(create_new: bool) -> fs::OpenOptions {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+        .share_mode(FILE_SHARE_READ)
+        .create_new(create_new);
+    options
+}
+
 #[cfg(not(windows))]
-fn atomic_config_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::rename(source, destination)
+fn owned_open_options(create_new: bool) -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(create_new);
+    options
+}
+
+#[cfg(windows)]
+fn remove_owned_config_platform(file: fs::File, _path: &Path) -> anyhow::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct FileDispositionInfo {
+        delete_file: i32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetFileInformationByHandle(
+            handle: *mut std::ffi::c_void,
+            class: u32,
+            information: *const FileDispositionInfo,
+            size: u32,
+        ) -> i32;
+    }
+    const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
+    let information = FileDispositionInfo { delete_file: 1 };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FILE_DISPOSITION_INFO_CLASS,
+            &information,
+            u32::try_from(std::mem::size_of::<FileDispositionInfo>())?,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    drop(file);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn remove_owned_config_platform(file: fs::File, path: &Path) -> anyhow::Result<()> {
+    // Unix cannot unlink by an open file descriptor. Rename the exact path
+    // into a private sibling first, then delete only the owned identity.
+    let quarantine = path
+        .parent()
+        .context("configuration path has no parent")?
+        .join(format!(".adobepy.{}.owned", Uuid::new_v4().simple()));
+    fs::rename(path, &quarantine)?;
+    let quarantined = FileReceipt::capture(&quarantine)?;
+    if quarantined.identity.as_ref() != Some(&file_identity(&file)?) {
+        return Err(anyhow!(
+            "configuration identity changed during owned removal"
+        ));
+    }
+    fs::remove_file(&quarantine)?;
+    drop(file);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activate_rejects_an_identity_swap_after_the_final_recapture() {
+        let root = std::env::temp_dir().join(format!(
+            "adobepy-config-recapture-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        let config = root.join("config.js");
+        fs::write(&config, b"old").unwrap();
+        let owner = ConfigTransactionOwner::default();
+        let expected = FileReceipt::capture(&config).unwrap();
+        let mut lease = owner.begin(&config, &expected).unwrap();
+        let staged_path = root.join("staged.js");
+        fs::write(&staged_path, b"transient").unwrap();
+        let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+        let replacement = root.join("replacement.js");
+        fs::write(&replacement, b"external").unwrap();
+        let swap_path = config.clone();
+        *BEFORE_ACTIVATE_WRITE.lock().unwrap() = Some(Box::new(move || {
+            fs::remove_file(&swap_path).unwrap();
+            fs::rename(&replacement, &swap_path).unwrap();
+        }));
+
+        assert_eq!(
+            lease.activate(&staged).unwrap_err(),
+            ConfigTransactionError::IdentityChanged
+        );
+        assert_eq!(fs::read(&config).unwrap(), b"external");
+        fs::remove_dir_all(root).unwrap();
+    }
 }

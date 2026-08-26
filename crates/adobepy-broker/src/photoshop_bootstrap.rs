@@ -19,13 +19,14 @@ pub(crate) struct ObservedHostProcess {
     pub executable_path: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PreparedBootstrap {
     config_path: Option<PathBuf>,
     previous_config: Option<Vec<u8>>,
     transient_config: Option<Vec<u8>>,
     committed_config: Option<Vec<u8>>,
     pub module_sha256: String,
+    pub(crate) activated: bool,
 }
 
 impl PreparedBootstrap {
@@ -37,6 +38,7 @@ impl PreparedBootstrap {
             transient_config: None,
             committed_config: None,
             module_sha256: module_sha256.into(),
+            activated: false,
         }
     }
 }
@@ -51,6 +53,10 @@ pub(crate) trait PhotoshopBootstrapBackend: Send + Sync {
         token: &str,
         websocket_url: &str,
     ) -> anyhow::Result<PreparedBootstrap>;
+
+    /// Activates a previously prepared inert plan. Implementations must not
+    /// perform unbounded discovery or waiting in this ownership transition.
+    fn activate(&self, prepared: &mut PreparedBootstrap) -> anyhow::Result<()>;
 
     fn launch(&self, target: &PhotoshopHostTarget) -> anyhow::Result<ObservedHostProcess>;
 
@@ -67,6 +73,7 @@ pub(crate) trait PhotoshopBootstrapBackend: Send + Sync {
 pub(crate) struct SystemPhotoshopBootstrapBackend;
 
 impl SystemPhotoshopBootstrapBackend {
+    #[cfg(test)]
     fn verify_prepared_configuration(
         &self,
         prepared: PreparedBootstrap,
@@ -115,9 +122,24 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
             bootstrap_config(websocket_url, token, &request.target, Some(nonce))?.into_bytes();
         let committed_config =
             bootstrap_config(websocket_url, token, &request.target, None)?.into_bytes();
-        match &previous_config {
-            Some(bytes) => exact_config_matches(&config_path, bytes)?,
-            None => match fs::symlink_metadata(&config_path) {
+        Ok(PreparedBootstrap {
+            config_path: Some(config_path),
+            previous_config,
+            transient_config: Some(transient_config),
+            committed_config: Some(committed_config),
+            module_sha256,
+            activated: false,
+        })
+    }
+
+    fn activate(&self, prepared: &mut PreparedBootstrap) -> anyhow::Result<()> {
+        let path = prepared
+            .config_path
+            .as_deref()
+            .context("prepared Photoshop configuration path is missing")?;
+        match prepared.previous_config.as_deref() {
+            Some(bytes) => exact_config_matches(path, bytes)?,
+            None => match fs::symlink_metadata(path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Ok(_) => {
                     return Err(anyhow!(
@@ -127,15 +149,14 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
                 Err(error) => return Err(error.into()),
             },
         }
-        atomic_write(&config_path, &transient_config)?;
-        let prepared = PreparedBootstrap {
-            config_path: Some(config_path),
-            previous_config,
-            transient_config: Some(transient_config),
-            committed_config: Some(committed_config),
-            module_sha256,
-        };
-        self.verify_prepared_configuration(prepared)
+        let transient = prepared
+            .transient_config
+            .as_deref()
+            .context("prepared Photoshop transient configuration is missing")?;
+        atomic_write(path, transient)?;
+        exact_config_matches(path, transient)?;
+        prepared.activated = true;
+        Ok(())
     }
 
     fn launch(&self, target: &PhotoshopHostTarget) -> anyhow::Result<ObservedHostProcess> {
@@ -170,6 +191,9 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
     }
 
     fn rollback(&self, prepared: PreparedBootstrap) -> anyhow::Result<()> {
+        if !prepared.activated {
+            return Ok(());
+        }
         let Some(path) = prepared.config_path else {
             return Ok(());
         };
@@ -211,6 +235,9 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
     }
 
     fn finalize(&self, prepared: &PreparedBootstrap) -> anyhow::Result<()> {
+        if !prepared.activated {
+            return Err(anyhow!("Photoshop bootstrap plan is not active"));
+        }
         match (
             &prepared.config_path,
             &prepared.transient_config,
@@ -731,6 +758,7 @@ mod tests {
             transient_config: Some(b"transient-config".to_vec()),
             committed_config: Some(b"committed-config".to_vec()),
             module_sha256: "a".repeat(64),
+            activated: true,
         };
 
         fs::write(&config, b"operator-change").unwrap();
@@ -760,6 +788,7 @@ mod tests {
             transient_config: Some(b"transient-config".to_vec()),
             committed_config: Some(b"committed-config".to_vec()),
             module_sha256: "a".repeat(64),
+            activated: true,
         };
         fs::remove_file(&config).unwrap();
 

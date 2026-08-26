@@ -24,11 +24,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 
 #[doc(hidden)]
@@ -43,6 +43,75 @@ use photoshop_bootstrap::{
 type DispatchResult = Result<RpcResponse, Box<RpcErrorResponse>>;
 type ValidationResult = Result<(), Box<RpcErrorResponse>>;
 type BootstrapResult = Result<PhotoshopBootstrapResult, Box<RpcErrorResponse>>;
+
+const BOOTSTRAP_BLOCKING_CAPACITY: usize = 2;
+const BOOTSTRAP_BLOCKING_QUEUE: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockingBoundaryError {
+    TimedOut,
+    Overloaded,
+    Panicked,
+}
+
+#[derive(Clone)]
+struct BootstrapBlockingBoundary {
+    admission: Arc<Semaphore>,
+    workers: Arc<Semaphore>,
+    active_workers: Arc<AtomicUsize>,
+}
+
+impl Default for BootstrapBlockingBoundary {
+    fn default() -> Self {
+        Self {
+            admission: Arc::new(Semaphore::new(
+                BOOTSTRAP_BLOCKING_CAPACITY + BOOTSTRAP_BLOCKING_QUEUE,
+            )),
+            workers: Arc::new(Semaphore::new(BOOTSTRAP_BLOCKING_CAPACITY)),
+            active_workers: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl BootstrapBlockingBoundary {
+    async fn execute<T, F>(
+        &self,
+        deadline: tokio::time::Instant,
+        operation: F,
+    ) -> Result<anyhow::Result<T>, BlockingBoundaryError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    {
+        let admission = tokio::time::timeout_at(deadline, self.admission.clone().acquire_owned())
+            .await
+            .map_err(|_| BlockingBoundaryError::TimedOut)?
+            .map_err(|_| BlockingBoundaryError::Overloaded)?;
+        let worker = tokio::time::timeout_at(deadline, self.workers.clone().acquire_owned())
+            .await
+            .map_err(|_| BlockingBoundaryError::TimedOut)?
+            .map_err(|_| BlockingBoundaryError::Overloaded)?;
+        let active = self.active_workers.clone();
+        let (sender, receiver) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let _admission = admission;
+            let _worker = worker;
+            active.fetch_add(1, Ordering::SeqCst);
+            bootstrap_transaction::install_sensitive_panic_hook();
+            let _sensitive = bootstrap_transaction::SensitivePanicGuard::enter();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+                .map_err(|_| BlockingBoundaryError::Panicked);
+            active.fetch_sub(1, Ordering::SeqCst);
+            let _ = sender.send(outcome);
+        });
+        match tokio::time::timeout_at(deadline, receiver).await {
+            Err(_) => Err(BlockingBoundaryError::TimedOut),
+            Ok(Err(_)) => Err(BlockingBoundaryError::Panicked),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Ok(Ok(outcome))) => Ok(outcome),
+        }
+    }
+}
 
 #[doc(hidden)]
 pub fn run_bootstrap_helper_stdio() -> anyhow::Result<()> {
@@ -72,36 +141,11 @@ struct BootstrapGrant {
     completion: watch::Sender<Option<BootstrapResult>>,
 }
 
-struct PreparedCleanupGuard {
-    backend: Arc<dyn PhotoshopBootstrapBackend>,
-    prepared: Option<PreparedBootstrap>,
-}
-
-impl PreparedCleanupGuard {
-    fn new(backend: Arc<dyn PhotoshopBootstrapBackend>, prepared: PreparedBootstrap) -> Self {
-        Self {
-            backend,
-            prepared: Some(prepared),
-        }
-    }
-
-    fn take(&mut self) -> PreparedBootstrap {
-        self.prepared.take().expect("prepared bootstrap is present")
-    }
-}
-
-impl Drop for PreparedCleanupGuard {
-    fn drop(&mut self) {
-        if let Some(prepared) = self.prepared.take() {
-            let _ = self.backend.rollback(prepared);
-        }
-    }
-}
-
 struct BootstrapTransactionGuard {
     key: String,
     grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
     backend: Arc<dyn PhotoshopBootstrapBackend>,
+    blocking: BootstrapBlockingBoundary,
     armed: bool,
 }
 
@@ -110,11 +154,13 @@ impl BootstrapTransactionGuard {
         key: String,
         grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
         backend: Arc<dyn PhotoshopBootstrapBackend>,
+        blocking: BootstrapBlockingBoundary,
     ) -> Self {
         Self {
             key,
             grants,
             backend,
+            blocking,
             armed: true,
         }
     }
@@ -133,31 +179,39 @@ impl Drop for BootstrapTransactionGuard {
         let key = self.key.clone();
         let grants = self.grants.clone();
         let backend = self.backend.clone();
-        if let Ok(mut locked) = grants.try_lock() {
-            cancel_bootstrap_grant(&mut locked, &key, backend.as_ref());
-            return;
-        }
+        let blocking = self.blocking.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let mut locked = grants.lock().await;
-                cancel_bootstrap_grant(&mut locked, &key, backend.as_ref());
+                cancel_bootstrap_grant(grants, &key, backend, blocking).await;
             });
         }
     }
 }
 
-fn cancel_bootstrap_grant(
-    grants: &mut HashMap<String, BootstrapGrant>,
+async fn cancel_bootstrap_grant(
+    grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
     key: &str,
-    backend: &dyn PhotoshopBootstrapBackend,
+    backend: Arc<dyn PhotoshopBootstrapBackend>,
+    blocking: BootstrapBlockingBoundary,
 ) {
-    let Some(grant) = grants.get_mut(key) else {
-        return;
+    let prepared = {
+        let mut grants = grants.lock().await;
+        let Some(grant) = grants.get_mut(key) else {
+            return;
+        };
+        grant.prepared.take()
     };
-    let rollback_failed = grant
-        .prepared
-        .take()
-        .is_some_and(|prepared| backend.rollback(prepared).is_err());
+    let rollback_failed = if let Some(prepared) = prepared {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+        !matches!(
+            blocking
+                .execute(deadline, move || backend.rollback(prepared))
+                .await,
+            Ok(Ok(()))
+        )
+    } else {
+        false
+    };
     let error = if rollback_failed {
         bootstrap_recovery_error("cancelled Photoshop bootstrap state could not be recovered")
     } else {
@@ -167,7 +221,10 @@ fn cancel_bootstrap_grant(
             json!({"stage": "cancellation"}),
         )
     };
-    grant.completion.send_replace(Some(Err(error)));
+    let mut grants = grants.lock().await;
+    if let Some(grant) = grants.get_mut(key) {
+        grant.completion.send_replace(Some(Err(error)));
+    }
     grants.remove(key);
 }
 
@@ -207,6 +264,7 @@ struct BrokerState {
     next_connection_id: Arc<AtomicU64>,
     broker_identity: Arc<BrokerRuntimeIdentity>,
     bootstrap_backend: Arc<dyn PhotoshopBootstrapBackend>,
+    bootstrap_blocking: BootstrapBlockingBoundary,
     bootstrap_grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
     bootstrap_receipts: Arc<Mutex<HashMap<String, BootstrapReceipt>>>,
     photoshop_websocket_url: String,
@@ -241,6 +299,7 @@ impl BrokerState {
             next_connection_id: Arc::new(AtomicU64::new(1)),
             broker_identity: Arc::new(capture_broker_identity()?),
             bootstrap_backend,
+            bootstrap_blocking: BootstrapBlockingBoundary::default(),
             bootstrap_grants: Arc::new(Mutex::new(HashMap::new())),
             bootstrap_receipts: Arc::new(Mutex::new(HashMap::new())),
             photoshop_websocket_url: format!(
@@ -400,10 +459,22 @@ impl BrokerState {
     async fn bootstrap_photoshop(&self, request: PhotoshopBootstrapRequest) -> BootstrapResult {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(request.timeout_ms);
         validate_photoshop_bootstrap_request(&request)?;
-        let attestation = self.bootstrap_backend.attest(&request);
-        if tokio::time::Instant::now() >= deadline {
-            return Err(bootstrap_timeout_error(&request, "attestation"));
-        }
+        let attestation = {
+            let backend = self.bootstrap_backend.clone();
+            let request = request.clone();
+            self.bootstrap_blocking
+                .execute(deadline, move || backend.attest(&request))
+                .await
+        };
+        let attestation = match attestation {
+            Err(BlockingBoundaryError::TimedOut) => {
+                return Err(bootstrap_timeout_error(&request, "attestation"));
+            }
+            Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                Err(anyhow!("bootstrap attestation worker failed closed"))
+            }
+            Ok(attestation) => attestation,
+        };
         let module_sha256 = attestation.map_err(|_| {
             identity_error(
                 ERROR_IDENTITY_UNAVAILABLE,
@@ -473,11 +544,8 @@ impl BrokerState {
                 return Err(bootstrap_timeout_error(&request, "identity"));
             }
             let identity = identity?;
-            let validation = self.validate_bootstrap_identity(&request, &identity, None);
-            if tokio::time::Instant::now() >= deadline {
-                return Err(bootstrap_timeout_error(&request, "identity_validation"));
-            }
-            validation?;
+            self.validate_bootstrap_identity(&request, &identity, None, deadline)
+                .await?;
             return self
                 .record_bootstrap_result(
                     identity,
@@ -532,55 +600,110 @@ impl BrokerState {
             key.clone(),
             self.bootstrap_grants.clone(),
             self.bootstrap_backend.clone(),
+            self.bootstrap_blocking.clone(),
         );
 
         let owner_result: BootstrapResult = async {
-            let prepared = self.bootstrap_backend.prepare(
-                &request,
-                &nonce,
-                &self.token,
-                &self.photoshop_websocket_url,
-            );
-            if tokio::time::Instant::now() >= deadline {
-                if let Ok(prepared) = prepared {
-                    let mut grants = self.bootstrap_grants.lock().await;
-                    if let Some(grant) = grants.get_mut(&key) {
-                        grant.prepared = Some(prepared);
-                    } else {
-                        let _ = self.bootstrap_backend.rollback(prepared);
-                    }
+            let prepared = {
+                let backend = self.bootstrap_backend.clone();
+                let request = request.clone();
+                let nonce = nonce.clone();
+                let token = self.token.clone();
+                let websocket_url = self.photoshop_websocket_url.clone();
+                self.bootstrap_blocking
+                    .execute(deadline, move || {
+                        backend.prepare(&request, &nonce, &token, &websocket_url)
+                    })
+                    .await
+            };
+            let prepared = match prepared {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    return Err(bootstrap_timeout_error(&request, "prepare"));
                 }
-                return Err(bootstrap_timeout_error(&request, "prepare"));
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    Err(anyhow!("bootstrap preparation worker failed closed"))
+                }
+                Ok(prepared) => prepared,
             }
-            let prepared = prepared.map_err(|_| {
+            .map_err(|_| {
                 identity_error(
                     ERROR_IDENTITY_UNAVAILABLE,
                     "the fixed Photoshop UXP bridge could not be prepared",
                     json!({"stage": "prepare"}),
                 )
             })?;
-            let mut prepared_guard =
-                PreparedCleanupGuard::new(self.bootstrap_backend.clone(), prepared);
-            {
+            let prepared = {
+                let backend = self.bootstrap_backend.clone();
+                self.bootstrap_blocking
+                    .execute(deadline, move || {
+                        let mut prepared = prepared;
+                        backend.activate(&mut prepared)?;
+                        Ok(prepared)
+                    })
+                    .await
+            };
+            let prepared = match prepared {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    return Err(bootstrap_timeout_error(&request, "prepare_activation"));
+                }
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    Err(anyhow!("bootstrap activation worker failed closed"))
+                }
+                Ok(prepared) => prepared,
+            }
+            .map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_UNAVAILABLE,
+                    "the fixed Photoshop UXP bridge could not be activated",
+                    json!({"stage": "prepare_activation"}),
+                )
+            })?;
+            let mut prepared = Some(prepared);
+            let inserted = {
                 let mut grants = self.bootstrap_grants.lock().await;
-                let Some(grant) = grants.get_mut(&key) else {
-                    return Err(identity_error(
-                        ERROR_IDENTITY_STALE,
-                        "Photoshop bootstrap reservation was cancelled",
-                        json!({"stage": "prepare"}),
-                    ));
-                };
-                let prepared = prepared_guard.take();
-                grant.module_sha256 = prepared.module_sha256.clone();
-                grant.prepared = Some(prepared);
+                if let Some(grant) = grants.get_mut(&key) {
+                    let prepared = prepared.take().expect("prepared bootstrap is present");
+                    grant.module_sha256 = prepared.module_sha256.clone();
+                    grant.prepared = Some(prepared);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !inserted {
+                if let Some(prepared) = prepared {
+                    let backend = self.bootstrap_backend.clone();
+                    let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+                    let _ = self
+                        .bootstrap_blocking
+                        .execute(cleanup_deadline, move || backend.rollback(prepared))
+                        .await;
+                }
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Photoshop bootstrap reservation was cancelled",
+                    json!({"stage": "prepare"}),
+                ));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(bootstrap_timeout_error(&request, "prepare"));
             }
-            let observed = self.bootstrap_backend.launch(&request.host);
-            if tokio::time::Instant::now() >= deadline {
-                return Err(bootstrap_timeout_error(&request, "launch"));
-            }
+            let observed = {
+                let backend = self.bootstrap_backend.clone();
+                let target = request.host.clone();
+                self.bootstrap_blocking
+                    .execute(deadline, move || backend.launch(&target))
+                    .await
+            };
+            let observed = match observed {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    return Err(bootstrap_timeout_error(&request, "launch"));
+                }
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    Err(anyhow!("bootstrap launch worker failed closed"))
+                }
+                Ok(observed) => observed,
+            };
             let observed = observed.map_err(|_| {
                 identity_error(
                     ERROR_IDENTITY_UNAVAILABLE,
@@ -625,16 +748,14 @@ impl BrokerState {
                             .await
                             .get(&key)
                             .and_then(|grant| grant.observed.clone());
-                        let validation = self.validate_bootstrap_identity(
+                        self.validate_bootstrap_identity(
                             &request,
                             &identity,
                             observed.as_ref(),
-                        );
-                        if tokio::time::Instant::now() >= deadline {
-                            return Err(bootstrap_timeout_error(&request, "identity_validation"));
-                        }
-                        validation?;
-                        let finalize = {
+                            deadline,
+                        )
+                        .await?;
+                        let prepared = {
                             let grants = self.bootstrap_grants.lock().await;
                             let Some(prepared) =
                                 grants.get(&key).and_then(|grant| grant.prepared.as_ref())
@@ -645,11 +766,23 @@ impl BrokerState {
                                     json!({"stage": "commit"}),
                                 ));
                             };
-                            self.bootstrap_backend.finalize(prepared)
+                            prepared.clone()
                         };
-                        if tokio::time::Instant::now() >= deadline {
-                            return Err(bootstrap_timeout_error(&request, "commit"));
-                        }
+                        let finalize = {
+                            let backend = self.bootstrap_backend.clone();
+                            self.bootstrap_blocking
+                                .execute(deadline, move || backend.finalize(&prepared))
+                                .await
+                        };
+                        let finalize = match finalize {
+                            Err(BlockingBoundaryError::TimedOut) => {
+                                return Err(bootstrap_timeout_error(&request, "commit"));
+                            }
+                            Err(
+                                BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked,
+                            ) => Err(anyhow!("bootstrap commit worker failed closed")),
+                            Ok(finalize) => finalize,
+                        };
                         finalize.map_err(|_| {
                             identity_error(
                                 ERROR_IDENTITY_UNAVAILABLE,
@@ -736,29 +869,44 @@ impl BrokerState {
         key: &str,
         primary_error: Box<RpcErrorResponse>,
     ) -> BootstrapResult {
-        let mut grants = self.bootstrap_grants.lock().await;
-        let Some(grant) = grants.get_mut(key) else {
-            return Err(primary_error);
+        let prepared = {
+            let mut grants = self.bootstrap_grants.lock().await;
+            let Some(grant) = grants.get_mut(key) else {
+                return Err(primary_error);
+            };
+            grant.prepared.take()
         };
-        let rollback_failed = grant
-            .prepared
-            .take()
-            .is_some_and(|prepared| self.bootstrap_backend.rollback(prepared).is_err());
+        let rollback_failed = if let Some(prepared) = prepared {
+            let backend = self.bootstrap_backend.clone();
+            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+            !matches!(
+                self.bootstrap_blocking
+                    .execute(cleanup_deadline, move || backend.rollback(prepared))
+                    .await,
+                Ok(Ok(()))
+            )
+        } else {
+            false
+        };
         let error = if rollback_failed {
             bootstrap_recovery_error("Photoshop bootstrap state could not be recovered")
         } else {
             primary_error
         };
-        grant.completion.send_replace(Some(Err(error.clone())));
+        let mut grants = self.bootstrap_grants.lock().await;
+        if let Some(grant) = grants.get_mut(key) {
+            grant.completion.send_replace(Some(Err(error.clone())));
+        }
         grants.remove(key);
         Err(error)
     }
 
-    fn validate_bootstrap_identity(
+    async fn validate_bootstrap_identity(
         &self,
         request: &PhotoshopBootstrapRequest,
         identity: &RuntimeIdentityAttestation,
         observed: Option<&ObservedHostProcess>,
+        deadline: tokio::time::Instant,
     ) -> Result<(), Box<RpcErrorResponse>> {
         let path_matches = normalized_paths_equal(
             &identity.host.executable_path,
@@ -775,16 +923,30 @@ impl BrokerState {
             process_start_identity: identity.host.process_start_identity.clone(),
             executable_path: identity.host.executable_path.clone(),
         };
-        let observed_matches = self.bootstrap_backend.process_matches(&claimed_process)
-            && observed.is_none_or(|expected| {
-                self.bootstrap_backend.process_matches(expected)
-                    && identity.host.pid == expected.pid
-                    && identity.host.process_start_identity == expected.process_start_identity
-                    && normalized_paths_equal(
-                        &identity.host.executable_path,
-                        &expected.executable_path,
-                    )
-            });
+        let expected = observed.cloned();
+        let expected_identity_matches = expected.as_ref().is_none_or(|expected| {
+            identity.host.pid == expected.pid
+                && identity.host.process_start_identity == expected.process_start_identity
+                && normalized_paths_equal(&identity.host.executable_path, &expected.executable_path)
+        });
+        let backend = self.bootstrap_backend.clone();
+        let observed_matches = self
+            .bootstrap_blocking
+            .execute(deadline, move || {
+                Ok(backend.process_matches(&claimed_process)
+                    && expected.as_ref().is_none_or(|expected| {
+                        backend.process_matches(expected) && expected_identity_matches
+                    }))
+            })
+            .await;
+        let observed_matches = match observed_matches {
+            Err(BlockingBoundaryError::TimedOut) => {
+                return Err(bootstrap_timeout_error(request, "identity_validation"));
+            }
+            Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => false,
+            Ok(Err(_)) => false,
+            Ok(Ok(matches)) => matches,
+        };
         if !path_matches
             || !observed_matches
             || identity.host.host_version != request.host.host_version
@@ -811,12 +973,22 @@ impl BrokerState {
         deadline: tokio::time::Instant,
         owner_key: Option<&str>,
     ) -> BootstrapResult {
-        let broker_attestation = self
-            .bootstrap_backend
-            .executable_sha256(&identity.broker.executable_path);
-        if tokio::time::Instant::now() >= deadline {
-            return Err(bootstrap_timeout_error(request, "broker_attestation"));
-        }
+        let broker_attestation = {
+            let backend = self.bootstrap_backend.clone();
+            let path = identity.broker.executable_path.clone();
+            self.bootstrap_blocking
+                .execute(deadline, move || backend.executable_sha256(&path))
+                .await
+        };
+        let broker_attestation = match broker_attestation {
+            Err(BlockingBoundaryError::TimedOut) => {
+                return Err(bootstrap_timeout_error(request, "broker_attestation"));
+            }
+            Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                Err(anyhow!("broker attestation worker failed closed"))
+            }
+            Ok(attestation) => attestation,
+        };
         let broker_sha256 = broker_attestation.map_err(|_| {
             identity_error(
                 ERROR_IDENTITY_UNAVAILABLE,
@@ -947,7 +1119,16 @@ impl BrokerState {
             process_start_identity: actual.host.process_start_identity.clone(),
             executable_path: actual.host.executable_path.clone(),
         };
-        if !self.bootstrap_backend.process_matches(&observed) {
+        let process_matches = {
+            let backend = self.bootstrap_backend.clone();
+            let observed = observed.clone();
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_millis(self.default_timeout_ms.max(1));
+            self.bootstrap_blocking
+                .execute(deadline, move || Ok(backend.process_matches(&observed)))
+                .await
+        };
+        if !matches!(process_matches, Ok(Ok(true))) {
             return Err(identity_error(
                 ERROR_IDENTITY_STALE,
                 "Photoshop process identity changed after bootstrap",
@@ -1022,7 +1203,18 @@ impl BrokerState {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        if !self.bootstrap_backend.process_matches(&observed) {
+        let process_matches = {
+            let backend = self.bootstrap_backend.clone();
+            let observed_for_validation = observed.clone();
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_millis(self.default_timeout_ms.max(1));
+            self.bootstrap_blocking
+                .execute(deadline, move || {
+                    Ok(backend.process_matches(&observed_for_validation))
+                })
+                .await
+        };
+        if !matches!(process_matches, Ok(Ok(true))) {
             return Err(identity_error(
                 ERROR_IDENTITY_STALE,
                 "selected Photoshop process identity changed before bridge connection",
@@ -2200,16 +2392,19 @@ mod tests {
             _websocket_url: &str,
         ) -> anyhow::Result<PreparedBootstrap> {
             self.prepares.fetch_add(1, Ordering::SeqCst);
-            self.config_state.store(2, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(
                 self.prepare_delay_ms.load(Ordering::SeqCst),
             ));
             if self.prepare_fails.load(Ordering::SeqCst) {
-                self.rollbacks.fetch_add(1, Ordering::SeqCst);
-                self.config_state.store(1, Ordering::SeqCst);
                 return Err(anyhow!("deterministic prepare failure"));
             }
             Ok(PreparedBootstrap::fake("d".repeat(64)))
+        }
+
+        fn activate(&self, prepared: &mut PreparedBootstrap) -> anyhow::Result<()> {
+            prepared.activated = true;
+            self.config_state.store(2, Ordering::SeqCst);
+            Ok(())
         }
 
         fn launch(
@@ -3489,7 +3684,7 @@ mod tests {
         assert_eq!(error.error.code, ERROR_TIMEOUT);
         assert_eq!(prepare_backend.prepares.load(Ordering::SeqCst), 1);
         assert_eq!(prepare_backend.launches.load(Ordering::SeqCst), 0);
-        assert_eq!(prepare_backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(prepare_backend.rollbacks.load(Ordering::SeqCst), 0);
         assert_eq!(prepare_backend.config_state.load(Ordering::SeqCst), 1);
         assert!(prepare_state.bootstrap_grants.lock().await.is_empty());
 
@@ -3520,6 +3715,41 @@ mod tests {
         assert_eq!(rollback_backend.rollbacks.load(Ordering::SeqCst), 1);
         assert_eq!(rollback_backend.config_state.load(Ordering::SeqCst), 1);
         assert!(rollback_state.bootstrap_grants.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_bootstrap_deadline_does_not_wait_for_non_cooperative_prepare() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.prepare_delay_ms.store(1_000, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let started = std::time::Instant::now();
+
+        let error = state
+            .bootstrap_photoshop(bootstrap_request(50))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "50 ms public deadline returned in {:?}",
+            started.elapsed()
+        );
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        assert_eq!(
+            backend.config_state.load(Ordering::SeqCst),
+            1,
+            "late inert preparation must never activate authoritative config"
+        );
+        assert_eq!(
+            state
+                .bootstrap_blocking
+                .active_workers
+                .load(Ordering::SeqCst),
+            0
+        );
     }
 
     #[test]
@@ -3570,7 +3800,11 @@ mod tests {
                 usize::from(stage == "launch"),
                 "{stage}"
             );
-            assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1, "{stage}");
+            assert_eq!(
+                backend.rollbacks.load(Ordering::SeqCst),
+                usize::from(stage == "launch"),
+                "{stage}"
+            );
             assert_eq!(backend.config_state.load(Ordering::SeqCst), 1, "{stage}");
             assert!(state.bootstrap_grants.blocking_lock().is_empty(), "{stage}");
             assert!(
