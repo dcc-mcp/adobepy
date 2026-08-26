@@ -139,7 +139,7 @@ pub(crate) struct SystemPhotoshopBootstrapBackend {
 }
 
 impl SystemPhotoshopBootstrapBackend {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     fn with_launch_arguments(arguments: Vec<String>) -> Self {
         Self {
             launch_arguments: arguments.into(),
