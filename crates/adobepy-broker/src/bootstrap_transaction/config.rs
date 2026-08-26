@@ -272,6 +272,15 @@ pub struct QuiescenceAck {
     pub generation: u64,
 }
 
+/// Linear proof that the exact committed file was recaptured while rollback
+/// ownership was still active. Dropping it leaves the lease rollback-capable.
+#[derive(Debug)]
+#[must_use = "a prepared commit confirmation must be consumed or rolled back"]
+pub struct ConfigCommitConfirmation {
+    transaction: ConfigTransactionIdentity,
+    expected: FileReceipt,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigTransactionError {
     #[error("configuration transaction is stale")]
@@ -492,6 +501,44 @@ impl ConfigLease {
         &mut self,
         expected: &FileReceipt,
     ) -> Result<QuiescenceAck, ConfigTransactionError> {
+        let confirmation = self.prepare_commit_confirmation(expected)?;
+        self.confirm_prevalidated(confirmation)
+    }
+
+    pub fn prepare_commit_confirmation(
+        &mut self,
+        expected: &FileReceipt,
+    ) -> Result<ConfigCommitConfirmation, ConfigTransactionError> {
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .map_err(|_| ConfigTransactionError::Io)?;
+        let active = matching_active(
+            &mut state,
+            self.generation,
+            self.transaction_id,
+            &self.valid,
+        )?;
+        if active.written.as_ref() != Some(expected)
+            || FileReceipt::capture(&active.destination).map_err(|_| ConfigTransactionError::Io)?
+                != *expected
+        {
+            return Err(ConfigTransactionError::IdentityChanged);
+        }
+        Ok(ConfigCommitConfirmation {
+            transaction: self.identity(),
+            expected: expected.clone(),
+        })
+    }
+
+    pub fn confirm_prevalidated(
+        &mut self,
+        confirmation: ConfigCommitConfirmation,
+    ) -> Result<QuiescenceAck, ConfigTransactionError> {
+        if confirmation.transaction != self.identity() {
+            return Err(ConfigTransactionError::Stale);
+        }
         let acknowledgement = {
             let mut state = self
                 .owner
@@ -504,11 +551,7 @@ impl ConfigLease {
                 self.transaction_id,
                 &self.valid,
             )?;
-            if active.written.as_ref() != Some(expected)
-                || FileReceipt::capture(&active.destination)
-                    .map_err(|_| ConfigTransactionError::Io)?
-                    != *expected
-            {
+            if active.written.as_ref() != Some(&confirmation.expected) {
                 return Err(ConfigTransactionError::IdentityChanged);
             }
             state.active = None;

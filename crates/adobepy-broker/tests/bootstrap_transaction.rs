@@ -647,12 +647,14 @@ fn config_commit_remains_rollback_capable_until_confirmation() {
     lease.activate(&staged).unwrap();
 
     let cancelled = std::sync::atomic::AtomicBool::new(false);
-    lease
+    let receipt = lease
         .prepare_commit_cancellable(b"committed", &cancelled)
         .unwrap();
+    let confirmation = lease.prepare_commit_confirmation(&receipt).unwrap();
     assert_eq!(std::fs::read(&destination).unwrap(), b"committed");
     assert!(!owner.is_quiescent());
 
+    drop(confirmation);
     lease.rollback().unwrap();
     assert_eq!(std::fs::read(&destination).unwrap(), b"old");
     assert!(owner.is_quiescent());

@@ -36,6 +36,8 @@ pub mod bootstrap_transaction;
 mod photoshop_bootstrap;
 
 #[cfg(test)]
+use photoshop_bootstrap::PhotoshopBootstrapCommitConfirmation;
+#[cfg(test)]
 use photoshop_bootstrap::PreparedBootstrap;
 use photoshop_bootstrap::{
     LaunchedHostProcess, ObservedHostProcess, PhotoshopBootstrapBackend,
@@ -1179,19 +1181,71 @@ impl BrokerState {
             expires_at_epoch_ms: epoch_ms() + 120_000,
         };
         if let Some(key) = owner_key {
+            let transaction = {
+                let grants = self.bootstrap_grants.lock().await;
+                grants
+                    .get(key)
+                    .and_then(|grant| grant.transaction.clone())
+                    .ok_or_else(|| {
+                        identity_error(
+                            ERROR_IDENTITY_STALE,
+                            "Photoshop bootstrap reservation is unavailable",
+                            json!({"stage": "receipt"}),
+                        )
+                    })?
+            };
+            if tokio::time::Instant::now() >= deadline {
+                transaction.revoke();
+                return Err(bootstrap_timeout_error(request, "receipt"));
+            }
+            let confirmation = {
+                let transaction = transaction.clone();
+                self.bootstrap_blocking
+                    .execute(deadline, move || transaction.prepare_commit_confirmation())
+                    .await
+            };
+            let confirmation = match confirmation {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    transaction.revoke();
+                    return Err(bootstrap_timeout_error(request, "receipt"));
+                }
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    transaction.revoke();
+                    Err(anyhow!(
+                        "bootstrap commit confirmation worker failed closed"
+                    ))
+                }
+                Ok(confirmation) => confirmation,
+            }
+            .map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Photoshop bootstrap commit ownership is stale",
+                    json!({"stage": "receipt"}),
+                )
+            })?;
+            if tokio::time::Instant::now() >= deadline {
+                transaction.revoke();
+                return Err(bootstrap_timeout_error(request, "receipt"));
+            }
             let mut owned_hosts = self.bootstrap_owned_hosts.lock().await;
             let mut grants = self.bootstrap_grants.lock().await;
             if tokio::time::Instant::now() >= deadline {
                 return Err(bootstrap_timeout_error(request, "receipt"));
             }
-            if grants
-                .get(key)
-                .and_then(|grant| grant.transaction.as_ref())
-                .is_none()
-            {
+            let Some(grant_transaction) =
+                grants.get(key).and_then(|grant| grant.transaction.as_ref())
+            else {
                 return Err(identity_error(
                     ERROR_IDENTITY_STALE,
                     "Photoshop bootstrap reservation is unavailable",
+                    json!({"stage": "receipt"}),
+                ));
+            };
+            if !Arc::ptr_eq(grant_transaction, &transaction) {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Photoshop bootstrap commit ownership is stale",
                     json!({"stage": "receipt"}),
                 ));
             }
@@ -1204,18 +1258,13 @@ impl BrokerState {
             let grant = grants
                 .get_mut(key)
                 .expect("owner grant remains locked through receipt persistence");
-            grant
-                .transaction
-                .as_ref()
-                .expect("owner transaction remains locked through receipt persistence")
-                .confirm_commit()
-                .map_err(|_| {
-                    identity_error(
-                        ERROR_IDENTITY_STALE,
-                        "Photoshop bootstrap commit ownership is stale",
-                        json!({"stage": "receipt"}),
-                    )
-                })?;
+            confirmation.commit().map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Photoshop bootstrap commit ownership is stale",
+                    json!({"stage": "receipt"}),
+                )
+            })?;
             grant.transaction.take();
             if let Some(launched) = grant.launched.take() {
                 owned_hosts.insert(key.to_owned(), launched);
@@ -2503,6 +2552,8 @@ mod tests {
         finalizes: Arc<AtomicUsize>,
         finalize_delay_ms: Arc<AtomicU64>,
         finalize_fails: Arc<AtomicBool>,
+        confirmations: Arc<AtomicUsize>,
+        confirm_delay_ms: Arc<AtomicU64>,
         rollbacks: Arc<AtomicUsize>,
         rollback_delay_ms: Arc<AtomicU64>,
         rollback_fails: Arc<AtomicBool>,
@@ -2529,10 +2580,32 @@ mod tests {
         finalizes: Arc<AtomicUsize>,
         finalize_delay_ms: Arc<AtomicU64>,
         finalize_fails: Arc<AtomicBool>,
+        confirmations: Arc<AtomicUsize>,
+        confirm_delay_ms: Arc<AtomicU64>,
         rollbacks: Arc<AtomicUsize>,
         rollback_delay_ms: Arc<AtomicU64>,
         rollback_fails: Arc<AtomicBool>,
         commit_pending: AtomicBool,
+    }
+
+    struct FakeBootstrapCommitConfirmation {
+        transaction: Arc<FakeBootstrapTransaction>,
+    }
+
+    impl PhotoshopBootstrapCommitConfirmation for FakeBootstrapCommitConfirmation {
+        fn commit(self: Box<Self>) -> anyhow::Result<()> {
+            if self.transaction.cancelled.load(Ordering::SeqCst) {
+                return Err(anyhow!("fake bootstrap transaction was revoked"));
+            }
+            if !self
+                .transaction
+                .commit_pending
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(anyhow!("fake commit is not pending"));
+            }
+            Ok(())
+        }
     }
 
     impl PhotoshopBootstrapTransaction for FakeBootstrapTransaction {
@@ -2567,11 +2640,22 @@ mod tests {
             Ok(())
         }
 
-        fn confirm_commit(&self) -> anyhow::Result<()> {
-            if !self.commit_pending.swap(false, Ordering::SeqCst) {
+        fn prepare_commit_confirmation(
+            self: Arc<Self>,
+        ) -> anyhow::Result<Box<dyn PhotoshopBootstrapCommitConfirmation>> {
+            self.confirmations.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(
+                self.confirm_delay_ms.load(Ordering::SeqCst),
+            ));
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(anyhow!("fake bootstrap transaction was revoked"));
+            }
+            if !self.commit_pending.load(Ordering::SeqCst) {
                 return Err(anyhow!("fake commit is not pending"));
             }
-            Ok(())
+            Ok(Box::new(FakeBootstrapCommitConfirmation {
+                transaction: self,
+            }))
         }
 
         fn revoke(&self) {
@@ -2640,6 +2724,8 @@ mod tests {
                 finalizes: self.finalizes.clone(),
                 finalize_delay_ms: self.finalize_delay_ms.clone(),
                 finalize_fails: self.finalize_fails.clone(),
+                confirmations: self.confirmations.clone(),
+                confirm_delay_ms: self.confirm_delay_ms.clone(),
                 rollbacks: self.rollbacks.clone(),
                 rollback_delay_ms: self.rollback_delay_ms.clone(),
                 rollback_fails: self.rollback_fails.clone(),
@@ -2855,6 +2941,26 @@ mod tests {
         identity.host.executable_path = Some(observed.executable_path.clone());
         insert_identity_session(state, "retouch", 1_720_000_000_000, Some(identity)).await;
         observed
+    }
+
+    async fn wait_for_bootstrap_blocking_quiescence(state: &BrokerState, bound: Duration) {
+        tokio::time::timeout(bound, async {
+            loop {
+                let notified = state.bootstrap_blocking.quiesced.notified();
+                if state
+                    .bootstrap_blocking
+                    .active_workers
+                    .load(Ordering::SeqCst)
+                    == 0
+                    && !state.bootstrap_blocking.poisoned.load(Ordering::SeqCst)
+                {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("bootstrap blocking boundary must quiesce");
     }
 
     fn identity_query(target: Option<&str>) -> RuntimeIdentityQuery {
@@ -4018,6 +4124,191 @@ mod tests {
             "a revoked finalize must not race recovery and commit late"
         );
         assert!(state.bootstrap_grants.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delayed_final_confirmation_times_out_without_ready_or_late_commit() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.confirm_delay_ms.store(250, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(200);
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        publish_matching_bootstrap_session(&state).await;
+
+        let error = tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .expect("final confirmation must have a bounded public outcome")
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(backend.confirmations.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+        assert_eq!(
+            state
+                .bootstrap_blocking
+                .active_workers
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(!state.bootstrap_blocking.poisoned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delayed_final_confirmation_releases_owner_and_follower_after_one_rollback() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.confirm_delay_ms.store(250, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(200);
+        let started = tokio::time::Instant::now();
+        let owner = tokio::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+        publish_matching_bootstrap_session(&state).await;
+        while backend.confirmations.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let follower = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(request).await }
+        });
+
+        let owner_error = tokio::time::timeout(Duration::from_millis(500), owner)
+            .await
+            .expect("confirmation owner must complete within the recovery bound")
+            .unwrap()
+            .unwrap_err();
+        let follower_error = tokio::time::timeout(Duration::from_millis(500), follower)
+            .await
+            .expect("confirmation follower must receive the terminal outcome")
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(owner_error.error.code, ERROR_TIMEOUT);
+        assert_eq!(follower_error.error.code, ERROR_TIMEOUT);
+        assert_eq!(follower_error.error.data, owner_error.error.data);
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(backend.confirmations.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+        wait_for_bootstrap_blocking_quiescence(&state, Duration::from_millis(250)).await;
+        assert_eq!(
+            state
+                .bootstrap_blocking
+                .active_workers
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abort_during_final_confirmation_revokes_the_ticket_before_cleanup() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.confirm_delay_ms.store(250, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let owner = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(bootstrap_request(1_000)).await }
+        });
+        publish_matching_bootstrap_session(&state).await;
+        while backend.confirmations.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if backend.rollbacks.load(Ordering::SeqCst) == 1
+                    && backend.config_state.load(Ordering::SeqCst) == 1
+                    && state.bootstrap_grants.lock().await.is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("aborted confirmation must reach terminal rollback");
+
+        wait_for_bootstrap_blocking_quiescence(&state, Duration::from_millis(500)).await;
+        assert_eq!(backend.confirmations.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        assert_eq!(
+            state
+                .bootstrap_blocking
+                .active_workers
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn final_confirmation_io_does_not_hold_bootstrap_state_locks() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.confirm_delay_ms.store(250, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let owner = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(bootstrap_request(1_000)).await }
+        });
+        publish_matching_bootstrap_session(&state).await;
+        while backend.confirmations.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let grant_guard =
+            tokio::time::timeout(Duration::from_millis(50), state.bootstrap_grants.lock())
+                .await
+                .expect("confirmation preflight must not hold the grant lock");
+        drop(grant_guard);
+        let owned_host_guard = tokio::time::timeout(
+            Duration::from_millis(50),
+            state.bootstrap_owned_hosts.lock(),
+        )
+        .await
+        .expect("confirmation preflight must not hold the owned-host lock");
+        drop(owned_host_guard);
+        let receipt_guard =
+            tokio::time::timeout(Duration::from_millis(50), state.bootstrap_receipts.lock())
+                .await
+                .expect("confirmation preflight must not hold the receipt lock");
+        drop(receipt_guard);
+
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if backend.rollbacks.load(Ordering::SeqCst) == 1
+                    && state.bootstrap_grants.lock().await.is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("confirmation cancellation must quiesce");
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
