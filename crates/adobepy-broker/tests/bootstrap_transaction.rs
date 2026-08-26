@@ -662,6 +662,323 @@ fn config_commit_remains_rollback_capable_until_confirmation() {
 }
 
 #[test]
+fn confirmed_pending_publication_remains_rollback_capable() {
+    let root = isolated_dir("config-confirmed-pending-rollback");
+    let destination = root.join("config.js");
+    std::fs::write(&destination, b"old").unwrap();
+    let owner = ConfigTransactionOwner::default();
+    let expected = FileReceipt::capture(&destination).unwrap();
+    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let staged_path = root.join("staged.js");
+    std::fs::write(&staged_path, b"transient").unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+    lease.activate(&staged).unwrap();
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let receipt = lease
+        .prepare_commit_cancellable(b"committed", &cancelled)
+        .unwrap();
+    let confirmation = lease.prepare_commit_confirmation(&receipt).unwrap();
+    let publication = lease.confirm_prevalidated(confirmation).unwrap();
+    drop(publication);
+
+    lease.rollback().unwrap();
+
+    assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+    assert!(owner.is_quiescent());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn publication_and_rollback_have_one_atomic_winner() {
+    for iteration in 0..50 {
+        let root = isolated_dir(&format!("config-publication-race-{iteration}"));
+        let destination = root.join("config.js");
+        std::fs::write(&destination, b"old").unwrap();
+        let owner = ConfigTransactionOwner::default();
+        let expected = FileReceipt::capture(&destination).unwrap();
+        let mut lease = owner.begin(&destination, &expected).unwrap();
+        let staged_path = root.join("staged.js");
+        std::fs::write(&staged_path, b"transient").unwrap();
+        let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+        lease.activate(&staged).unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let receipt = lease
+            .prepare_commit_cancellable(b"committed", &cancelled)
+            .unwrap();
+        let confirmation = lease.prepare_commit_confirmation(&receipt).unwrap();
+        let publication = lease.confirm_prevalidated(confirmation).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let publish_barrier = barrier.clone();
+        let publish = std::thread::spawn(move || {
+            publish_barrier.wait();
+            publication.publish()
+        });
+        let rollback = std::thread::spawn(move || {
+            barrier.wait();
+            lease.rollback()
+        });
+
+        let published = publish.join().unwrap();
+        let rolled_back = rollback.join().unwrap();
+
+        assert_ne!(published.is_ok(), rolled_back.is_ok());
+        assert!(owner.is_quiescent());
+        let expected_bytes: &[u8] = if published.is_ok() {
+            b"committed"
+        } else {
+            b"old"
+        };
+        assert_eq!(std::fs::read(&destination).unwrap(), expected_bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn config_confirmation_rejects_a_same_identity_edit_after_preflight() {
+    let root = isolated_dir("config-confirmation-edit");
+    let destination = root.join("config.js");
+    std::fs::write(&destination, b"old").unwrap();
+    let owner = ConfigTransactionOwner::default();
+    let expected = FileReceipt::capture(&destination).unwrap();
+    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let staged_path = root.join("staged.js");
+    std::fs::write(&staged_path, b"transient").unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+    lease.activate(&staged).unwrap();
+
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let receipt = lease
+        .prepare_commit_cancellable(b"committed", &cancelled)
+        .unwrap();
+    let confirmation = lease.prepare_commit_confirmation(&receipt).unwrap();
+    std::fs::write(&destination, b"foreign-after-preflight").unwrap();
+
+    assert_eq!(
+        lease.confirm_prevalidated(confirmation).unwrap_err(),
+        ConfigTransactionError::IdentityChanged
+    );
+    assert!(!owner.is_quiescent());
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"foreign-after-preflight"
+    );
+    let current = FileReceipt::capture(&destination).unwrap();
+    assert_eq!(
+        owner.begin(&destination, &current).unwrap_err(),
+        ConfigTransactionError::Busy
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn config_confirmation_rejects_same_bytes_with_a_new_identity_after_preflight() {
+    let root = isolated_dir("config-confirmation-identity");
+    let destination = root.join("config.js");
+    std::fs::write(&destination, b"old").unwrap();
+    let owner = ConfigTransactionOwner::default();
+    let expected = FileReceipt::capture(&destination).unwrap();
+    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let staged_path = root.join("staged.js");
+    std::fs::write(&staged_path, b"transient").unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+    lease.activate(&staged).unwrap();
+
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let receipt = lease
+        .prepare_commit_cancellable(b"committed", &cancelled)
+        .unwrap();
+    let confirmation = lease.prepare_commit_confirmation(&receipt).unwrap();
+    let replacement = root.join("replacement.js");
+    std::fs::write(&replacement, b"committed").unwrap();
+    std::fs::remove_file(&destination).unwrap();
+    std::fs::rename(&replacement, &destination).unwrap();
+
+    assert_eq!(
+        lease.confirm_prevalidated(confirmation).unwrap_err(),
+        ConfigTransactionError::IdentityChanged
+    );
+    assert!(!owner.is_quiescent());
+    assert_eq!(std::fs::read(&destination).unwrap(), b"committed");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn config_confirmation_defines_the_commit_instant_before_lock_free_publication() {
+    let root = isolated_dir("config-confirmation-instant");
+    let destination = root.join("config.js");
+    std::fs::write(&destination, b"old").unwrap();
+    let owner = ConfigTransactionOwner::default();
+    let expected = FileReceipt::capture(&destination).unwrap();
+    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let staged_path = root.join("staged.js");
+    std::fs::write(&staged_path, b"transient").unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+    lease.activate(&staged).unwrap();
+
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let receipt = lease
+        .prepare_commit_cancellable(b"committed", &cancelled)
+        .unwrap();
+    let confirmation = lease.prepare_commit_confirmation(&receipt).unwrap();
+    let publication = lease.confirm_prevalidated(confirmation).unwrap();
+    assert!(!owner.is_quiescent());
+
+    std::fs::write(&destination, b"external-after-commit-instant").unwrap();
+    let acknowledgement = publication.publish().unwrap();
+
+    assert_eq!(acknowledgement.generation, lease.generation());
+    assert!(owner.is_quiescent());
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"external-after-commit-instant"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn duplicate_confirmation_tickets_cannot_publish_the_same_transaction() {
+    let root = isolated_dir("config-confirmation-duplicate");
+    let destination = root.join("config.js");
+    std::fs::write(&destination, b"old").unwrap();
+    let owner = ConfigTransactionOwner::default();
+    let expected = FileReceipt::capture(&destination).unwrap();
+    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let staged_path = root.join("staged.js");
+    std::fs::write(&staged_path, b"transient").unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+    lease.activate(&staged).unwrap();
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let receipt = lease
+        .prepare_commit_cancellable(b"committed", &cancelled)
+        .unwrap();
+    let first = lease.prepare_commit_confirmation(&receipt).unwrap();
+    let duplicate = lease.prepare_commit_confirmation(&receipt).unwrap();
+
+    let publication = lease.confirm_prevalidated(first).unwrap();
+    assert_eq!(
+        lease.confirm_prevalidated(duplicate).unwrap_err(),
+        ConfigTransactionError::Stale
+    );
+    publication.publish().unwrap();
+    assert!(owner.is_quiescent());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_confirmation_ticket_cannot_be_reused_by_a_later_transaction() {
+    let root = isolated_dir("config-confirmation-reuse");
+    let destination = root.join("config.js");
+    std::fs::write(&destination, b"old").unwrap();
+    let owner = ConfigTransactionOwner::default();
+    let expected = FileReceipt::capture(&destination).unwrap();
+    let mut first = owner.begin(&destination, &expected).unwrap();
+    let staged_path = root.join("staged.js");
+    std::fs::write(&staged_path, b"transient").unwrap();
+    let staged = StagedArtifact::capture(first.identity(), &staged_path).unwrap();
+    first.activate(&staged).unwrap();
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let receipt = first
+        .prepare_commit_cancellable(b"committed", &cancelled)
+        .unwrap();
+    let stale = first.prepare_commit_confirmation(&receipt).unwrap();
+    first.rollback().unwrap();
+
+    let expected = FileReceipt::capture(&destination).unwrap();
+    let mut second = owner.begin(&destination, &expected).unwrap();
+    assert_eq!(
+        second.confirm_prevalidated(stale).unwrap_err(),
+        ConfigTransactionError::Stale
+    );
+    second.revoke().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn config_confirmation_rejects_a_reparse_parent_swap_after_preflight() {
+    let root = isolated_dir("config-confirmation-reparse");
+    let owned_parent = root.join("owned");
+    let original_parent = root.join("original");
+    let foreign_parent = root.join("foreign");
+    std::fs::create_dir(&owned_parent).unwrap();
+    std::fs::create_dir(&foreign_parent).unwrap();
+    let destination = owned_parent.join("config.js");
+    std::fs::write(&destination, b"old").unwrap();
+    std::fs::write(foreign_parent.join("config.js"), b"committed").unwrap();
+    let owner = ConfigTransactionOwner::default();
+    let expected = FileReceipt::capture(&destination).unwrap();
+    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let staged_path = root.join("staged.js");
+    std::fs::write(&staged_path, b"transient").unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+    lease.activate(&staged).unwrap();
+
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let receipt = lease
+        .prepare_commit_cancellable(b"committed", &cancelled)
+        .unwrap();
+    let confirmation = lease.prepare_commit_confirmation(&receipt).unwrap();
+    std::fs::rename(&owned_parent, &original_parent).unwrap();
+    let status = Command::new("cmd")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&owned_parent)
+        .arg(&foreign_parent)
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    assert_eq!(
+        lease.confirm_prevalidated(confirmation).unwrap_err(),
+        ConfigTransactionError::IdentityChanged
+    );
+    assert!(!owner.is_quiescent());
+    assert_eq!(std::fs::read(&destination).unwrap(), b"committed");
+    std::fs::remove_dir(&owned_parent).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn config_confirmation_rejects_a_symlink_parent_swap_after_preflight() {
+    use std::os::unix::fs::symlink;
+
+    let root = isolated_dir("config-confirmation-symlink");
+    let owned_parent = root.join("owned");
+    let original_parent = root.join("original");
+    let foreign_parent = root.join("foreign");
+    std::fs::create_dir(&owned_parent).unwrap();
+    std::fs::create_dir(&foreign_parent).unwrap();
+    let destination = owned_parent.join("config.js");
+    std::fs::write(&destination, b"old").unwrap();
+    std::fs::write(foreign_parent.join("config.js"), b"committed").unwrap();
+    let owner = ConfigTransactionOwner::default();
+    let expected = FileReceipt::capture(&destination).unwrap();
+    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let staged_path = root.join("staged.js");
+    std::fs::write(&staged_path, b"transient").unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+    lease.activate(&staged).unwrap();
+
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let receipt = lease
+        .prepare_commit_cancellable(b"committed", &cancelled)
+        .unwrap();
+    let confirmation = lease.prepare_commit_confirmation(&receipt).unwrap();
+    std::fs::rename(&owned_parent, &original_parent).unwrap();
+    symlink(&foreign_parent, &owned_parent).unwrap();
+
+    assert_eq!(
+        lease.confirm_prevalidated(confirmation).unwrap_err(),
+        ConfigTransactionError::IdentityChanged
+    );
+    assert!(!owner.is_quiescent());
+    assert_eq!(std::fs::read(&destination).unwrap(), b"committed");
+    std::fs::remove_file(&owned_parent).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn config_rollback_only_restores_the_receipt_it_owns() {
     let root = isolated_dir("config-rollback");
     let config = root.join("config.js");

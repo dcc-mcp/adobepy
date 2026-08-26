@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
@@ -16,6 +16,9 @@ use uuid::Uuid;
 type ActivateHook = Box<dyn FnOnce() + Send>;
 #[cfg(test)]
 static BEFORE_ACTIVATE_WRITE: LazyLock<Mutex<HashMap<PathBuf, ActivateHook>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static AFTER_CONFIRMATION_PREFLIGHT: LazyLock<Mutex<HashMap<PathBuf, ActivateHook>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
 static AFTER_RECEIPT_METADATA: LazyLock<Mutex<HashMap<PathBuf, ActivateHook>>> =
@@ -30,6 +33,17 @@ pub(crate) fn set_before_activate_write(path: PathBuf, intervene: impl FnOnce() 
 }
 
 #[cfg(test)]
+pub(crate) fn set_after_confirmation_preflight(
+    path: PathBuf,
+    intervene: impl FnOnce() + Send + 'static,
+) {
+    AFTER_CONFIRMATION_PREFLIGHT
+        .lock()
+        .unwrap()
+        .insert(path, Box::new(intervene));
+}
+
+#[cfg(test)]
 fn set_after_receipt_metadata(path: PathBuf, intervene: impl FnOnce() + Send + 'static) {
     AFTER_RECEIPT_METADATA
         .lock()
@@ -38,6 +52,10 @@ fn set_after_receipt_metadata(path: PathBuf, intervene: impl FnOnce() + Send + '
 }
 
 const MAX_CONFIG_BYTES: u64 = 512 * 1024;
+const CONFIG_PHASE_ACTIVE: u8 = 0;
+const CONFIG_PHASE_PENDING_PUBLICATION: u8 = 1;
+const CONFIG_PHASE_PUBLISHED: u8 = 2;
+const CONFIG_PHASE_ROLLING_BACK: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileReceipt {
@@ -281,6 +299,34 @@ pub struct ConfigCommitConfirmation {
     expected: FileReceipt,
 }
 
+/// Linear permission to publish a transaction whose exact committed identity
+/// was recaptured at the confirmation instant. Publication is a non-blocking
+/// compare-and-swap so callers never perform file I/O under async state locks.
+#[derive(Debug)]
+#[must_use = "a confirmed config transaction must be published or rolled back"]
+pub struct ConfigPublicationPermit {
+    transaction: ConfigTransactionIdentity,
+    phase: Arc<AtomicU8>,
+    valid: Arc<AtomicBool>,
+}
+
+impl ConfigPublicationPermit {
+    pub fn publish(self) -> Result<QuiescenceAck, ConfigTransactionError> {
+        self.phase
+            .compare_exchange(
+                CONFIG_PHASE_PENDING_PUBLICATION,
+                CONFIG_PHASE_PUBLISHED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map_err(|_| ConfigTransactionError::Stale)?;
+        self.valid.store(false, Ordering::SeqCst);
+        Ok(QuiescenceAck {
+            generation: self.transaction.generation,
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigTransactionError {
     #[error("configuration transaction is stale")]
@@ -298,6 +344,7 @@ struct ActiveConfigLease {
     generation: u64,
     transaction_id: Uuid,
     valid: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
     destination: PathBuf,
     expected: FileReceipt,
     attempted: Option<Vec<u8>>,
@@ -307,6 +354,7 @@ struct ActiveConfigLease {
 #[derive(Debug, Default)]
 struct ConfigOwnerState {
     active: Option<ActiveConfigLease>,
+    pending_publication: Option<ActiveConfigLease>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -318,11 +366,8 @@ pub struct ConfigTransactionOwner {
 impl ConfigTransactionOwner {
     pub fn is_quiescent(&self) -> bool {
         self.state.lock().is_ok_and(|state| {
-            state.active.as_ref().is_none_or(|active| {
-                !active.valid.load(Ordering::SeqCst)
-                    && active.attempted.is_none()
-                    && active.written.is_none()
-            })
+            lease_is_quiescent(state.active.as_ref())
+                && lease_is_quiescent(state.pending_publication.as_ref())
         })
     }
 
@@ -337,15 +382,12 @@ impl ConfigTransactionOwner {
             return Err(ConfigTransactionError::IdentityChanged);
         }
         let mut state = self.state.lock().map_err(|_| ConfigTransactionError::Io)?;
-        if let Some(active) = state.active.as_ref() {
-            if active.valid.load(Ordering::SeqCst)
-                || active.attempted.is_some()
-                || active.written.is_some()
-            {
-                return Err(ConfigTransactionError::Busy);
-            }
+        if lease_is_busy(state.active.as_ref()) || lease_is_busy(state.pending_publication.as_ref())
+        {
+            return Err(ConfigTransactionError::Busy);
         }
         state.active = None;
+        state.pending_publication = None;
         let current = FileReceipt::capture(&destination).map_err(|_| ConfigTransactionError::Io)?;
         if &current != expected {
             return Err(ConfigTransactionError::IdentityChanged);
@@ -356,11 +398,13 @@ impl ConfigTransactionOwner {
             .checked_add(1)
             .ok_or(ConfigTransactionError::Io)?;
         let valid = Arc::new(AtomicBool::new(true));
+        let phase = Arc::new(AtomicU8::new(CONFIG_PHASE_ACTIVE));
         let transaction_id = Uuid::new_v4();
         state.active = Some(ActiveConfigLease {
             generation,
             transaction_id,
             valid: valid.clone(),
+            phase: phase.clone(),
             destination: destination.clone(),
             expected: expected.clone(),
             attempted: None,
@@ -470,6 +514,9 @@ impl ConfigLease {
                 .state
                 .lock()
                 .map_err(|_| ConfigTransactionError::Io)?;
+            if state.pending_publication.is_some() {
+                return Err(ConfigTransactionError::Busy);
+            }
             let active = matching_active(
                 &mut state,
                 self.generation,
@@ -502,7 +549,7 @@ impl ConfigLease {
         expected: &FileReceipt,
     ) -> Result<QuiescenceAck, ConfigTransactionError> {
         let confirmation = self.prepare_commit_confirmation(expected)?;
-        self.confirm_prevalidated(confirmation)
+        self.confirm_prevalidated(confirmation)?.publish()
     }
 
     pub fn prepare_commit_confirmation(
@@ -521,25 +568,36 @@ impl ConfigLease {
             &self.valid,
         )?;
         if active.written.as_ref() != Some(expected)
-            || FileReceipt::capture(&active.destination).map_err(|_| ConfigTransactionError::Io)?
-                != *expected
+            || active.phase.load(Ordering::SeqCst) != CONFIG_PHASE_ACTIVE
         {
             return Err(ConfigTransactionError::IdentityChanged);
         }
-        Ok(ConfigCommitConfirmation {
+        #[cfg(test)]
+        let destination = active.destination.clone();
+        let confirmation = ConfigCommitConfirmation {
             transaction: self.identity(),
             expected: expected.clone(),
-        })
+        };
+        drop(state);
+        #[cfg(test)]
+        if let Some(intervene) = AFTER_CONFIRMATION_PREFLIGHT
+            .lock()
+            .map_err(|_| ConfigTransactionError::Io)?
+            .remove(&destination)
+        {
+            intervene();
+        }
+        Ok(confirmation)
     }
 
     pub fn confirm_prevalidated(
         &mut self,
         confirmation: ConfigCommitConfirmation,
-    ) -> Result<QuiescenceAck, ConfigTransactionError> {
+    ) -> Result<ConfigPublicationPermit, ConfigTransactionError> {
         if confirmation.transaction != self.identity() {
             return Err(ConfigTransactionError::Stale);
         }
-        let acknowledgement = {
+        let phase = {
             let mut state = self
                 .owner
                 .state
@@ -551,17 +609,32 @@ impl ConfigLease {
                 self.transaction_id,
                 &self.valid,
             )?;
-            if active.written.as_ref() != Some(&confirmation.expected) {
+            if active.written.as_ref() != Some(&confirmation.expected)
+                || FileReceipt::capture(&active.destination)
+                    .map_err(|_| ConfigTransactionError::IdentityChanged)?
+                    != confirmation.expected
+            {
                 return Err(ConfigTransactionError::IdentityChanged);
             }
-            state.active = None;
-            QuiescenceAck {
-                generation: self.generation,
-            }
+            active
+                .phase
+                .compare_exchange(
+                    CONFIG_PHASE_ACTIVE,
+                    CONFIG_PHASE_PENDING_PUBLICATION,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .map_err(|_| ConfigTransactionError::Stale)?;
+            let phase = active.phase.clone();
+            let pending = state.active.take().ok_or(ConfigTransactionError::Stale)?;
+            state.pending_publication = Some(pending);
+            phase
         };
-        self.valid.store(false, Ordering::SeqCst);
-        self.closed = true;
-        Ok(acknowledgement)
+        Ok(ConfigPublicationPermit {
+            transaction: self.identity(),
+            phase,
+            valid: self.valid.clone(),
+        })
     }
 
     pub fn rollback(mut self) -> Result<QuiescenceAck, ConfigTransactionError> {
@@ -571,12 +644,46 @@ impl ConfigLease {
                 .state
                 .lock()
                 .map_err(|_| ConfigTransactionError::Io)?;
-            let active = matching_active(
-                &mut state,
+            let pending = matches_lease(
+                state.pending_publication.as_ref(),
                 self.generation,
                 self.transaction_id,
                 &self.valid,
-            )?;
+            );
+            let active = if pending {
+                state
+                    .pending_publication
+                    .as_mut()
+                    .ok_or(ConfigTransactionError::Stale)?
+            } else {
+                matching_active(
+                    &mut state,
+                    self.generation,
+                    self.transaction_id,
+                    &self.valid,
+                )?
+            };
+            active
+                .phase
+                .compare_exchange(
+                    CONFIG_PHASE_ACTIVE,
+                    CONFIG_PHASE_ROLLING_BACK,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .or_else(|current| {
+                    if current == CONFIG_PHASE_PENDING_PUBLICATION {
+                        active.phase.compare_exchange(
+                            CONFIG_PHASE_PENDING_PUBLICATION,
+                            CONFIG_PHASE_ROLLING_BACK,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                    } else {
+                        Err(current)
+                    }
+                })
+                .map_err(|_| ConfigTransactionError::Stale)?;
             if let Some(written) = active.written.as_ref() {
                 let current = FileReceipt::capture(&active.destination)
                     .map_err(|_| ConfigTransactionError::Io)?;
@@ -589,7 +696,11 @@ impl ConfigLease {
                 // ambiguous. Never infer ownership from equal bytes alone.
                 return Err(ConfigTransactionError::IdentityChanged);
             }
-            state.active = None;
+            if pending {
+                state.pending_publication = None;
+            } else {
+                state.active = None;
+            }
             QuiescenceAck {
                 generation: self.generation,
             }
@@ -611,7 +722,10 @@ impl ConfigLease {
             self.transaction_id,
             &self.valid,
         )?;
-        if active.written.is_some() || active.attempted.is_some() {
+        if active.phase.load(Ordering::SeqCst) != CONFIG_PHASE_ACTIVE
+            || active.written.is_some()
+            || active.attempted.is_some()
+        {
             return Err(ConfigTransactionError::Busy);
         }
         state.active = None;
@@ -652,6 +766,39 @@ fn matching_active<'a>(
                 && active.valid.load(Ordering::SeqCst)
         })
         .ok_or(ConfigTransactionError::Stale)
+}
+
+fn matches_lease(
+    lease: Option<&ActiveConfigLease>,
+    generation: u64,
+    transaction_id: Uuid,
+    valid: &Arc<AtomicBool>,
+) -> bool {
+    valid.load(Ordering::SeqCst)
+        && lease.is_some_and(|lease| {
+            lease.generation == generation
+                && lease.transaction_id == transaction_id
+                && Arc::ptr_eq(&lease.valid, valid)
+                && lease.valid.load(Ordering::SeqCst)
+        })
+}
+
+fn lease_is_busy(lease: Option<&ActiveConfigLease>) -> bool {
+    lease.is_some_and(|lease| {
+        lease.phase.load(Ordering::SeqCst) != CONFIG_PHASE_PUBLISHED
+            && (lease.valid.load(Ordering::SeqCst)
+                || lease.attempted.is_some()
+                || lease.written.is_some())
+    })
+}
+
+fn lease_is_quiescent(lease: Option<&ActiveConfigLease>) -> bool {
+    lease.is_none_or(|lease| {
+        lease.phase.load(Ordering::SeqCst) == CONFIG_PHASE_PUBLISHED
+            || (!lease.valid.load(Ordering::SeqCst)
+                && lease.attempted.is_none()
+                && lease.written.is_none())
+    })
 }
 
 fn restore_expected(
@@ -886,6 +1033,38 @@ mod tests {
             ConfigTransactionError::IdentityChanged
         );
         assert_eq!(fs::read(&config).unwrap(), b"external");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authoritative_confirmation_moves_active_ownership_to_pending_publication() {
+        let root = std::env::temp_dir().join(format!(
+            "adobepy-config-confirmation-state-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        let config = root.join("config.js");
+        fs::write(&config, b"old").unwrap();
+        let owner = ConfigTransactionOwner::default();
+        let expected = FileReceipt::capture(&config).unwrap();
+        let mut lease = owner.begin(&config, &expected).unwrap();
+        let staged_path = root.join("staged.js");
+        fs::write(&staged_path, b"transient").unwrap();
+        let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+        lease.activate(&staged).unwrap();
+        let receipt = lease
+            .prepare_commit_cancellable(b"committed", &AtomicBool::new(false))
+            .unwrap();
+        let confirmation = lease.prepare_commit_confirmation(&receipt).unwrap();
+
+        let publication = lease.confirm_prevalidated(confirmation).unwrap();
+
+        let state = owner.state.lock().unwrap();
+        assert!(state.active.is_none());
+        assert!(state.pending_publication.is_some());
+        drop(state);
+        drop(publication);
+        lease.rollback().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }

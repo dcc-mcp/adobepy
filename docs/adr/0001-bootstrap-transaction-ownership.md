@@ -69,8 +69,17 @@ generation with a random transaction UUID; each staged artifact also carries a
 different staging UUID. Activation, commit preparation, rollback, and
 revocation compare the complete transaction identity and receipt under one
 owner lock. Commit is two phase: the owner first writes and retains a
-rollback-capable exact receipt, then confirms it only while the broker persists
-the success receipt.
+rollback-capable exact receipt. A prepared confirmation ticket is inert: its
+consumer reacquires the config-owner lock, recaptures the authoritative
+path/handle/bytes, and atomically advances that exact transaction to
+`confirmed-pending-publication`, moving it out of the active slot while the
+owner retains a separate rollback-capable pending slot. Only then does the
+broker receive a linear publication permit. Publishing that permit is a
+non-blocking compare-and-swap, so the broker performs no filesystem I/O while
+holding its async grant, host, or receipt locks. Deadline or cancellation
+before publication leaves the transaction rollback-capable; publication and
+rollback race through mutually exclusive state transitions and cannot both
+succeed.
 Configuration writes reacquire the expected OS file identity, keep that handle
 through the conditional write, and bind the post-write receipt to the same
 handle. A path replacement in the recapture-to-write window therefore fails

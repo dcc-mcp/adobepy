@@ -36,12 +36,14 @@ pub mod bootstrap_transaction;
 mod photoshop_bootstrap;
 
 #[cfg(test)]
-use photoshop_bootstrap::PhotoshopBootstrapCommitConfirmation;
-#[cfg(test)]
 use photoshop_bootstrap::PreparedBootstrap;
 use photoshop_bootstrap::{
     LaunchedHostProcess, ObservedHostProcess, PhotoshopBootstrapBackend,
     PhotoshopBootstrapTransaction, SystemPhotoshopBootstrapBackend,
+};
+#[cfg(test)]
+use photoshop_bootstrap::{
+    PhotoshopBootstrapCommitConfirmation, PhotoshopBootstrapPublicationPermit,
 };
 
 type DispatchResult = Result<RpcResponse, Box<RpcErrorResponse>>;
@@ -1228,6 +1230,34 @@ impl BrokerState {
                 transaction.revoke();
                 return Err(bootstrap_timeout_error(request, "receipt"));
             }
+            let publication = self
+                .bootstrap_blocking
+                .execute(deadline, move || confirmation.confirm())
+                .await;
+            let publication = match publication {
+                Err(BlockingBoundaryError::TimedOut) => {
+                    transaction.revoke();
+                    return Err(bootstrap_timeout_error(request, "receipt"));
+                }
+                Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
+                    transaction.revoke();
+                    Err(anyhow!(
+                        "bootstrap commit confirmation worker failed closed"
+                    ))
+                }
+                Ok(publication) => publication,
+            }
+            .map_err(|_| {
+                identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Photoshop bootstrap commit ownership is stale",
+                    json!({"stage": "receipt"}),
+                )
+            })?;
+            if tokio::time::Instant::now() >= deadline {
+                transaction.revoke();
+                return Err(bootstrap_timeout_error(request, "receipt"));
+            }
             let mut owned_hosts = self.bootstrap_owned_hosts.lock().await;
             let mut grants = self.bootstrap_grants.lock().await;
             if tokio::time::Instant::now() >= deadline {
@@ -1258,7 +1288,7 @@ impl BrokerState {
             let grant = grants
                 .get_mut(key)
                 .expect("owner grant remains locked through receipt persistence");
-            confirmation.commit().map_err(|_| {
+            publication.publish().map_err(|_| {
                 identity_error(
                     ERROR_IDENTITY_STALE,
                     "Photoshop bootstrap commit ownership is stale",
@@ -2553,6 +2583,7 @@ mod tests {
         finalize_delay_ms: Arc<AtomicU64>,
         finalize_fails: Arc<AtomicBool>,
         confirmations: Arc<AtomicUsize>,
+        confirmed: Arc<AtomicUsize>,
         confirm_delay_ms: Arc<AtomicU64>,
         rollbacks: Arc<AtomicUsize>,
         rollback_delay_ms: Arc<AtomicU64>,
@@ -2581,6 +2612,7 @@ mod tests {
         finalize_delay_ms: Arc<AtomicU64>,
         finalize_fails: Arc<AtomicBool>,
         confirmations: Arc<AtomicUsize>,
+        confirmed: Arc<AtomicUsize>,
         confirm_delay_ms: Arc<AtomicU64>,
         rollbacks: Arc<AtomicUsize>,
         rollback_delay_ms: Arc<AtomicU64>,
@@ -2592,8 +2624,32 @@ mod tests {
         transaction: Arc<FakeBootstrapTransaction>,
     }
 
+    struct FakeBootstrapPublicationPermit {
+        transaction: Arc<FakeBootstrapTransaction>,
+    }
+
     impl PhotoshopBootstrapCommitConfirmation for FakeBootstrapCommitConfirmation {
-        fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        fn confirm(
+            self: Box<Self>,
+        ) -> anyhow::Result<Box<dyn PhotoshopBootstrapPublicationPermit>> {
+            std::thread::sleep(Duration::from_millis(
+                self.transaction.confirm_delay_ms.load(Ordering::SeqCst),
+            ));
+            if self.transaction.cancelled.load(Ordering::SeqCst) {
+                return Err(anyhow!("fake bootstrap transaction was revoked"));
+            }
+            if !self.transaction.commit_pending.load(Ordering::SeqCst) {
+                return Err(anyhow!("fake commit is not pending"));
+            }
+            self.transaction.confirmed.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FakeBootstrapPublicationPermit {
+                transaction: self.transaction,
+            }))
+        }
+    }
+
+    impl PhotoshopBootstrapPublicationPermit for FakeBootstrapPublicationPermit {
+        fn publish(self: Box<Self>) -> anyhow::Result<()> {
             if self.transaction.cancelled.load(Ordering::SeqCst) {
                 return Err(anyhow!("fake bootstrap transaction was revoked"));
             }
@@ -2644,9 +2700,6 @@ mod tests {
             self: Arc<Self>,
         ) -> anyhow::Result<Box<dyn PhotoshopBootstrapCommitConfirmation>> {
             self.confirmations.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(
-                self.confirm_delay_ms.load(Ordering::SeqCst),
-            ));
             if self.cancelled.load(Ordering::SeqCst) {
                 return Err(anyhow!("fake bootstrap transaction was revoked"));
             }
@@ -2725,6 +2778,7 @@ mod tests {
                 finalize_delay_ms: self.finalize_delay_ms.clone(),
                 finalize_fails: self.finalize_fails.clone(),
                 confirmations: self.confirmations.clone(),
+                confirmed: self.confirmed.clone(),
                 confirm_delay_ms: self.confirm_delay_ms.clone(),
                 rollbacks: self.rollbacks.clone(),
                 rollback_delay_ms: self.rollback_delay_ms.clone(),
@@ -2771,7 +2825,98 @@ mod tests {
         }
     }
 
-    fn bootstrap_state(backend: Arc<FakeBootstrapBackend>) -> BrokerState {
+    struct CountingBootstrapTransaction {
+        inner: Arc<dyn PhotoshopBootstrapTransaction>,
+        rollbacks: Arc<AtomicUsize>,
+    }
+
+    impl PhotoshopBootstrapTransaction for CountingBootstrapTransaction {
+        fn module_sha256(&self) -> &str {
+            self.inner.module_sha256()
+        }
+
+        fn activate(&self) -> anyhow::Result<()> {
+            self.inner.activate()
+        }
+
+        fn finalize_pending(&self) -> anyhow::Result<()> {
+            self.inner.finalize_pending()
+        }
+
+        fn prepare_commit_confirmation(
+            self: Arc<Self>,
+        ) -> anyhow::Result<Box<dyn PhotoshopBootstrapCommitConfirmation>> {
+            self.inner.clone().prepare_commit_confirmation()
+        }
+
+        fn revoke(&self) {
+            self.inner.revoke();
+        }
+
+        fn rollback(&self) -> anyhow::Result<()> {
+            self.rollbacks.fetch_add(1, Ordering::SeqCst);
+            self.inner.rollback()
+        }
+    }
+
+    struct RealConfigBootstrapBackend {
+        fake: Arc<FakeBootstrapBackend>,
+        system: SystemPhotoshopBootstrapBackend,
+        config_path: std::path::PathBuf,
+        previous_config: Vec<u8>,
+        rollbacks: Arc<AtomicUsize>,
+    }
+
+    impl PhotoshopBootstrapBackend for RealConfigBootstrapBackend {
+        fn attest(&self, request: &PhotoshopBootstrapRequest) -> anyhow::Result<String> {
+            self.fake.attest(request)
+        }
+
+        fn prepare(
+            &self,
+            _request: &PhotoshopBootstrapRequest,
+            _nonce: &str,
+            _token: &str,
+            _websocket_url: &str,
+        ) -> anyhow::Result<PreparedBootstrap> {
+            Ok(PreparedBootstrap::config_test(
+                self.config_path.clone(),
+                Some(self.previous_config.clone()),
+                b"transient".to_vec(),
+                b"committed".to_vec(),
+                "d".repeat(64),
+            ))
+        }
+
+        fn begin_transaction(
+            &self,
+            prepared: PreparedBootstrap,
+        ) -> anyhow::Result<Arc<dyn PhotoshopBootstrapTransaction>> {
+            let inner = self.system.begin_transaction(prepared)?;
+            Ok(Arc::new(CountingBootstrapTransaction {
+                inner,
+                rollbacks: self.rollbacks.clone(),
+            }))
+        }
+
+        fn launch_owned(
+            &self,
+            target: &adobepy_protocol::PhotoshopHostTarget,
+            cancelled: Arc<AtomicBool>,
+        ) -> anyhow::Result<LaunchedHostProcess> {
+            self.fake.launch_owned(target, cancelled)
+        }
+
+        fn process_matches(&self, observed: &ObservedHostProcess) -> bool {
+            self.fake.process_matches(observed)
+        }
+
+        fn executable_sha256(&self, path: &str) -> anyhow::Result<String> {
+            self.fake.executable_sha256(path)
+        }
+    }
+
+    fn bootstrap_state(backend: Arc<dyn PhotoshopBootstrapBackend>) -> BrokerState {
         BrokerState::with_bootstrap_backend(
             &BrokerConfig {
                 bind: SocketAddr::from(([127, 0, 0, 1], 47_391)),
@@ -4164,6 +4309,146 @@ mod tests {
             0
         );
         assert!(!state.bootstrap_blocking.poisoned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn public_confirmation_rejects_a_config_edit_after_preflight_without_ready() {
+        let root = std::env::temp_dir().join(format!(
+            "adobepy-public-confirmation-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let config_path = root.join("adobepy.config.js");
+        std::fs::write(&config_path, b"old").unwrap();
+        let fake = FakeBootstrapBackend::ready();
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(RealConfigBootstrapBackend {
+            fake: fake.clone(),
+            system: SystemPhotoshopBootstrapBackend::default(),
+            config_path: config_path.clone(),
+            previous_config: b"old".to_vec(),
+            rollbacks: rollbacks.clone(),
+        });
+        let state = bootstrap_state(backend);
+        let foreign_path = config_path.clone();
+        bootstrap_transaction::set_after_confirmation_preflight(config_path.clone(), move || {
+            std::fs::write(foreign_path, b"foreign-after-preflight").unwrap()
+        });
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(bootstrap_request(1_000)).await }
+        });
+        publish_matching_bootstrap_session(&state).await;
+
+        let error = task.await.unwrap().unwrap_err();
+
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if rollbacks.load(Ordering::SeqCst) == 1
+                    && state.bootstrap_grants.lock().await.is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("failed confirmation must reach one terminal rollback");
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        assert!(!fake.launch_live.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            b"foreign-after-preflight"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            b"foreign-after-preflight"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deadline_after_final_confirmation_rolls_back_without_publication() {
+        let backend = FakeBootstrapBackend::ready();
+        let state = bootstrap_state(backend.clone());
+        let receipts_guard = state.bootstrap_receipts.lock().await;
+        let owner = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(bootstrap_request(100)).await }
+        });
+        publish_matching_bootstrap_session(&state).await;
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while backend.confirmed.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("final confirmation must complete before publication is released");
+        tokio::time::sleep(Duration::from_millis(125)).await;
+        drop(receipts_guard);
+
+        let error = owner.await.unwrap().unwrap_err();
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if backend.rollbacks.load(Ordering::SeqCst) == 1
+                    && state.bootstrap_grants.lock().await.is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("post-confirmation deadline must reach terminal rollback");
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+        assert!(!backend.launch_live.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abort_after_final_confirmation_rolls_back_without_publication() {
+        let backend = FakeBootstrapBackend::ready();
+        let state = bootstrap_state(backend.clone());
+        let receipts_guard = state.bootstrap_receipts.lock().await;
+        let owner = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_photoshop(bootstrap_request(1_000)).await }
+        });
+        publish_matching_bootstrap_session(&state).await;
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while backend.confirmed.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("final confirmation must complete before cancellation");
+
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        drop(receipts_guard);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if backend.rollbacks.load(Ordering::SeqCst) == 1
+                    && state.bootstrap_grants.lock().await.is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("post-confirmation abort must reach terminal rollback");
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+        assert!(!backend.launch_live.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
