@@ -59,9 +59,18 @@ print('SDK import smoke passed')
         throw "SDK import verification failed ($LASTEXITCODE)"
     }
 
-    $doctorExe = Join-Path $extractedRoot.FullName "bin" "adobepy.exe"
+    $binDirectory = Join-Path $extractedRoot.FullName "bin"
+    $doctorExe = Join-Path $binDirectory "adobepy.exe"
     if (-not (Test-Path -LiteralPath $doctorExe)) {
         throw "adobepy.exe not found at $doctorExe"
+    }
+    $helperExe = Join-Path $binDirectory "adobepy-bootstrap-helper.exe"
+    if (-not (Test-Path -LiteralPath $helperExe -PathType Leaf)) {
+        throw "adobepy-bootstrap-helper.exe not found at $helperExe"
+    }
+    $helperVersion = & $helperExe --version 2>&1
+    if ($LASTEXITCODE -ne 0 -or ($helperVersion | Out-String).Trim() -ne "adobepy-bootstrap-helper/1") {
+        throw "bootstrap helper version probe failed"
     }
 
     Write-Host "Running adobepy doctor --json..."

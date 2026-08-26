@@ -71,11 +71,36 @@ class DistributionTests(unittest.TestCase):
         self.assertGreaterEqual(package_script.count("check-release-versions.js"), 2)
         self.assertIn('"package-lock.json"', package_script)
         self.assertIn('"package-manifest.json"', package_script)
+        self.assertIn("Write-Utf8NoBom", package_script)
+        self.assertIn("[System.Text.UTF8Encoding]::new($false)", package_script)
+        self.assertLess(
+            package_script.index("function Write-Utf8NoBom"),
+            package_script.index("function Write-Installer"),
+        )
         ci_workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
         self.assertIn("Expand-Archive", ci_workflow)
         self.assertIn("node scripts/check-release-versions.js --root", ci_workflow)
+
+    def test_native_bootstrap_helper_is_built_packaged_and_smoke_checked(self):
+        package_script = (REPO_ROOT / "scripts" / "package-release.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        smoke_script = (REPO_ROOT / "scripts" / "smoke_install.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        manifest_contract = (REPO_ROOT / "docs" / "distribution-contract.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"adobepy-bootstrap-helper"', package_script)
+        self.assertGreaterEqual(package_script.count("adobepy-bootstrap-helper.exe"), 4)
+        self.assertIn("adobepy-bootstrap-helper.exe", smoke_script)
+        self.assertIn("--version", smoke_script)
+        self.assertIn('$binDirectory = Join-Path $extractedRoot.FullName "bin"', smoke_script)
+        self.assertNotIn('Join-Path $extractedRoot.FullName "bin" "', smoke_script)
+        self.assertIn("adobepy-bootstrap-helper.exe", manifest_contract)
+        self.assertIn("pure Python", manifest_contract)
 
     def test_release_version_checker_rejects_staged_drift(self):
         node = shutil.which("node")

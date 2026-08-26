@@ -13,6 +13,7 @@ The stable adapter-facing wire contract is documented in
 | --- | --- | --- |
 | `crates/adobepy-protocol` | Wire types, host identifiers, JSON-RPC errors, capability contracts | Broker state, HTTP/WebSocket runtime, host DOM behavior |
 | `crates/adobepy-broker` | Local HTTP/WebSocket broker, auth, session routing, timeout and capability checks | Photoshop/InDesign/Premiere DOM logic |
+| `crates/adobepy-broker::bootstrap_transaction` | Bounded helper-process admission, inert staging, linear config generations, and original host-process ownership | Adobe-host policy or a success receipt before quiescence |
 | `python/adobe/core` | Broker client, base session, capability normalization, shared errors | Host-specific facade imports |
 | `python/adobe/raw` | Explicit raw JavaScript/ExtendScript escape hatches | Typed host facade behavior |
 | `python/adobe/dcc_mcp` | Optional DCC MCP skill-result compatibility helpers and adobepy error mapping | MCP server lifecycle or host-specific behavior |

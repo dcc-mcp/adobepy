@@ -31,6 +31,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
 use uuid::Uuid;
 
+#[doc(hidden)]
+pub mod bootstrap_transaction;
 mod photoshop_bootstrap;
 
 use photoshop_bootstrap::{
@@ -41,6 +43,11 @@ use photoshop_bootstrap::{
 type DispatchResult = Result<RpcResponse, Box<RpcErrorResponse>>;
 type ValidationResult = Result<(), Box<RpcErrorResponse>>;
 type BootstrapResult = Result<PhotoshopBootstrapResult, Box<RpcErrorResponse>>;
+
+#[doc(hidden)]
+pub fn run_bootstrap_helper_stdio() -> anyhow::Result<()> {
+    bootstrap_transaction::run_helper_stdio()
+}
 
 struct PendingRequest {
     original_id: RequestId,

@@ -115,10 +115,11 @@ The package script:
 - ensures Python build/test helpers `coverage[toml]`, `setuptools`, and `wheel`
   exist;
 - runs `npm run test:all` unless `-SkipTests` is passed;
-- builds `adobepy` with `cargo build --release -p adobepy-cli --bin adobepy`;
+- builds `adobepy` and the fixed-sibling `adobepy-bootstrap-helper` with remapped
+  release paths;
 - builds UXP and CEP bridge bundles;
 - builds a Python wheel;
-- stages the CLI, Python SDK, bridge templates, IR contracts, lockfiles, docs,
+- stages both native executables, the Python SDK, bridge templates, IR contracts, lockfiles, docs,
   installer, and manifest;
 - writes a `.zip` archive and `.sha256` checksum under `dist/`.
 
@@ -128,3 +129,6 @@ After extracting the archive:
 .\install.ps1 -Python python -AddToUserPath
 adobepy doctor
 ```
+
+`doctor` reports `bootstrap_helper` separately. The helper is part of the
+Windows runtime archive, not the pure-Python wheel.

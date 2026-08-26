@@ -39,6 +39,12 @@ function Copy-File {
     Copy-Item -LiteralPath $Source -Destination $Destination -Force
 }
 
+function Write-Utf8NoBom {
+    param([string]$Destination, [string]$Content)
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($Destination, $Content, $encoding)
+}
+
 function Assert-ChildPath {
     param([string]$Parent, [string]$Child)
     $parentFull = [System.IO.Path]::GetFullPath($Parent).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
@@ -92,7 +98,7 @@ function Invoke-RemappedCargoReleaseBuild {
     if ($env:USERPROFILE) { $flags += "--remap-path-prefix=$($env:USERPROFILE)=/user" }
     $env:CARGO_ENCODED_RUSTFLAGS = $flags -join $separator
     try {
-        Invoke-External "cargo" @("build", "--release", "-p", "adobepy-cli", "--bin", "adobepy")
+        Invoke-External "cargo" @("build", "--release", "-p", "adobepy-cli", "--bin", "adobepy", "-p", "adobepy-broker", "--bin", "adobepy-bootstrap-helper")
     }
     finally {
         $env:CARGO_ENCODED_RUSTFLAGS = $previousFlags
@@ -132,6 +138,14 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Bin = Join-Path $Root "bin"
+$Cli = Join-Path $Bin "adobepy.exe"
+$Helper = Join-Path $Bin "adobepy-bootstrap-helper.exe"
+foreach ($required in @($Cli, $Helper)) {
+    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+        throw "required runtime executable is missing: $([System.IO.Path]::GetFileName($required))"
+    }
+}
+
 $Wheel = Get-ChildItem -LiteralPath (Join-Path $Root "wheels") -Filter "*.whl" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $Wheel) { throw "no Python wheel found" }
 & $Python -m pip install --user --force-reinstall $Wheel.FullName
@@ -146,6 +160,7 @@ if ($AddToUserPath) {
 }
 Write-Host "Installed adobepy SDK."
 Write-Host "CLI: $Bin\adobepy.exe"
+Write-Host "Bootstrap helper: $Bin\adobepy-bootstrap-helper.exe"
 '@ | Set-Content -LiteralPath $Destination -Encoding UTF8
 }
 
@@ -157,8 +172,9 @@ function Write-DistributionReadme {
 Package: $PackageName
 Runtime: $RuntimeId
 
-This package contains the release `adobepy` CLI, Python SDK wheel/source,
-compiled UXP/CEP bridge templates, IR contracts, and operation docs.
+This package contains the release `adobepy` CLI, its fixed sibling bootstrap
+helper, Python SDK wheel/source, compiled UXP/CEP bridge templates, IR contracts,
+and operation docs.
 
 ```powershell
 .\install.ps1 -Python python -AddToUserPath
@@ -232,6 +248,7 @@ Invoke-Step "Stage distribution tree" {
     New-Item -ItemType Directory -Force -Path (Join-Path $stageRoot "bin") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $stageRoot "wheels") | Out-Null
     Copy-File (Join-Path $Root "target\release\adobepy.exe") (Join-Path $stageRoot "bin\adobepy.exe")
+    Copy-File (Join-Path $Root "target\release\adobepy-bootstrap-helper.exe") (Join-Path $stageRoot "bin\adobepy-bootstrap-helper.exe")
     foreach ($dir in @("python", "bridges", "docs", "generators")) { Copy-Tree $dir (Join-Path $stageRoot $dir) }
     foreach ($file in @("README.md", "install.md", "pyproject.toml", "package.json", "package-lock.json", "Cargo.toml", "Cargo.lock")) {
         Copy-File $file (Join-Path $stageRoot $file)
@@ -251,15 +268,16 @@ Invoke-Step "Build Python wheel" {
 Invoke-Step "Write package docs and manifest" {
     Write-Installer (Join-Path $stageRoot "install.ps1")
     Write-DistributionReadme (Join-Path $stageRoot "DISTRIBUTION-README.md") $packageName $runtimeId
-    [ordered]@{
+    $manifest = [ordered]@{
         name = "adobepy"
         version = $Version
         runtime = $runtimeId
         builtAt = (Get-Date).ToUniversalTime().ToString("o")
         commands = @("vx just package", ".\install.ps1 -Python python -AddToUserPath", ".\bin\adobepy.exe doctor")
-        includes = @("bin/adobepy.exe", "wheels/*.whl", "python/adobe", "bridges/uxp", "bridges/cep", "docs", "generators/ir", "install.md")
-        notes = @("Rust dependencies are linked into the release executable.", "Bridge JavaScript dependencies are bundled into bridges/**/dist.", "The Python SDK has no third-party runtime dependencies.")
-    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stageRoot "package-manifest.json") -Encoding UTF8
+        includes = @("bin/adobepy.exe", "bin/adobepy-bootstrap-helper.exe", "wheels/*.whl", "python/adobe", "bridges/uxp", "bridges/cep", "docs", "generators/ir", "install.md")
+        notes = @("Rust dependencies are linked into the release executables.", "The bootstrap helper is resolved only as a canonical sibling of adobepy.exe.", "Bridge JavaScript dependencies are bundled into bridges/**/dist.", "The Python SDK wheel remains pure Python and does not contain native executables.")
+    } | ConvertTo-Json -Depth 8
+    Write-Utf8NoBom (Join-Path $stageRoot "package-manifest.json") $manifest
 }
 
 Invoke-Step "Verify staged release version projection" {

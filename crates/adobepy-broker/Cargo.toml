@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "adobepy-bootstrap-helper"
+path = "src/bin/bootstrap-helper.rs"
+
 [dependencies]
 adobepy-protocol = { path = "../adobepy-protocol" }
 anyhow.workspace = true
