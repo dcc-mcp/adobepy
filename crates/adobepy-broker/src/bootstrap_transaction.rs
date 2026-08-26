@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::fs;
-use std::io::{BufRead as _, BufReader as StdBufReader, Read, Write};
+use std::io::{BufReader as StdBufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -46,10 +46,10 @@ pub fn install_sensitive_panic_hook() {
     });
 }
 
-struct SensitivePanicGuard;
+pub(crate) struct SensitivePanicGuard;
 
 impl SensitivePanicGuard {
-    fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         SENSITIVE_PANIC_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
         Self
     }
@@ -70,6 +70,7 @@ pub enum HelperRequest {
     },
     Stage {
         generation: u64,
+        transaction_id: String,
         staging_id: String,
         bytes: Vec<u8>,
     },
@@ -87,6 +88,7 @@ pub enum HelperResponse {
     Completed,
     Staged {
         generation: u64,
+        transaction_id: String,
         staging_id: String,
         path: PathBuf,
         bytes: u64,
@@ -434,7 +436,7 @@ impl BootstrapProbe {
 
     pub async fn stage(
         &self,
-        generation: u64,
+        transaction: ConfigTransactionIdentity,
         bytes: Vec<u8>,
         deadline: tokio::time::Instant,
     ) -> Result<StagedArtifact, HelperPoolError> {
@@ -442,7 +444,8 @@ impl BootstrapProbe {
             .pool
             .execute(
                 HelperRequest::Stage {
-                    generation,
+                    generation: transaction.generation(),
+                    transaction_id: transaction.transaction_id().hyphenated().to_string(),
                     staging_id: Uuid::new_v4().hyphenated().to_string(),
                     bytes,
                 },
@@ -860,20 +863,10 @@ pub fn run_helper_stdio() -> anyhow::Result<()> {
     let stdout = std::io::stdout();
     let mut writer = stdout.lock();
     loop {
-        let mut encoded = Vec::new();
-        let read = reader.read_until(b'\n', &mut encoded)?;
-        if read == 0 {
+        let Some(encoded) = read_bounded_request_frame(&mut reader, MAX_HELPER_REQUEST_BYTES)?
+        else {
             return Ok(());
-        }
-        if encoded.last() == Some(&b'\n') {
-            encoded.pop();
-            if encoded.last() == Some(&b'\r') {
-                encoded.pop();
-            }
-        }
-        if encoded.len() > MAX_HELPER_REQUEST_BYTES {
-            return Err(anyhow!("bootstrap helper request exceeded its bound"));
-        }
+        };
         let request: HelperRequestEnvelope =
             serde_json::from_slice(&encoded).context("bootstrap helper request is malformed")?;
         if request.protocol_version != HELPER_PROTOCOL_VERSION
@@ -905,6 +898,42 @@ pub fn run_helper_stdio() -> anyhow::Result<()> {
         writer.write_all(&encoded)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
+    }
+}
+
+fn read_bounded_request_frame(
+    reader: &mut impl std::io::BufRead,
+    maximum: usize,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(bytes))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |position| position + 1);
+        let next_length = bytes
+            .len()
+            .checked_add(take)
+            .context("bootstrap helper request length overflow")?;
+        let allowed = maximum.saturating_add(usize::from(newline.is_some()));
+        if next_length > allowed {
+            return Err(anyhow!("bootstrap helper request exceeded its bound"));
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            return Ok(Some(bytes));
+        }
     }
 }
 
@@ -943,9 +972,14 @@ fn execute_helper_request(request: HelperRequest) -> anyhow::Result<HelperRespon
         }
         HelperRequest::Stage {
             generation,
+            transaction_id,
             staging_id,
             bytes,
         } => {
+            let transaction_id = Uuid::parse_str(&transaction_id)
+                .context("bootstrap transaction identity is invalid")?
+                .hyphenated()
+                .to_string();
             let staging_id = Uuid::parse_str(&staging_id)
                 .context("bootstrap staging generation is invalid")?
                 .hyphenated()
@@ -967,6 +1001,7 @@ fn execute_helper_request(request: HelperRequest) -> anyhow::Result<HelperRespon
             }
             Ok(HelperResponse::Staged {
                 generation,
+                transaction_id,
                 staging_id,
                 path,
                 bytes: u64::try_from(bytes.len())?,

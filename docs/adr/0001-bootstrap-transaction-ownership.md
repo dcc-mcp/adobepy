@@ -63,11 +63,26 @@ receipt. The public timeout therefore preserves its response SLO without being
 misrepresented as successful quiescence.
 
 Helper output is inert. It may create only a UUID-scoped staging artifact. A
-separate `ConfigTransactionOwner` grants one non-clone generation lease after an
-exact path/handle/byte receipt comparison. Activation, finalization, rollback,
-and revocation compare that generation and receipt under one owner lock. Lease
-Drop performs a single atomic revocation; explicit methods return a quiescence
-acknowledgement. Rollback refuses to overwrite an external edit.
+separate `ConfigTransactionOwner` grants one non-clone lease after an exact
+path/handle/byte receipt comparison. The lease identity combines the local
+generation with a random transaction UUID; each staged artifact also carries a
+different staging UUID. Activation, finalization, rollback, and revocation
+compare the complete transaction identity and receipt under one owner lock.
+Configuration writes reacquire the expected OS file identity, keep that handle
+through the conditional write, and bind the post-write receipt to the same
+handle. A path replacement in the recapture-to-write window therefore fails
+closed instead of overwriting the replacement. Lease Drop performs a single
+atomic revocation; explicit methods return a quiescence acknowledgement.
+Rollback refuses to overwrite an external edit.
+
+The existing public Photoshop bootstrap places each synchronous backend phase
+behind one fixed-capacity admission boundary instead of a Tokio worker. Its
+preparation phase produces an inert plan; a separate ownership transition is
+the only point that may activate authoritative configuration. A timed-out
+preparation can finish late, but it cannot redeem its result or mutate the
+configuration. The fixed thread boundary is limited to trusted, in-repository
+read-only planning and bounded ownership transitions. Arbitrary extension work
+continues to require the killable helper-process boundary described above.
 
 `HostProcessBroker` retains the original child and an unforgeable ownership ID.
 Windows ownership includes a kill-on-close Job handle. Unix ownership includes
@@ -104,6 +119,8 @@ and safety-sensitive.
 
 - Missing, redirected, or foreign helper: fail before request I/O.
 - Full queue: typed overload; the fixed helper count cannot grow.
+- Unterminated input: reject as soon as the incremental 512 KiB request bound
+  is crossed; do not wait for a newline or EOF.
 - Deadline: typed timeout, then counted kill/reap with no replacement before
   quiescence.
 - Reap failure: close the pool and expose fail-stop; never replace the worker.

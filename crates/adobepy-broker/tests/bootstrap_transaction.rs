@@ -144,11 +144,13 @@ async fn admission_queue_process_count_and_shutdown_are_bounded() {
 async fn helper_staging_is_generation_scoped_and_inert() {
     let pool = HelperProcessPool::new(helper_program(), 1, 0).unwrap();
     let generation = 42;
+    let transaction_id = uuid::Uuid::new_v4().hyphenated().to_string();
     let staging_id = uuid::Uuid::new_v4().hyphenated().to_string();
     let response = pool
         .execute(
             HelperRequest::Stage {
                 generation,
+                transaction_id: transaction_id.clone(),
                 staging_id: staging_id.clone(),
                 bytes: b"PRIVATE_STAGED_CONFIGURATION".to_vec(),
             },
@@ -158,6 +160,7 @@ async fn helper_staging_is_generation_scoped_and_inert() {
         .unwrap();
     let HelperResponse::Staged {
         generation: actual_generation,
+        transaction_id: actual_transaction_id,
         staging_id: actual_staging_id,
         path,
         bytes,
@@ -167,6 +170,7 @@ async fn helper_staging_is_generation_scoped_and_inert() {
         panic!("expected an inert staged response")
     };
     assert_eq!(actual_generation, generation);
+    assert_eq!(actual_transaction_id, transaction_id);
     assert_eq!(actual_staging_id, staging_id);
     assert_eq!(bytes, 28);
     assert_eq!(
@@ -223,7 +227,7 @@ async fn helper_stage_can_only_be_redeemed_by_its_exact_config_generation() {
     let probe = BootstrapProbe::new(helper_program(), 1, 0).unwrap();
     let staged = probe
         .stage(
-            lease.generation(),
+            lease.identity(),
             b"transient".to_vec(),
             tokio::time::Instant::now() + Duration::from_secs(10),
         )
@@ -364,6 +368,40 @@ fn ordinary_panic_hook_behavior_is_preserved_outside_sensitive_work() {
 }
 
 #[test]
+fn helper_rejects_an_oversized_request_before_newline_or_eof() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_adobepy-bootstrap-helper"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&vec![b'x'; 600 * 1024]);
+        let _ = stdin.flush();
+        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+    });
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let exited = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    if !exited {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    let _ = release_tx.send(());
+    writer.join().unwrap();
+    assert!(exited, "oversized unterminated request remained buffered");
+}
+
+#[test]
 fn config_generation_rejects_late_staging_and_drop_is_nonblocking() {
     let root = isolated_dir("config-generation");
     let config = root.join("config.js");
@@ -371,7 +409,7 @@ fn config_generation_rejects_late_staging_and_drop_is_nonblocking() {
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&config).unwrap();
     let first = owner.begin(&config, &expected).unwrap();
-    let first_generation = first.generation();
+    let first_identity = first.identity();
     let started = std::time::Instant::now();
     drop(first);
     assert!(started.elapsed() < Duration::from_millis(10));
@@ -381,12 +419,45 @@ fn config_generation_rejects_late_staging_and_drop_is_nonblocking() {
     let mut second = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("late.js");
     std::fs::write(&staged_path, b"late").unwrap();
-    let stale = StagedArtifact::capture(first_generation, &staged_path).unwrap();
+    let stale = StagedArtifact::capture(first_identity, &staged_path).unwrap();
     assert_eq!(
         second.activate(&stale).unwrap_err(),
         ConfigTransactionError::Stale
     );
     assert_eq!(std::fs::read(&config).unwrap(), b"old");
+    second.revoke().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn staged_artifact_from_another_owner_with_the_same_generation_is_stale() {
+    let root = isolated_dir("config-cross-owner-generation");
+    let first_config = root.join("first.js");
+    let second_config = root.join("second.js");
+    let staged_path = root.join("staged.js");
+    std::fs::write(&first_config, b"first").unwrap();
+    std::fs::write(&second_config, b"second").unwrap();
+    std::fs::write(&staged_path, b"foreign").unwrap();
+
+    let first_owner = ConfigTransactionOwner::default();
+    let first_expected = FileReceipt::capture(&first_config).unwrap();
+    let first = first_owner.begin(&first_config, &first_expected).unwrap();
+    let foreign = StagedArtifact::capture(first.identity(), &staged_path).unwrap();
+    first.revoke().unwrap();
+
+    let second_owner = ConfigTransactionOwner::default();
+    let second_expected = FileReceipt::capture(&second_config).unwrap();
+    let mut second = second_owner
+        .begin(&second_config, &second_expected)
+        .unwrap();
+    assert!(first_owner.is_quiescent());
+    assert_eq!(first_expected.path(), first_config);
+    assert_eq!(second.generation(), 1);
+    assert_eq!(
+        second.activate(&foreign).unwrap_err(),
+        ConfigTransactionError::Stale
+    );
+    assert_eq!(std::fs::read(&second_config).unwrap(), b"second");
     second.revoke().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -427,7 +498,7 @@ fn config_finalize_fails_closed_on_same_bytes_new_identity() {
     let mut lease = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
-    let staged = StagedArtifact::capture(lease.generation(), &staged_path).unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
     lease.activate(&staged).unwrap();
 
     let replacement = root.join("replacement.js");
@@ -460,7 +531,7 @@ fn config_finalize_commits_the_exact_receipt_and_quiesces_the_owner() {
     let mut lease = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
-    let staged = StagedArtifact::capture(lease.generation(), &staged_path).unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
 
     lease.activate(&staged).unwrap();
     let receipt = lease.finalize(b"committed").unwrap();
@@ -481,7 +552,7 @@ fn config_rollback_only_restores_the_receipt_it_owns() {
     let mut lease = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
-    let staged = StagedArtifact::capture(lease.generation(), &staged_path).unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
     lease.activate(&staged).unwrap();
     std::fs::write(&config, b"external-edit").unwrap();
 
@@ -503,12 +574,32 @@ fn config_activate_and_rollback_return_an_explicit_quiescence_ack() {
     let mut lease = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
-    let staged = StagedArtifact::capture(lease.generation(), &staged_path).unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
     lease.activate(&staged).unwrap();
     let generation = lease.generation();
     let acknowledgement = lease.rollback().unwrap();
     assert_eq!(acknowledgement.generation, generation);
     assert_eq!(std::fs::read(&config).unwrap(), b"old");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn config_rollback_removes_only_the_owned_file_created_from_an_absent_receipt() {
+    let root = isolated_dir("config-absent-rollback");
+    let config = root.join("config.js");
+    let owner = ConfigTransactionOwner::default();
+    let expected = FileReceipt::capture(&config).unwrap();
+    let mut lease = owner.begin(&config, &expected).unwrap();
+    let staged_path = root.join("staged.js");
+    std::fs::write(&staged_path, b"transient").unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
+
+    lease.activate(&staged).unwrap();
+    assert_eq!(std::fs::read(&config).unwrap(), b"transient");
+    lease.rollback().unwrap();
+
+    assert!(!config.exists());
+    assert!(owner.is_quiescent());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -522,7 +613,7 @@ fn dropping_an_activated_config_lease_is_nonblocking_and_fail_stops_the_owner() 
     let mut lease = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
-    let staged = StagedArtifact::capture(lease.generation(), &staged_path).unwrap();
+    let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
     lease.activate(&staged).unwrap();
     let started = std::time::Instant::now();
     drop(lease);
