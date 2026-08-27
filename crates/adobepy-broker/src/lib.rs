@@ -52,6 +52,7 @@ type BootstrapResult = Result<PhotoshopBootstrapResult, Box<RpcErrorResponse>>;
 
 const BOOTSTRAP_BLOCKING_CAPACITY: usize = 2;
 const BOOTSTRAP_BLOCKING_QUEUE: usize = 2;
+const BOOTSTRAP_CLEANUP_CAPACITY: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockingBoundaryError {
@@ -64,6 +65,7 @@ enum BlockingBoundaryError {
 struct BootstrapBlockingBoundary {
     admission: Arc<Semaphore>,
     workers: Arc<Semaphore>,
+    cleanup_workers: Arc<Semaphore>,
     active_workers: Arc<AtomicUsize>,
     poisoned: Arc<AtomicBool>,
     quiesced: Arc<Notify>,
@@ -76,6 +78,7 @@ impl Default for BootstrapBlockingBoundary {
                 BOOTSTRAP_BLOCKING_CAPACITY + BOOTSTRAP_BLOCKING_QUEUE,
             )),
             workers: Arc::new(Semaphore::new(BOOTSTRAP_BLOCKING_CAPACITY)),
+            cleanup_workers: Arc::new(Semaphore::new(BOOTSTRAP_CLEANUP_CAPACITY)),
             active_workers: Arc::new(AtomicUsize::new(0)),
             poisoned: Arc::new(AtomicBool::new(false)),
             quiesced: Arc::new(Notify::new()),
@@ -118,6 +121,16 @@ impl BootstrapBlockingBoundary {
         T: Send + 'static,
         F: FnOnce() -> anyhow::Result<T> + Send + 'static,
     {
+        let admission = if cleanup {
+            None
+        } else {
+            Some(
+                self.admission
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| BlockingBoundaryError::Overloaded)?,
+            )
+        };
         while !cleanup && self.poisoned.load(Ordering::SeqCst) {
             let notified = self.quiesced.notified();
             if !self.poisoned.load(Ordering::SeqCst) {
@@ -127,22 +140,26 @@ impl BootstrapBlockingBoundary {
                 .await
                 .map_err(|_| BlockingBoundaryError::TimedOut)?;
         }
-        let admission = tokio::time::timeout_at(deadline, self.admission.clone().acquire_owned())
+        let workers = if cleanup {
+            self.cleanup_workers.clone()
+        } else {
+            self.workers.clone()
+        };
+        let worker = tokio::time::timeout_at(deadline, workers.acquire_owned())
             .await
             .map_err(|_| BlockingBoundaryError::TimedOut)?
             .map_err(|_| BlockingBoundaryError::Overloaded)?;
-        let worker = tokio::time::timeout_at(deadline, self.workers.clone().acquire_owned())
-            .await
-            .map_err(|_| BlockingBoundaryError::TimedOut)?
-            .map_err(|_| BlockingBoundaryError::Overloaded)?;
+        if !cleanup && self.poisoned.load(Ordering::SeqCst) {
+            return Err(BlockingBoundaryError::Overloaded);
+        }
         let active = self.active_workers.clone();
         let poisoned = self.poisoned.clone();
         let quiesced = self.quiesced.clone();
         let (sender, receiver) = oneshot::channel();
+        active.fetch_add(1, Ordering::SeqCst);
         tokio::task::spawn_blocking(move || {
             let _admission = admission;
             let _worker = worker;
-            active.fetch_add(1, Ordering::SeqCst);
             bootstrap_transaction::install_sensitive_panic_hook();
             let _sensitive = bootstrap_transaction::SensitivePanicGuard::enter();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
@@ -2556,6 +2573,36 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tower::ServiceExt;
 
+    #[derive(Clone)]
+    struct FakePhaseGate {
+        entered: watch::Sender<bool>,
+        release: Arc<std::sync::Barrier>,
+    }
+
+    impl FakePhaseGate {
+        fn new() -> (Self, watch::Receiver<bool>) {
+            let (entered, receiver) = watch::channel(false);
+            (
+                Self {
+                    entered,
+                    release: Arc::new(std::sync::Barrier::new(2)),
+                },
+                receiver,
+            )
+        }
+
+        fn enter_and_wait(&self) {
+            self.entered.send_replace(true);
+            self.release.wait();
+        }
+
+        async fn release(self) {
+            tokio::task::spawn_blocking(move || self.release.wait())
+                .await
+                .expect("phase gate release must not panic");
+        }
+    }
+
     fn state() -> BrokerState {
         BrokerState::new(&BrokerConfig {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -2582,6 +2629,7 @@ mod tests {
         finalizes: Arc<AtomicUsize>,
         finalize_delay_ms: Arc<AtomicU64>,
         finalize_fails: Arc<AtomicBool>,
+        finalize_gate: Arc<std::sync::Mutex<Option<FakePhaseGate>>>,
         confirmations: Arc<AtomicUsize>,
         confirmed: Arc<AtomicUsize>,
         confirm_delay_ms: Arc<AtomicU64>,
@@ -2611,6 +2659,7 @@ mod tests {
         finalizes: Arc<AtomicUsize>,
         finalize_delay_ms: Arc<AtomicU64>,
         finalize_fails: Arc<AtomicBool>,
+        finalize_gate: Arc<std::sync::Mutex<Option<FakePhaseGate>>>,
         confirmations: Arc<AtomicUsize>,
         confirmed: Arc<AtomicUsize>,
         confirm_delay_ms: Arc<AtomicU64>,
@@ -2682,6 +2731,9 @@ mod tests {
 
         fn finalize_pending(&self) -> anyhow::Result<()> {
             self.finalizes.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = self.finalize_gate.lock().unwrap().clone() {
+                gate.enter_and_wait();
+            }
             std::thread::sleep(Duration::from_millis(
                 self.finalize_delay_ms.load(Ordering::SeqCst),
             ));
@@ -2777,6 +2829,7 @@ mod tests {
                 finalizes: self.finalizes.clone(),
                 finalize_delay_ms: self.finalize_delay_ms.clone(),
                 finalize_fails: self.finalize_fails.clone(),
+                finalize_gate: self.finalize_gate.clone(),
                 confirmations: self.confirmations.clone(),
                 confirmed: self.confirmed.clone(),
                 confirm_delay_ms: self.confirm_delay_ms.clone(),
@@ -3106,6 +3159,114 @@ mod tests {
         })
         .await
         .expect("bootstrap blocking boundary must quiesce");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn saturated_forward_queue_cannot_delay_cleanup_after_worker_timeout() {
+        let boundary = BootstrapBlockingBoundary::default();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
+        let first = tokio::spawn({
+            let boundary = boundary.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_millis(75),
+                        move || {
+                            release_first_rx.recv().unwrap();
+                            Ok(())
+                        },
+                    )
+                    .await
+            }
+        });
+        let second = tokio::spawn({
+            let boundary = boundary.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || {
+                            release_second_rx.recv().unwrap();
+                            Ok(())
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while boundary.active_workers.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both forward workers must be saturated");
+
+        let forwarded = Arc::new(AtomicUsize::new(0));
+        let queued = (0..BOOTSTRAP_BLOCKING_QUEUE)
+            .map(|_| {
+                let boundary = boundary.clone();
+                let forwarded = forwarded.clone();
+                tokio::spawn(async move {
+                    boundary
+                        .execute(
+                            tokio::time::Instant::now() + Duration::from_secs(2),
+                            move || {
+                                forwarded.fetch_add(1, Ordering::SeqCst);
+                                Ok(())
+                            },
+                        )
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while boundary.admission.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bounded forward queue must fill");
+
+        let overloaded = tokio::time::timeout(
+            Duration::from_millis(50),
+            boundary.execute(tokio::time::Instant::now() + Duration::from_secs(1), || {
+                Ok(())
+            }),
+        )
+        .await;
+        assert!(matches!(
+            overloaded,
+            Ok(Err(BlockingBoundaryError::Overloaded))
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(250), first).await,
+            Ok(Ok(Err(BlockingBoundaryError::TimedOut)))
+        ));
+
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let cleanup = {
+            let rollbacks = rollbacks.clone();
+            boundary
+                .execute_cleanup(
+                    tokio::time::Instant::now() + Duration::from_millis(175),
+                    move || {
+                        rollbacks.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+        };
+        assert!(matches!(cleanup, Ok(Ok(()))));
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(forwarded.load(Ordering::SeqCst), 0);
+
+        release_first_tx.send(()).unwrap();
+        release_second_tx.send(()).unwrap();
+        let _ = second.await;
+        for task in queued {
+            let _ = task.await;
+        }
     }
 
     fn identity_query(target: Option<&str>) -> RuntimeIdentityQuery {
@@ -3851,44 +4012,54 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn late_finalize_failure_is_one_timeout_outcome_for_owner_and_waiter() {
         let backend = FakeBootstrapBackend::ready();
-        backend.finalize_delay_ms.store(250, Ordering::SeqCst);
         backend.finalize_fails.store(true, Ordering::SeqCst);
+        let (finalize_gate, mut finalize_entered) = FakePhaseGate::new();
+        *backend.finalize_gate.lock().unwrap() = Some(finalize_gate.clone());
         let state = bootstrap_state(backend.clone());
         let request = bootstrap_request(200);
-        let owner = std::thread::spawn({
+        let owner = tokio::spawn({
             let state = state.clone();
             let request = request.clone();
-            move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(state.bootstrap_photoshop(request))
-            }
+            async move { state.bootstrap_photoshop(request).await }
         });
 
         publish_matching_bootstrap_session(&state).await;
         tokio::time::timeout(Duration::from_secs(2), async {
-            while backend.finalizes.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+            while !*finalize_entered.borrow() {
+                finalize_entered.changed().await.unwrap();
             }
         })
         .await
         .expect("the bootstrap owner must enter finalize");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let follower = std::thread::spawn({
+        let follower = tokio::spawn({
             let state = state.clone();
             let request = request.clone();
-            move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(state.bootstrap_photoshop(request))
-            }
+            async move { state.bootstrap_photoshop(request).await }
         });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let follower_is_waiting = state
+                    .bootstrap_grants
+                    .lock()
+                    .await
+                    .get(&session_key(HostKind::Photoshop, "retouch"))
+                    .is_some_and(|grant| grant.completion.receiver_count() >= 1);
+                if follower_is_waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the follower must subscribe before finalize is released");
 
-        let outcomes = [owner.join().unwrap(), follower.join().unwrap()];
+        let outcomes = tokio::time::timeout(Duration::from_secs(1), async {
+            [owner.await.unwrap(), follower.await.unwrap()]
+        })
+        .await;
+        finalize_gate.release().await;
+        wait_for_bootstrap_blocking_quiescence(&state, Duration::from_millis(250)).await;
+        let outcomes = outcomes.expect("owner and follower must receive the deadline outcome");
         let errors = outcomes
             .into_iter()
             .map(Result::unwrap_err)
@@ -4298,7 +4469,7 @@ mod tests {
         assert!(state.bootstrap_receipts.lock().await.is_empty());
         assert!(state.bootstrap_grants.lock().await.is_empty());
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_bootstrap_blocking_quiescence(&state, Duration::from_millis(250)).await;
         assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
         assert!(state.bootstrap_receipts.lock().await.is_empty());
         assert_eq!(
@@ -4364,7 +4535,7 @@ mod tests {
             b"foreign-after-preflight"
         );
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_bootstrap_blocking_quiescence(&state, Duration::from_millis(250)).await;
         assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
         assert!(state.bootstrap_receipts.lock().await.is_empty());
         assert_eq!(
