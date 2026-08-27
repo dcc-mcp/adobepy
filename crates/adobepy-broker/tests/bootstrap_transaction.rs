@@ -223,7 +223,7 @@ async fn helper_stage_can_only_be_redeemed_by_its_exact_config_generation() {
     std::fs::write(&config, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&config).unwrap();
-    let mut lease = owner.begin(&config, &expected).unwrap();
+    let lease = owner.begin(&config, &expected).unwrap();
     let probe = BootstrapProbe::new(helper_program(), 1, 0).unwrap();
     let staged = probe
         .stage(
@@ -507,7 +507,7 @@ fn config_generation_rejects_late_staging_and_drop_is_nonblocking() {
     assert!(owner.is_quiescent());
 
     let expected = FileReceipt::capture(&config).unwrap();
-    let mut second = owner.begin(&config, &expected).unwrap();
+    let second = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("late.js");
     std::fs::write(&staged_path, b"late").unwrap();
     let stale = StagedArtifact::capture(first_identity, &staged_path).unwrap();
@@ -538,7 +538,7 @@ fn staged_artifact_from_another_owner_with_the_same_generation_is_stale() {
 
     let second_owner = ConfigTransactionOwner::default();
     let second_expected = FileReceipt::capture(&second_config).unwrap();
-    let mut second = second_owner
+    let second = second_owner
         .begin(&second_config, &second_expected)
         .unwrap();
     assert!(first_owner.is_quiescent());
@@ -586,7 +586,7 @@ fn config_finalize_fails_closed_on_same_bytes_new_identity() {
     std::fs::write(&config, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&config).unwrap();
-    let mut lease = owner.begin(&config, &expected).unwrap();
+    let lease = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -619,7 +619,7 @@ fn config_finalize_commits_the_exact_receipt_and_quiesces_the_owner() {
     std::fs::write(&config, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&config).unwrap();
-    let mut lease = owner.begin(&config, &expected).unwrap();
+    let lease = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -640,7 +640,7 @@ fn config_commit_remains_rollback_capable_until_confirmation() {
     std::fs::write(&destination, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&destination).unwrap();
-    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let lease = owner.begin(&destination, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -668,7 +668,7 @@ fn confirmed_pending_publication_remains_rollback_capable() {
     std::fs::write(&destination, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&destination).unwrap();
-    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let lease = owner.begin(&destination, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -696,7 +696,7 @@ fn publication_and_rollback_have_one_atomic_winner() {
         std::fs::write(&destination, b"old").unwrap();
         let owner = ConfigTransactionOwner::default();
         let expected = FileReceipt::capture(&destination).unwrap();
-        let mut lease = owner.begin(&destination, &expected).unwrap();
+        let lease = owner.begin(&destination, &expected).unwrap();
         let staged_path = root.join("staged.js");
         std::fs::write(&staged_path, b"transient").unwrap();
         let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -740,7 +740,7 @@ fn config_confirmation_rejects_a_same_identity_edit_after_preflight() {
     std::fs::write(&destination, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&destination).unwrap();
-    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let lease = owner.begin(&destination, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -777,7 +777,7 @@ fn config_confirmation_rejects_same_bytes_with_a_new_identity_after_preflight() 
     std::fs::write(&destination, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&destination).unwrap();
-    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let lease = owner.begin(&destination, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -809,7 +809,7 @@ fn config_confirmation_defines_the_commit_instant_before_lock_free_publication()
     std::fs::write(&destination, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&destination).unwrap();
-    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let lease = owner.begin(&destination, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -842,7 +842,7 @@ fn duplicate_confirmation_tickets_cannot_publish_the_same_transaction() {
     std::fs::write(&destination, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&destination).unwrap();
-    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let lease = owner.begin(&destination, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -871,7 +871,7 @@ fn a_confirmation_ticket_cannot_be_reused_by_a_later_transaction() {
     std::fs::write(&destination, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&destination).unwrap();
-    let mut first = owner.begin(&destination, &expected).unwrap();
+    let first = owner.begin(&destination, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(first.identity(), &staged_path).unwrap();
@@ -884,7 +884,7 @@ fn a_confirmation_ticket_cannot_be_reused_by_a_later_transaction() {
     first.rollback().unwrap();
 
     let expected = FileReceipt::capture(&destination).unwrap();
-    let mut second = owner.begin(&destination, &expected).unwrap();
+    let second = owner.begin(&destination, &expected).unwrap();
     assert_eq!(
         second.confirm_prevalidated(stale).unwrap_err(),
         ConfigTransactionError::Stale
@@ -907,7 +907,7 @@ fn config_confirmation_rejects_a_reparse_parent_swap_after_preflight() {
     std::fs::write(foreign_parent.join("config.js"), b"committed").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&destination).unwrap();
-    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let lease = owner.begin(&destination, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -954,7 +954,7 @@ fn config_confirmation_rejects_a_symlink_parent_swap_after_preflight() {
     std::fs::write(foreign_parent.join("config.js"), b"committed").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&destination).unwrap();
-    let mut lease = owner.begin(&destination, &expected).unwrap();
+    let lease = owner.begin(&destination, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -985,7 +985,7 @@ fn config_rollback_only_restores_the_receipt_it_owns() {
     std::fs::write(&config, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&config).unwrap();
-    let mut lease = owner.begin(&config, &expected).unwrap();
+    let lease = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -1007,7 +1007,7 @@ fn config_activate_and_rollback_return_an_explicit_quiescence_ack() {
     std::fs::write(&config, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&config).unwrap();
-    let mut lease = owner.begin(&config, &expected).unwrap();
+    let lease = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -1025,7 +1025,7 @@ fn config_rollback_removes_only_the_owned_file_created_from_an_absent_receipt() 
     let config = root.join("config.js");
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&config).unwrap();
-    let mut lease = owner.begin(&config, &expected).unwrap();
+    let lease = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();
@@ -1046,7 +1046,7 @@ fn dropping_an_activated_config_lease_is_nonblocking_and_fail_stops_the_owner() 
     std::fs::write(&config, b"old").unwrap();
     let owner = ConfigTransactionOwner::default();
     let expected = FileReceipt::capture(&config).unwrap();
-    let mut lease = owner.begin(&config, &expected).unwrap();
+    let lease = owner.begin(&config, &expected).unwrap();
     let staged_path = root.join("staged.js");
     std::fs::write(&staged_path, b"transient").unwrap();
     let staged = StagedArtifact::capture(lease.identity(), &staged_path).unwrap();

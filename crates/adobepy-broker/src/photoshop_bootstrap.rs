@@ -183,7 +183,7 @@ struct SystemBootstrapTransaction {
 }
 
 struct SystemBootstrapTransactionState {
-    lease: Option<ConfigLease>,
+    lease: Option<Arc<ConfigLease>>,
     staged: StagedArtifact,
     committed_config: Vec<u8>,
     staging_path: PathBuf,
@@ -193,6 +193,7 @@ struct SystemBootstrapTransactionState {
 
 struct SystemBootstrapCommitConfirmation {
     transaction: Arc<SystemBootstrapTransaction>,
+    lease: Arc<ConfigLease>,
     confirmation: ConfigCommitConfirmation,
 }
 
@@ -206,7 +207,7 @@ impl PhotoshopBootstrapCommitConfirmation for SystemBootstrapCommitConfirmation 
         if self.transaction.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
         }
-        let mut state = self
+        let state = self
             .transaction
             .state
             .lock()
@@ -214,12 +215,15 @@ impl PhotoshopBootstrapCommitConfirmation for SystemBootstrapCommitConfirmation 
         if self.transaction.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
         }
-        let publication = state
+        let current_lease = state
             .lease
-            .as_mut()
-            .context("Photoshop config lease is unavailable")?
-            .confirm_prevalidated(self.confirmation)?;
+            .as_ref()
+            .context("Photoshop config lease is unavailable")?;
+        if !Arc::ptr_eq(current_lease, &self.lease) {
+            return Err(anyhow!("Photoshop config lease is stale"));
+        }
         drop(state);
+        let publication = self.lease.confirm_prevalidated(self.confirmation)?;
         Ok(Box::new(SystemBootstrapPublicationPermit {
             transaction: self.transaction,
             publication,
@@ -246,19 +250,36 @@ impl PhotoshopBootstrapTransaction for SystemBootstrapTransaction {
         if self.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
         }
+        let (lease, staged) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("transaction lock failed"))?;
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+            }
+            (
+                state
+                    .lease
+                    .as_ref()
+                    .context("Photoshop config lease is unavailable")?
+                    .clone(),
+                state.staged.clone(),
+            )
+        };
+        lease.activate_cancellable(&staged, &self.cancelled)?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("transaction lock failed"))?;
-        if self.cancelled.load(Ordering::SeqCst) {
+        if self.cancelled.load(Ordering::SeqCst)
+            || !state
+                .lease
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &lease))
+        {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
         }
-        let staged = state.staged.clone();
-        state
-            .lease
-            .as_mut()
-            .context("Photoshop config lease is unavailable")?
-            .activate_cancellable(&staged, &self.cancelled)?;
         state.activated = true;
         Ok(())
     }
@@ -267,20 +288,38 @@ impl PhotoshopBootstrapTransaction for SystemBootstrapTransaction {
         if self.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
         }
+        let (lease, committed, staging_path) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("transaction lock failed"))?;
+            if !state.activated || self.cancelled.load(Ordering::SeqCst) {
+                return Err(anyhow!("Photoshop bootstrap transaction is not active"));
+            }
+            (
+                state
+                    .lease
+                    .as_ref()
+                    .context("Photoshop config lease is unavailable")?
+                    .clone(),
+                state.committed_config.clone(),
+                state.staging_path.clone(),
+            )
+        };
+        let receipt = lease.prepare_commit_cancellable(&committed, &self.cancelled)?;
+        remove_staging_file(&staging_path)?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("transaction lock failed"))?;
-        if !state.activated || self.cancelled.load(Ordering::SeqCst) {
-            return Err(anyhow!("Photoshop bootstrap transaction is not active"));
+        if self.cancelled.load(Ordering::SeqCst)
+            || !state
+                .lease
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &lease))
+        {
+            return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
         }
-        let committed = state.committed_config.clone();
-        let receipt = state
-            .lease
-            .as_mut()
-            .context("Photoshop config lease is unavailable")?
-            .prepare_commit_cancellable(&committed, &self.cancelled)?;
-        remove_staging_file(&state.staging_path)?;
         state.commit_receipt = Some(receipt);
         Ok(())
     }
@@ -291,26 +330,43 @@ impl PhotoshopBootstrapTransaction for SystemBootstrapTransaction {
         if self.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
         }
-        let mut state = self
+        let (lease, receipt) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("transaction lock failed"))?;
+            (
+                state
+                    .lease
+                    .as_ref()
+                    .context("Photoshop config lease is unavailable")?
+                    .clone(),
+                state
+                    .commit_receipt
+                    .as_ref()
+                    .context("Photoshop commit receipt is unavailable")?
+                    .clone(),
+            )
+        };
+        let confirmation = lease.prepare_commit_confirmation(&receipt)?;
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
+        let state = self
             .state
             .lock()
             .map_err(|_| anyhow!("transaction lock failed"))?;
-        let receipt = state
-            .commit_receipt
-            .as_ref()
-            .context("Photoshop commit receipt is unavailable")?
-            .clone();
-        let confirmation = state
+        if !state
             .lease
-            .as_mut()
-            .context("Photoshop config lease is unavailable")?
-            .prepare_commit_confirmation(&receipt)?;
-        if self.cancelled.load(Ordering::SeqCst) {
-            return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &lease))
+        {
+            return Err(anyhow!("Photoshop config lease is stale"));
         }
         drop(state);
         Ok(Box::new(SystemBootstrapCommitConfirmation {
             transaction: self,
+            lease,
             confirmation,
         }))
     }
@@ -321,15 +377,20 @@ impl PhotoshopBootstrapTransaction for SystemBootstrapTransaction {
 
     fn rollback(&self) -> anyhow::Result<()> {
         self.revoke();
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("transaction lock failed"))?;
-        if let Some(lease) = state.lease.take() {
+        let (lease, staging_path) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("transaction lock failed"))?;
+            let lease = state.lease.take();
+            state.activated = false;
+            state.commit_receipt = None;
+            (lease, state.staging_path.clone())
+        };
+        if let Some(lease) = lease {
             lease.rollback()?;
         }
-        remove_staging_file(&state.staging_path)?;
-        state.activated = false;
+        remove_staging_file(&staging_path)?;
         Ok(())
     }
 }
@@ -427,7 +488,7 @@ impl PhotoshopBootstrapBackend for SystemPhotoshopBootstrapBackend {
             module_sha256: prepared.module_sha256,
             cancelled: Arc::new(AtomicBool::new(false)),
             state: Mutex::new(SystemBootstrapTransactionState {
-                lease: Some(lease),
+                lease: Some(Arc::new(lease)),
                 staged,
                 committed_config: committed,
                 staging_path,
@@ -988,6 +1049,75 @@ mod tests {
         assert!(transaction.activate().is_err());
         assert_eq!(fs::read(&config).unwrap(), b"external-config");
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stuck_activation_io_does_not_hold_owner_or_block_transaction_rollback() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "photoshop-bootstrap-lock-free-recovery-{}",
+                Uuid::new_v4().simple()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join(CONFIG_NAME);
+        fs::write(&config, b"prior-config").unwrap();
+        let prepared = PreparedBootstrap {
+            config_path: Some(config.clone()),
+            previous_config: Some(b"prior-config".to_vec()),
+            transient_config: Some(b"transient-config".to_vec()),
+            committed_config: Some(b"committed-config".to_vec()),
+            module_sha256: "a".repeat(64),
+        };
+        let backend = SystemPhotoshopBootstrapBackend::default();
+        let transaction = backend.begin_transaction(prepared).unwrap();
+        let owner = backend
+            .config_owners
+            .lock()
+            .unwrap()
+            .get(&config)
+            .unwrap()
+            .clone();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let (owner_unlocked_tx, owner_unlocked_rx) = std::sync::mpsc::channel();
+        crate::bootstrap_transaction::set_before_activate_write(config.clone(), {
+            let entered = entered.clone();
+            let release = release.clone();
+            move || {
+                owner_unlocked_tx.send(owner.lock_available()).unwrap();
+                entered.wait();
+                release.wait();
+            }
+        });
+
+        let activation = std::thread::spawn({
+            let transaction = transaction.clone();
+            move || transaction.activate()
+        });
+        entered.wait();
+        let (rollback_tx, rollback_rx) = std::sync::mpsc::channel();
+        let rollback = std::thread::spawn({
+            let transaction = transaction.clone();
+            move || rollback_tx.send(transaction.rollback()).unwrap()
+        });
+        let rollback_before_release = rollback_rx.recv_timeout(Duration::from_millis(100)).ok();
+        release.wait();
+        let activation_result = activation.join().unwrap();
+        rollback.join().unwrap();
+
+        assert!(
+            owner_unlocked_rx.recv().unwrap(),
+            "activation file I/O ran under ConfigOwnerState"
+        );
+        assert!(
+            matches!(rollback_before_release, Some(Ok(()))),
+            "stuck activation file I/O blocked the independent rollback lane"
+        );
+        assert!(activation_result.is_err());
+        assert_eq!(fs::read(&config).unwrap(), b"prior-config");
         fs::remove_dir_all(root).unwrap();
     }
 

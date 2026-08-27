@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify, RwLock, Semaphore};
@@ -69,6 +69,36 @@ struct BootstrapBlockingBoundary {
     active_workers: Arc<AtomicUsize>,
     poisoned: Arc<AtomicBool>,
     quiesced: Arc<Notify>,
+    state: Arc<StdMutex<BootstrapBlockingState>>,
+}
+
+#[derive(Debug, Default)]
+struct BootstrapBlockingState {
+    epoch: u64,
+    poisoned_epoch: Option<u64>,
+    active_forward: usize,
+    active_cleanup: usize,
+    recovery_completed: bool,
+}
+
+struct BootstrapBlockingCallGuard {
+    boundary: BootstrapBlockingBoundary,
+    epoch: u64,
+    armed: bool,
+}
+
+impl BootstrapBlockingCallGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BootstrapBlockingCallGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.boundary.poison(self.epoch);
+        }
+    }
 }
 
 impl Default for BootstrapBlockingBoundary {
@@ -82,11 +112,96 @@ impl Default for BootstrapBlockingBoundary {
             active_workers: Arc::new(AtomicUsize::new(0)),
             poisoned: Arc::new(AtomicBool::new(false)),
             quiesced: Arc::new(Notify::new()),
+            state: Arc::new(StdMutex::new(BootstrapBlockingState::default())),
         }
     }
 }
 
 impl BootstrapBlockingBoundary {
+    fn poison(&self, epoch: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return;
+        };
+        if state.epoch == epoch && state.poisoned_epoch.is_none() {
+            state.poisoned_epoch = Some(epoch);
+            state.recovery_completed = false;
+        }
+        if state.poisoned_epoch == Some(epoch) {
+            self.poisoned.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn start_forward(&self) -> Result<u64, BlockingBoundaryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BlockingBoundaryError::Panicked)?;
+        if state.poisoned_epoch.is_some() {
+            return Err(BlockingBoundaryError::Overloaded);
+        }
+        let epoch = state.epoch;
+        state.active_forward = state.active_forward.saturating_add(1);
+        self.active_workers.fetch_add(1, Ordering::SeqCst);
+        Ok(epoch)
+    }
+
+    fn start_cleanup(&self) -> Result<u64, BlockingBoundaryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BlockingBoundaryError::Panicked)?;
+        let epoch = state.poisoned_epoch.unwrap_or(state.epoch);
+        state.active_cleanup = state.active_cleanup.saturating_add(1);
+        self.active_workers.fetch_add(1, Ordering::SeqCst);
+        Ok(epoch)
+    }
+
+    fn finish_forward(&self, epoch: u64, failed_or_abandoned: bool) {
+        if failed_or_abandoned {
+            self.poison(epoch);
+        }
+        let Ok(mut state) = self.state.lock() else {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return;
+        };
+        state.active_forward = state.active_forward.saturating_sub(1);
+        self.active_workers.fetch_sub(1, Ordering::SeqCst);
+        self.try_finish_recovery(&mut state);
+    }
+
+    fn finish_cleanup(&self, epoch: u64, succeeded: bool) {
+        let Ok(mut state) = self.state.lock() else {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return;
+        };
+        state.active_cleanup = state.active_cleanup.saturating_sub(1);
+        self.active_workers.fetch_sub(1, Ordering::SeqCst);
+        if succeeded && state.poisoned_epoch == Some(epoch) {
+            state.recovery_completed = true;
+        }
+        self.try_finish_recovery(&mut state);
+    }
+
+    fn try_finish_recovery(&self, state: &mut BootstrapBlockingState) {
+        if state.poisoned_epoch.is_some()
+            && state.recovery_completed
+            && state.active_forward == 0
+            && state.active_cleanup == 0
+        {
+            state.poisoned_epoch = None;
+            state.recovery_completed = false;
+            state.epoch = state.epoch.wrapping_add(1);
+            self.poisoned.store(false, Ordering::SeqCst);
+            self.quiesced.notify_waiters();
+        } else if state.poisoned_epoch.is_none()
+            && state.active_forward == 0
+            && state.active_cleanup == 0
+        {
+            self.quiesced.notify_waiters();
+        }
+    }
+
     async fn execute<T, F>(
         &self,
         deadline: tokio::time::Instant,
@@ -149,14 +264,18 @@ impl BootstrapBlockingBoundary {
             .await
             .map_err(|_| BlockingBoundaryError::TimedOut)?
             .map_err(|_| BlockingBoundaryError::Overloaded)?;
-        if !cleanup && self.poisoned.load(Ordering::SeqCst) {
-            return Err(BlockingBoundaryError::Overloaded);
-        }
-        let active = self.active_workers.clone();
-        let poisoned = self.poisoned.clone();
-        let quiesced = self.quiesced.clone();
+        let epoch = if cleanup {
+            self.start_cleanup()?
+        } else {
+            self.start_forward()?
+        };
+        let mut call_guard = (!cleanup).then(|| BootstrapBlockingCallGuard {
+            boundary: self.clone(),
+            epoch,
+            armed: true,
+        });
+        let boundary = self.clone();
         let (sender, receiver) = oneshot::channel();
-        active.fetch_add(1, Ordering::SeqCst);
         tokio::task::spawn_blocking(move || {
             let _admission = admission;
             let _worker = worker;
@@ -164,24 +283,28 @@ impl BootstrapBlockingBoundary {
             let _sensitive = bootstrap_transaction::SensitivePanicGuard::enter();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
                 .map_err(|_| BlockingBoundaryError::Panicked);
-            if active.fetch_sub(1, Ordering::SeqCst) == 1 {
-                poisoned.store(false, Ordering::SeqCst);
-                quiesced.notify_waiters();
+            let failed = outcome.is_err();
+            if cleanup {
+                boundary.finish_cleanup(epoch, !failed);
+                let _ = sender.send(outcome);
+            } else {
+                if failed {
+                    boundary.poison(epoch);
+                }
+                let abandoned = sender.send(outcome).is_err();
+                boundary.finish_forward(epoch, abandoned);
             }
-            let _ = sender.send(outcome);
         });
         match tokio::time::timeout_at(deadline, receiver).await {
-            Err(_) => {
-                self.poisoned.store(true, Ordering::SeqCst);
-                if self.active_workers.load(Ordering::SeqCst) == 0 {
-                    self.poisoned.store(false, Ordering::SeqCst);
-                    self.quiesced.notify_waiters();
-                }
-                Err(BlockingBoundaryError::TimedOut)
-            }
+            Err(_) => Err(BlockingBoundaryError::TimedOut),
             Ok(Err(_)) => Err(BlockingBoundaryError::Panicked),
             Ok(Ok(Err(error))) => Err(error),
-            Ok(Ok(Ok(outcome))) => Ok(outcome),
+            Ok(Ok(Ok(outcome))) => {
+                if let Some(call_guard) = call_guard.as_mut() {
+                    call_guard.disarm();
+                }
+                Ok(outcome)
+            }
         }
     }
 }
@@ -3267,6 +3390,216 @@ mod tests {
         for task in queued {
             let _ = task.await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_mutating_worker_keeps_queued_forward_behind_recovery() {
+        let boundary = BootstrapBlockingBoundary::default();
+        let (cancelled_gate, mut cancelled_entered) = FakePhaseGate::new();
+        let cancelled = tokio::spawn({
+            let boundary = boundary.clone();
+            let cancelled_gate = cancelled_gate.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || {
+                            cancelled_gate.enter_and_wait();
+                            Ok(())
+                        },
+                    )
+                    .await
+            }
+        });
+        while !*cancelled_entered.borrow() {
+            cancelled_entered.changed().await.unwrap();
+        }
+
+        let (blocker_gate, mut blocker_entered) = FakePhaseGate::new();
+        let blocker = tokio::spawn({
+            let boundary = boundary.clone();
+            let blocker_gate = blocker_gate.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || {
+                            blocker_gate.enter_and_wait();
+                            Ok(())
+                        },
+                    )
+                    .await
+            }
+        });
+        while !*blocker_entered.borrow() {
+            blocker_entered.changed().await.unwrap();
+        }
+
+        let (queued_started_tx, mut queued_started) = watch::channel(false);
+        let queued = tokio::spawn({
+            let boundary = boundary.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || {
+                            queued_started_tx.send_replace(true);
+                            Ok(())
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while boundary.admission.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the ordinary forward must be queued behind both workers");
+
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        let (cleanup_gate, mut cleanup_entered) = FakePhaseGate::new();
+        let cleanup = tokio::spawn({
+            let boundary = boundary.clone();
+            let cleanup_gate = cleanup_gate.clone();
+            async move {
+                boundary
+                    .execute_cleanup(
+                        tokio::time::Instant::now() + Duration::from_millis(500),
+                        move || {
+                            cleanup_gate.enter_and_wait();
+                            Ok(())
+                        },
+                    )
+                    .await
+            }
+        });
+        while !*cleanup_entered.borrow() {
+            cleanup_entered.changed().await.unwrap();
+        }
+
+        cancelled_gate.release().await;
+        let queued_before_cleanup = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if *queued_started.borrow() {
+                    return true;
+                }
+                if queued_started.changed().await.is_err() {
+                    return false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        cleanup_gate.release().await;
+        blocker_gate.release().await;
+        assert!(matches!(cleanup.await.unwrap(), Ok(Ok(()))));
+        let _ = blocker.await;
+        let _ = queued.await;
+
+        assert!(
+            !queued_before_cleanup,
+            "queued ordinary work started before cancelled-worker recovery completed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn panicking_mutating_worker_rejects_queued_forward_until_recovery_quiesces() {
+        let boundary = BootstrapBlockingBoundary::default();
+        let (panic_gate, mut panic_entered) = FakePhaseGate::new();
+        let panicking = tokio::spawn({
+            let boundary = boundary.clone();
+            let panic_gate = panic_gate.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || -> anyhow::Result<()> {
+                            panic_gate.enter_and_wait();
+                            panic!("deterministic mutating worker panic");
+                        },
+                    )
+                    .await
+            }
+        });
+        while !*panic_entered.borrow() {
+            panic_entered.changed().await.unwrap();
+        }
+
+        let (blocker_gate, mut blocker_entered) = FakePhaseGate::new();
+        let blocker = tokio::spawn({
+            let boundary = boundary.clone();
+            let blocker_gate = blocker_gate.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || {
+                            blocker_gate.enter_and_wait();
+                            Ok(())
+                        },
+                    )
+                    .await
+            }
+        });
+        while !*blocker_entered.borrow() {
+            blocker_entered.changed().await.unwrap();
+        }
+
+        let queued_started = Arc::new(AtomicBool::new(false));
+        let queued = tokio::spawn({
+            let boundary = boundary.clone();
+            let queued_started = queued_started.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || {
+                            queued_started.store(true, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while boundary.admission.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the ordinary forward must queue behind the panicking worker");
+
+        panic_gate.release().await;
+        assert!(matches!(
+            panicking.await.unwrap(),
+            Err(BlockingBoundaryError::Panicked)
+        ));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let cleanup = {
+            let rollbacks = rollbacks.clone();
+            boundary
+                .execute_cleanup(
+                    tokio::time::Instant::now() + Duration::from_millis(500),
+                    move || {
+                        rollbacks.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+        };
+        blocker_gate.release().await;
+        let _ = blocker.await;
+        let queued = queued.await.unwrap();
+
+        assert!(matches!(cleanup, Ok(Ok(()))));
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+        assert!(matches!(queued, Err(BlockingBoundaryError::Overloaded)));
+        assert!(!queued_started.load(Ordering::SeqCst));
+        assert!(!boundary.poisoned.load(Ordering::SeqCst));
     }
 
     fn identity_query(target: Option<&str>) -> RuntimeIdentityQuery {
