@@ -192,8 +192,8 @@ impl ManagedHostProcess {
         let completion = process.completion.clone();
         let broker = process.broker.clone();
         drop(process);
-        completion.complete();
         broker.release();
+        completion.complete();
     }
 }
 
