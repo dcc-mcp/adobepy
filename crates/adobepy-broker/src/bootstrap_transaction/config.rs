@@ -416,13 +416,15 @@ impl ConfigTransactionOwner {
                 written: None,
             });
         }
-        let current = FileReceipt::capture(&destination).map_err(|_| ConfigTransactionError::Io)?;
-        if &current != expected {
-            let mut state = self.state.lock().map_err(|_| ConfigTransactionError::Io)?;
-            if matches_lease(state.active.as_ref(), generation, transaction_id, &valid) {
-                state.active = None;
+        let current = match FileReceipt::capture(&destination) {
+            Ok(current) => current,
+            Err(_) => {
+                self.clear_begin_reservation(generation, transaction_id, &valid)?;
+                return Err(ConfigTransactionError::Io);
             }
-            valid.store(false, Ordering::SeqCst);
+        };
+        if &current != expected {
+            self.clear_begin_reservation(generation, transaction_id, &valid)?;
             return Err(ConfigTransactionError::IdentityChanged);
         }
         if self
@@ -435,11 +437,7 @@ impl ConfigTransactionOwner {
             )
             .is_err()
         {
-            let mut state = self.state.lock().map_err(|_| ConfigTransactionError::Io)?;
-            if matches_lease(state.active.as_ref(), generation, transaction_id, &valid) {
-                state.active = None;
-            }
-            valid.store(false, Ordering::SeqCst);
+            self.clear_begin_reservation(generation, transaction_id, &valid)?;
             return Err(ConfigTransactionError::Io);
         }
         Ok(ConfigLease {
@@ -449,6 +447,21 @@ impl ConfigTransactionOwner {
             valid,
             closed: AtomicBool::new(false),
         })
+    }
+
+    fn clear_begin_reservation(
+        &self,
+        generation: u64,
+        transaction_id: Uuid,
+        valid: &Arc<AtomicBool>,
+    ) -> Result<(), ConfigTransactionError> {
+        let state = self.state.lock();
+        valid.store(false, Ordering::SeqCst);
+        let mut state = state.map_err(|_| ConfigTransactionError::Io)?;
+        if exact_lease_token(state.active.as_ref(), generation, transaction_id, valid) {
+            state.active = None;
+        }
+        Ok(())
     }
 }
 
@@ -931,6 +944,19 @@ fn matches_lease(
         })
 }
 
+fn exact_lease_token(
+    lease: Option<&ActiveConfigLease>,
+    generation: u64,
+    transaction_id: Uuid,
+    valid: &Arc<AtomicBool>,
+) -> bool {
+    lease.is_some_and(|lease| {
+        lease.generation == generation
+            && lease.transaction_id == transaction_id
+            && Arc::ptr_eq(&lease.valid, valid)
+    })
+}
+
 fn lease_is_busy(lease: Option<&ActiveConfigLease>) -> bool {
     lease.is_some_and(|lease| {
         lease.phase.load(Ordering::SeqCst) != CONFIG_PHASE_PUBLISHED
@@ -1151,6 +1177,92 @@ mod tests {
             result.is_err(),
             "same-identity growth bypassed the configured receipt bound"
         );
+    }
+
+    #[test]
+    fn begin_recapture_io_error_releases_exact_reservation() {
+        let root = std::env::temp_dir().join(format!(
+            "adobepy-config-begin-recapture-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        let config = root.join("config.js");
+        fs::write(&config, b"old").unwrap();
+        let owner = ConfigTransactionOwner::default();
+        let expected = FileReceipt::capture(&config).unwrap();
+        let remove_path = config.clone();
+        set_after_receipt_metadata(config.clone(), move || {
+            fs::remove_file(remove_path).unwrap();
+        });
+
+        assert_eq!(
+            owner.begin(&config, &expected).unwrap_err(),
+            ConfigTransactionError::Io
+        );
+
+        fs::write(&config, b"replacement").unwrap();
+        let replacement = FileReceipt::capture(&config).unwrap();
+        let lease = owner
+            .begin(&config, &replacement)
+            .expect("recapture I/O failure orphaned the owner reservation");
+        lease.revoke().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn begin_recapture_cleanup_preserves_a_concurrent_new_owner_token() {
+        let root = std::env::temp_dir().join(format!(
+            "adobepy-config-begin-replacement-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        let config = root.join("config.js");
+        let replacement_config = root.join("replacement.js");
+        fs::write(&config, b"old").unwrap();
+        fs::write(&replacement_config, b"new-owner").unwrap();
+        let owner = ConfigTransactionOwner::default();
+        let expected = FileReceipt::capture(&config).unwrap();
+        let replacement_expected = FileReceipt::capture(&replacement_config).unwrap();
+        let replacement_generation = 41;
+        let replacement_transaction_id = Uuid::new_v4();
+        let replacement_valid = Arc::new(AtomicBool::new(true));
+        let replacement_phase = Arc::new(AtomicU8::new(CONFIG_PHASE_ACTIVE));
+        let remove_path = config.clone();
+        set_after_receipt_metadata(config.clone(), {
+            let owner = owner.clone();
+            let replacement_valid = replacement_valid.clone();
+            let replacement_phase = replacement_phase.clone();
+            move || {
+                owner.state.lock().unwrap().active = Some(ActiveConfigLease {
+                    generation: replacement_generation,
+                    transaction_id: replacement_transaction_id,
+                    valid: replacement_valid,
+                    phase: replacement_phase,
+                    destination: replacement_config,
+                    expected: replacement_expected,
+                    attempted: None,
+                    written: None,
+                });
+                fs::remove_file(remove_path).unwrap();
+            }
+        });
+
+        assert_eq!(
+            owner.begin(&config, &expected).unwrap_err(),
+            ConfigTransactionError::Io
+        );
+        let replacement_lease = ConfigLease {
+            owner: owner.clone(),
+            generation: replacement_generation,
+            transaction_id: replacement_transaction_id,
+            valid: replacement_valid,
+            closed: AtomicBool::new(false),
+        };
+        replacement_lease
+            .revoke()
+            .expect("failed recapture cleared a different owner token");
+        assert!(owner.is_quiescent());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
