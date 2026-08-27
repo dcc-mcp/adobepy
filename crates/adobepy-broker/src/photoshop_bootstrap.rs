@@ -7,16 +7,15 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::bootstrap_transaction::{
-    same_file_identity, ConfigCommitConfirmation, ConfigLease,
-    ConfigPublicationPermit, ConfigTransactionOwner, FileReceipt, HostProcessBroker,
-    OwnedHostProcess, StagedArtifact,
+    same_file_identity, ConfigCommitConfirmation, ConfigLease, ConfigPublicationPermit,
+    ConfigTransactionOwner, FileReceipt, HostProcessBroker, OwnedHostProcess, StagedArtifact,
 };
 
 const MAX_HASH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -68,11 +67,7 @@ impl BlockingDeadline {
         Ok(())
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
-    fn remaining(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
-    }
-
+    #[cfg(test)]
     pub(crate) fn interruptible_sleep(&self, duration: Duration) -> anyhow::Result<()> {
         let sleep_deadline = Instant::now() + duration;
         loop {
@@ -157,6 +152,8 @@ pub(crate) struct LaunchedHostProcess {
     fake_live: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     fake_terminations: Option<Arc<AtomicUsize>>,
+    #[cfg(test)]
+    fake_termination_delay_ms: Option<Arc<AtomicU64>>,
 }
 
 impl LaunchedHostProcess {
@@ -168,6 +165,8 @@ impl LaunchedHostProcess {
             fake_live: None,
             #[cfg(test)]
             fake_terminations: None,
+            #[cfg(test)]
+            fake_termination_delay_ms: None,
         }
     }
 
@@ -176,12 +175,14 @@ impl LaunchedHostProcess {
         observed: ObservedHostProcess,
         live: Arc<AtomicBool>,
         terminations: Arc<AtomicUsize>,
+        termination_delay_ms: Arc<AtomicU64>,
     ) -> Self {
         Self {
             observed,
             owned: None,
             fake_live: Some(live),
             fake_terminations: Some(terminations),
+            fake_termination_delay_ms: Some(termination_delay_ms),
         }
     }
 
@@ -191,6 +192,20 @@ impl LaunchedHostProcess {
     ) -> anyhow::Result<()> {
         #[cfg(test)]
         if let Some(live) = self.fake_live.take() {
+            let delay_ms = self
+                .fake_termination_delay_ms
+                .take()
+                .map(|delay| delay.load(Ordering::SeqCst))
+                .unwrap_or_default();
+            if tokio::time::timeout_at(
+                deadline,
+                tokio::time::sleep(Duration::from_millis(delay_ms)),
+            )
+            .await
+            .is_err()
+            {
+                return Err(anyhow!("fake host termination exceeded its deadline"));
+            }
             live.store(false, Ordering::SeqCst);
             if let Some(terminations) = self.fake_terminations.take() {
                 terminations.fetch_add(1, Ordering::SeqCst);
@@ -224,11 +239,17 @@ struct IllustratorFileReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct IllustratorPluginReceipt {
+pub(crate) struct IllustratorPluginReceipt {
     root: PathReceipt,
     manifest: IllustratorFileReceipt,
     index: IllustratorFileReceipt,
     module: IllustratorFileReceipt,
+}
+
+impl IllustratorPluginReceipt {
+    pub(crate) fn validate_bounded(&self, deadline: &BlockingDeadline) -> anyhow::Result<()> {
+        recapture_illustrator_receipt_bounded(self, Some(deadline))
+    }
 }
 
 pub(crate) trait PhotoshopBootstrapBackend: Send + Sync {
@@ -257,12 +278,13 @@ pub(crate) trait PhotoshopBootstrapBackend: Send + Sync {
 
     fn executable_sha256(&self, path: &str) -> anyhow::Result<String>;
 
-    fn terminate(&self, _observed: &ObservedHostProcess) -> anyhow::Result<()> {
-        Err(anyhow!("host termination is unavailable"))
-    }
-
-    fn validate_prepared_identity(&self, _prepared: &PreparedBootstrap) -> anyhow::Result<()> {
-        Ok(())
+    fn capture_illustrator_receipt_bounded(
+        &self,
+        _request: &PhotoshopBootstrapRequest,
+        deadline: &BlockingDeadline,
+    ) -> anyhow::Result<Option<IllustratorPluginReceipt>> {
+        deadline.checkpoint()?;
+        Ok(None)
     }
 
     fn attest_bounded(
@@ -286,18 +308,6 @@ pub(crate) trait PhotoshopBootstrapBackend: Send + Sync {
         deadline.checkpoint()?;
         result
     }
-
-    fn validate_prepared_identity_bounded(
-        &self,
-        prepared: &PreparedBootstrap,
-        deadline: &BlockingDeadline,
-    ) -> anyhow::Result<()> {
-        deadline.checkpoint()?;
-        let result = self.validate_prepared_identity(prepared);
-        deadline.checkpoint()?;
-        result
-    }
-
 }
 
 #[derive(Debug, Default)]
@@ -356,6 +366,9 @@ impl PhotoshopBootstrapCommitConfirmation for SystemBootstrapCommitConfirmation 
         if self.transaction.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
         }
+        if let Some(receipt) = self.transaction.illustrator_receipt.as_ref() {
+            recapture_illustrator_receipt(receipt)?;
+        }
         let state = self
             .transaction
             .state
@@ -384,6 +397,9 @@ impl PhotoshopBootstrapPublicationPermit for SystemBootstrapPublicationPermit {
     fn publish(self: Box<Self>) -> anyhow::Result<()> {
         if self.transaction.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
+        if let Some(receipt) = self.transaction.illustrator_receipt.as_ref() {
+            recapture_illustrator_receipt(receipt)?;
         }
         self.publication.publish()?;
         Ok(())
@@ -492,6 +508,9 @@ impl PhotoshopBootstrapTransaction for SystemBootstrapTransaction {
     ) -> anyhow::Result<Box<dyn PhotoshopBootstrapCommitConfirmation>> {
         if self.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("Photoshop bootstrap transaction is revoked"));
+        }
+        if let Some(receipt) = self.illustrator_receipt.as_ref() {
+            recapture_illustrator_receipt(receipt)?;
         }
         let (lease, receipt) = {
             let state = self
@@ -880,19 +899,6 @@ impl PhotoshopBootstrapBackend for SystemIllustratorBootstrapBackend {
         digest_file(Path::new(path))
     }
 
-    fn validate_prepared_identity(&self, prepared: &PreparedBootstrap) -> anyhow::Result<()> {
-        let receipt = prepared
-            .illustrator_receipt
-            .as_ref()
-            .context("Illustrator bootstrap identity receipt is unavailable")?;
-        recapture_illustrator_receipt(receipt)
-    }
-
-    fn terminate(&self, observed: &ObservedHostProcess) -> anyhow::Result<()> {
-        let deadline = BlockingDeadline::new(Duration::from_secs(2));
-        terminate_observed_process(observed, &deadline)
-    }
-
     fn attest_bounded(
         &self,
         request: &PhotoshopBootstrapRequest,
@@ -905,6 +911,17 @@ impl PhotoshopBootstrapBackend for SystemIllustratorBootstrapBackend {
         )
     }
 
+    fn capture_illustrator_receipt_bounded(
+        &self,
+        request: &PhotoshopBootstrapRequest,
+        deadline: &BlockingDeadline,
+    ) -> anyhow::Result<Option<IllustratorPluginReceipt>> {
+        Ok(Some(attest_illustrator_request_with_receipt_bounded(
+            request,
+            Some(deadline),
+        )?))
+    }
+
     fn executable_sha256_bounded(
         &self,
         path: &str,
@@ -913,19 +930,6 @@ impl PhotoshopBootstrapBackend for SystemIllustratorBootstrapBackend {
         let bytes = stable_file_bytes_bounded(Path::new(path), MAX_HASH_BYTES, Some(deadline))?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
-
-    fn validate_prepared_identity_bounded(
-        &self,
-        prepared: &PreparedBootstrap,
-        deadline: &BlockingDeadline,
-    ) -> anyhow::Result<()> {
-        let receipt = prepared
-            .illustrator_receipt
-            .as_ref()
-            .context("Illustrator bootstrap identity receipt is unavailable")?;
-        recapture_illustrator_receipt_bounded(receipt, Some(deadline))
-    }
-
 }
 
 fn attest_illustrator_request(request: &PhotoshopBootstrapRequest) -> anyhow::Result<String> {
@@ -1075,6 +1079,11 @@ fn capture_path_receipt_bounded(
     if metadata.is_dir() != expect_directory || (!expect_directory && !metadata.is_file()) {
         return Err(std::io::Error::other("filesystem object type is invalid"));
     }
+    if !expect_directory && filesystem_link_count(path, &metadata) != Some(1) {
+        return Err(std::io::Error::other(
+            "multi-link filesystem objects are not accepted",
+        ));
+    }
     let filesystem_identity = filesystem_identity(path, &metadata)
         .ok_or_else(|| std::io::Error::other("filesystem identity is unavailable"))?;
     deadline_checkpoint(deadline)?;
@@ -1111,46 +1120,70 @@ fn filesystem_identity(path: &Path, _metadata: &fs::Metadata) -> Option<(u64, u6
 fn handle_filesystem_identity(file: &fs::File, _metadata: &fs::Metadata) -> Option<(u64, u64)> {
     use std::os::windows::io::AsRawHandle;
 
-    #[repr(C)]
-    struct FileTime {
-        low: u32,
-        high: u32,
-    }
-
-    #[repr(C)]
-    struct ByHandleFileInformation {
-        file_attributes: u32,
-        creation_time: FileTime,
-        last_access_time: FileTime,
-        last_write_time: FileTime,
-        volume_serial_number: u32,
-        file_size_high: u32,
-        file_size_low: u32,
-        number_of_links: u32,
-        file_index_high: u32,
-        file_index_low: u32,
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandle(
-            handle: isize,
-            information: *mut ByHandleFileInformation,
-        ) -> i32;
-    }
-
-    let mut information = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
-    if unsafe {
-        GetFileInformationByHandle(file.as_raw_handle() as isize, information.as_mut_ptr())
-    } == 0
-    {
-        return None;
-    }
-    let information = unsafe { information.assume_init() };
+    let information = windows_file_information(file.as_raw_handle())?;
     Some((
         u64::from(information.volume_serial_number),
         (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low),
     ))
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsFileTime {
+    low: u32,
+    high: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsFileInformation {
+    file_attributes: u32,
+    creation_time: WindowsFileTime,
+    last_access_time: WindowsFileTime,
+    last_write_time: WindowsFileTime,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+fn windows_file_information(
+    handle: std::os::windows::io::RawHandle,
+) -> Option<WindowsFileInformation> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut std::ffi::c_void,
+            information: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut information = std::mem::MaybeUninit::<WindowsFileInformation>::uninit();
+    if unsafe {
+        GetFileInformationByHandle(handle, information.as_mut_ptr().cast::<std::ffi::c_void>())
+    } == 0
+    {
+        return None;
+    }
+    Some(unsafe { information.assume_init() })
+}
+
+#[cfg(windows)]
+fn filesystem_link_count(path: &Path, _metadata: &fs::Metadata) -> Option<u64> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    windows_file_information(file.as_raw_handle())
+        .map(|information| u64::from(information.number_of_links))
 }
 
 #[cfg(unix)]
@@ -1164,6 +1197,12 @@ fn handle_filesystem_identity(_file: &fs::File, metadata: &fs::Metadata) -> Opti
     filesystem_identity(Path::new(""), metadata)
 }
 
+#[cfg(unix)]
+fn filesystem_link_count(_path: &Path, metadata: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.nlink())
+}
+
 #[cfg(not(any(windows, unix)))]
 fn filesystem_identity(_path: &Path, _metadata: &fs::Metadata) -> Option<(u64, u64)> {
     None
@@ -1171,6 +1210,11 @@ fn filesystem_identity(_path: &Path, _metadata: &fs::Metadata) -> Option<(u64, u
 
 #[cfg(not(any(windows, unix)))]
 fn handle_filesystem_identity(_file: &fs::File, _metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(not(any(windows, unix)))]
+fn filesystem_link_count(_path: &Path, _metadata: &fs::Metadata) -> Option<u64> {
     None
 }
 
@@ -1566,135 +1610,6 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn terminate_observed_process(
-    observed: &ObservedHostProcess,
-    deadline: &BlockingDeadline,
-) -> anyhow::Result<()> {
-    #[repr(C)]
-    struct FileTime {
-        low: u32,
-        high: u32,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
-        fn QueryFullProcessImageNameW(
-            process: isize,
-            flags: u32,
-            buffer: *mut u16,
-            size: *mut u32,
-        ) -> i32;
-        fn GetProcessTimes(
-            process: isize,
-            creation: *mut FileTime,
-            exit: *mut FileTime,
-            kernel: *mut FileTime,
-            user: *mut FileTime,
-        ) -> i32;
-        fn TerminateProcess(process: isize, exit_code: u32) -> i32;
-        fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
-        fn CloseHandle(handle: isize) -> i32;
-    }
-    const PROCESS_TERMINATE: u32 = 0x0001;
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const SYNCHRONIZE: u32 = 0x0010_0000;
-    const WAIT_OBJECT_0: u32 = 0;
-
-    deadline.checkpoint()?;
-    let handle = unsafe {
-        OpenProcess(
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-            0,
-            observed.pid,
-        )
-    };
-    if handle == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let outcome = (|| {
-        let mut path = vec![0_u16; 32_768];
-        let mut path_len = u32::try_from(path.len())?;
-        if unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut path_len) } == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let mut creation = FileTime { low: 0, high: 0 };
-        let mut exit = FileTime { low: 0, high: 0 };
-        let mut kernel = FileTime { low: 0, high: 0 };
-        let mut user = FileTime { low: 0, high: 0 };
-        if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let creation_ticks = (u64::from(creation.high) << 32) | u64::from(creation.low);
-        let actual = ObservedHostProcess {
-            pid: observed.pid,
-            process_start_identity: format!("windows:{creation_ticks}"),
-            executable_path: String::from_utf16(&path[..usize::try_from(path_len)?])?,
-        };
-        if &actual != observed {
-            return Err(anyhow!(
-                "Illustrator process identity changed before cleanup"
-            ));
-        }
-        if unsafe { TerminateProcess(handle, 1) } == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let milliseconds = u32::try_from(deadline.remaining().as_millis())
-            .unwrap_or(u32::MAX)
-            .max(1);
-        if unsafe { WaitForSingleObject(handle, milliseconds) } != WAIT_OBJECT_0 {
-            return Err(anyhow!("Illustrator process cleanup timed out"));
-        }
-        Ok(())
-    })();
-    unsafe {
-        CloseHandle(handle);
-    }
-    outcome
-}
-
-#[cfg(target_os = "macos")]
-fn terminate_observed_process(
-    observed: &ObservedHostProcess,
-    deadline: &BlockingDeadline,
-) -> anyhow::Result<()> {
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-    const SIGTERM: i32 = 15;
-    const SIGKILL: i32 = 9;
-
-    deadline.checkpoint()?;
-    if observe_process(observed.pid).ok().as_ref() != Some(observed) {
-        return Err(anyhow!(
-            "Illustrator process identity changed before cleanup"
-        ));
-    }
-    if unsafe { kill(i32::try_from(observed.pid)?, SIGTERM) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let hard_kill_at = Instant::now() + deadline.remaining() / 2;
-    loop {
-        if observe_process(observed.pid).is_err() {
-            return Ok(());
-        }
-        deadline.checkpoint()?;
-        if Instant::now() >= hard_kill_at {
-            let _ = unsafe { kill(i32::try_from(observed.pid)?, SIGKILL) };
-        }
-        deadline.interruptible_sleep(Duration::from_millis(10))?;
-    }
-}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-fn terminate_observed_process(
-    _observed: &ObservedHostProcess,
-    _deadline: &BlockingDeadline,
-) -> anyhow::Result<()> {
-    Err(anyhow!("Illustrator process cleanup is unsupported"))
-}
-
-#[cfg(windows)]
 fn observe_process(pid: u32) -> anyhow::Result<ObservedHostProcess> {
     #[repr(C)]
     struct FileTime {
@@ -1833,6 +1748,30 @@ fn observe_process(_pid: u32) -> anyhow::Result<ObservedHostProcess> {
 mod tests {
     use super::*;
 
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn illustrator_file_receipts_reject_multi_link_objects() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "illustrator-multi-link-{}",
+                Uuid::new_v4().simple()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        for name in ["manifest.xml", "index.html", "main.js"] {
+            let path = root.join(name);
+            let alias = root.join(format!("{name}.alias"));
+            fs::write(&path, b"receipted CEP payload").unwrap();
+            fs::hard_link(&path, &alias).unwrap();
+            assert!(
+                capture_path_receipt_bounded(&path, false, None).is_err(),
+                "multi-link {name} must fail closed"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn illustrator_attestation_accepts_only_the_fixed_receipted_cep_tree() {
@@ -1888,6 +1827,19 @@ mod tests {
         };
         let backend = SystemIllustratorBootstrapBackend::default();
         assert_eq!(backend.attest(&request).unwrap(), hash(module));
+        for (path, alias_name) in [
+            (plugin.join("CSXS").join("manifest.xml"), "manifest.alias"),
+            (plugin.join("index.html"), "index.alias"),
+            (plugin.join("dist").join("main.js"), "module.alias"),
+        ] {
+            let alias = root.join(alias_name);
+            fs::hard_link(&path, &alias).unwrap();
+            assert!(
+                backend.attest(&request).is_err(),
+                "multi-link CEP objects must fail closed"
+            );
+            fs::remove_file(alias).unwrap();
+        }
         assert!(!plugin.join(CONFIG_NAME).exists());
         let shadow_host = root
             .join("Adobe Illustrator Shadow")
@@ -1925,13 +1877,17 @@ mod tests {
                 "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
             )
             .unwrap();
+        let transaction = backend.begin_transaction(prepared).unwrap();
         let replaced_module = b"REPLACED FAKE CEP MODUL";
         assert_eq!(replaced_module.len(), module.len());
         fs::write(plugin.join("dist").join("main.js"), replaced_module).unwrap();
         assert!(
-            backend.validate_prepared_identity(&prepared).is_err(),
+            transaction
+                .validate_prepared_identity_bounded(&BlockingDeadline::new(Duration::from_secs(1)))
+                .is_err(),
             "a module replaced after prepare must fail before nonce consumption"
         );
+        transaction.rollback().unwrap();
         fs::write(plugin.join("dist").join("main.js"), module).unwrap();
 
         let prepared = backend
@@ -1942,13 +1898,87 @@ mod tests {
                 "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
             )
             .unwrap();
+        let transaction = backend.begin_transaction(prepared).unwrap();
         let replacement = plugin.join("dist").join("main.replacement.js");
         fs::write(&replacement, module).unwrap();
         fs::remove_file(plugin.join("dist").join("main.js")).unwrap();
         fs::rename(&replacement, plugin.join("dist").join("main.js")).unwrap();
         assert!(
-            backend.validate_prepared_identity(&prepared).is_err(),
+            transaction
+                .validate_prepared_identity_bounded(&BlockingDeadline::new(Duration::from_secs(1)))
+                .is_err(),
             "same bytes at a different filesystem identity must fail closed"
+        );
+        transaction.rollback().unwrap();
+
+        let prepared = backend
+            .prepare(
+                &request,
+                &"1".repeat(64),
+                "PRIVATE_TEST_TOKEN",
+                "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
+            )
+            .unwrap();
+        let transaction = backend.begin_transaction(prepared).unwrap();
+        transaction.activate().unwrap();
+        transaction.finalize_pending().unwrap();
+        let replacement = plugin.join("dist").join("main.post-finalize.js");
+        fs::write(&replacement, module).unwrap();
+        fs::remove_file(plugin.join("dist").join("main.js")).unwrap();
+        fs::rename(&replacement, plugin.join("dist").join("main.js")).unwrap();
+        assert!(
+            transaction.clone().prepare_commit_confirmation().is_err(),
+            "same module bytes at a new filesystem identity after finalize must fail closed"
+        );
+        transaction.rollback().unwrap();
+
+        let prepared = backend
+            .prepare(
+                &request,
+                &"1".repeat(64),
+                "PRIVATE_TEST_TOKEN",
+                "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
+            )
+            .unwrap();
+        let transaction = backend.begin_transaction(prepared).unwrap();
+        transaction.activate().unwrap();
+        transaction.finalize_pending().unwrap();
+        let confirmation = transaction.clone().prepare_commit_confirmation().unwrap();
+        let replacement = plugin.join("dist").join("main.pre-publication.js");
+        fs::write(&replacement, module).unwrap();
+        fs::remove_file(plugin.join("dist").join("main.js")).unwrap();
+        fs::rename(&replacement, plugin.join("dist").join("main.js")).unwrap();
+        assert!(
+            confirmation.confirm().is_err(),
+            "same module bytes at a new filesystem identity before publication must fail closed"
+        );
+        transaction.rollback().unwrap();
+
+        let prepared = backend
+            .prepare(
+                &request,
+                &"1".repeat(64),
+                "PRIVATE_TEST_TOKEN",
+                "ws://127.0.0.1:47391/v1/bridge/illustrator/ws",
+            )
+            .unwrap();
+        let transaction = backend.begin_transaction(prepared).unwrap();
+        transaction.activate().unwrap();
+        transaction.finalize_pending().unwrap();
+        let confirmation = transaction.clone().prepare_commit_confirmation().unwrap();
+        let publication = confirmation.confirm().unwrap();
+        let replacement = plugin.join("dist").join("main.at-publication.js");
+        fs::write(&replacement, module).unwrap();
+        fs::remove_file(plugin.join("dist").join("main.js")).unwrap();
+        fs::rename(&replacement, plugin.join("dist").join("main.js")).unwrap();
+        assert!(
+            publication.publish().is_err(),
+            "same module bytes at a new filesystem identity at publication must fail closed"
+        );
+        transaction.rollback().unwrap();
+        assert!(
+            !plugin.join(CONFIG_NAME).exists(),
+            "failed publication must remain rollback-capable"
         );
 
         let prepared = backend
@@ -1975,7 +2005,10 @@ mod tests {
         request.plugin.manifest_bytes = foreign_manifest.len() as u64;
         request.plugin.manifest_sha256 = hash(foreign_manifest);
         assert!(backend.attest(&request).is_err());
-        assert_eq!(fs::read_to_string(plugin.join(CONFIG_NAME)).unwrap(), committed);
+        assert_eq!(
+            fs::read_to_string(plugin.join(CONFIG_NAME)).unwrap(),
+            committed
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

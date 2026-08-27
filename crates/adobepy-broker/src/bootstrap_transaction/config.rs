@@ -182,11 +182,17 @@ pub(super) fn file_identity(file: &fs::File) -> anyhow::Result<FileIdentity> {
     unsafe extern "system" {
         fn GetFileInformationByHandle(
             handle: *mut std::ffi::c_void,
-            information: *mut ByHandleFileInformation,
+            information: *mut std::ffi::c_void,
         ) -> i32;
     }
     let mut information = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+    if unsafe {
+        GetFileInformationByHandle(
+            file.as_raw_handle(),
+            information.as_mut_ptr().cast::<std::ffi::c_void>(),
+        )
+    } == 0
+    {
         return Err(std::io::Error::last_os_error().into());
     }
     let information = unsafe { information.assume_init() };

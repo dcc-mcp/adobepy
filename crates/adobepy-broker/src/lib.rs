@@ -42,10 +42,9 @@ mod photoshop_bootstrap;
 #[cfg(test)]
 use photoshop_bootstrap::PreparedBootstrap;
 use photoshop_bootstrap::{
-    is_blocking_deadline_error, BlockingDeadline, LaunchedHostProcess, ObservedHostProcess,
-    PhotoshopBootstrapBackend,
-    PhotoshopBootstrapTransaction, SystemIllustratorBootstrapBackend,
-    SystemPhotoshopBootstrapBackend,
+    is_blocking_deadline_error, BlockingDeadline, IllustratorPluginReceipt, LaunchedHostProcess,
+    ObservedHostProcess, PhotoshopBootstrapBackend, PhotoshopBootstrapTransaction,
+    SystemIllustratorBootstrapBackend, SystemPhotoshopBootstrapBackend,
 };
 #[cfg(test)]
 use photoshop_bootstrap::{
@@ -379,10 +378,17 @@ struct BridgeSender {
     sender: mpsc::UnboundedSender<BridgeOutbound>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BridgeConnectionIdentity {
+    connection_id: u64,
+    connected_at_epoch_ms: u128,
+}
+
 struct BootstrapGrant {
     request: PhotoshopBootstrapRequest,
     nonce: String,
     nonce_claimed: bool,
+    claimed_connection: Option<BridgeConnectionIdentity>,
     observed: Option<ObservedHostProcess>,
     launched: Option<LaunchedHostProcess>,
     launch_cancelled: Arc<AtomicBool>,
@@ -444,7 +450,7 @@ async fn cancel_bootstrap_grant(
     blocking: BootstrapBlockingBoundary,
     product: &str,
 ) {
-    let (transaction, launched) = {
+    let (nonce, completion, transaction, launched) = {
         let mut grants = grants.lock().await;
         let Some(grant) = grants.get_mut(key) else {
             return;
@@ -453,7 +459,12 @@ async fn cancel_bootstrap_grant(
         if let Some(transaction) = grant.transaction.as_ref() {
             transaction.revoke();
         }
-        (grant.transaction.take(), grant.launched.take())
+        (
+            grant.nonce.clone(),
+            grant.completion.clone(),
+            grant.transaction.take(),
+            grant.launched.take(),
+        )
     };
     let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
     let host_failed = if let Some(launched) = launched {
@@ -483,11 +494,15 @@ async fn cancel_bootstrap_grant(
             json!({"stage": "cancellation"}),
         )
     };
+    let recovery_failed = rollback_failed || host_failed;
     let mut grants = grants.lock().await;
-    if let Some(grant) = grants.get_mut(key) {
-        grant.completion.send_replace(Some(Err(error)));
+    if !grants.get(key).is_some_and(|grant| grant.nonce == nonce) {
+        return;
     }
-    grants.remove(key);
+    completion.send_replace(Some(Err(error)));
+    if !recovery_failed {
+        grants.remove(key);
+    }
 }
 
 #[derive(Clone)]
@@ -500,8 +515,17 @@ struct BootstrapReceipt {
 #[derive(Clone)]
 struct IllustratorBootstrapReceipt {
     identity: RuntimeIdentityAttestation,
+    connection: BridgeConnectionIdentity,
+    request: PhotoshopBootstrapRequest,
+    filesystem_receipt: Option<IllustratorPluginReceipt>,
     result: IllustratorBootstrapResult,
     expires_at_epoch_ms: u128,
+}
+
+struct IllustratorPublicationContext {
+    status: IllustratorBootstrapStatus,
+    owner_key: Option<String>,
+    connection: BridgeConnectionIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -753,6 +777,48 @@ impl BrokerState {
         Ok(actual)
     }
 
+    async fn active_connection_identity(&self, key: &str) -> Option<BridgeConnectionIdentity> {
+        let senders = self.bridge_senders.read().await;
+        let sender = senders.get(key)?;
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(key)?;
+        Some(BridgeConnectionIdentity {
+            connection_id: sender.connection_id,
+            connected_at_epoch_ms: session.connected_at_epoch_ms,
+        })
+    }
+
+    async fn runtime_identity_for_connection(
+        &self,
+        query: RuntimeIdentityQuery,
+        expected: BridgeConnectionIdentity,
+    ) -> Result<RuntimeIdentityAttestation, Box<RpcErrorResponse>> {
+        let key = session_key(
+            query.host,
+            query.target.as_deref().unwrap_or(DEFAULT_TARGET),
+        );
+        let senders = self.bridge_senders.read().await;
+        if !senders
+            .get(&key)
+            .is_some_and(|sender| sender.connection_id == expected.connection_id)
+        {
+            return Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "bridge connection identity is stale",
+                json!({"field": "bridge.connectionId"}),
+            ));
+        }
+        let actual = self.runtime_identity(query).await?;
+        if actual.bridge.connected_at_epoch_ms != expected.connected_at_epoch_ms {
+            return Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "bridge connection identity is stale",
+                json!({"field": "bridge.connectedAtEpochMs"}),
+            ));
+        }
+        Ok(actual)
+    }
+
     async fn bootstrap_photoshop(&self, request: PhotoshopBootstrapRequest) -> BootstrapResult {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(request.timeout_ms);
         validate_photoshop_bootstrap_request(&request)?;
@@ -878,6 +944,7 @@ impl BrokerState {
                             request: request.clone(),
                             nonce: nonce.clone(),
                             nonce_claimed: false,
+                            claimed_connection: None,
                             observed: None,
                             launched: None,
                             launch_cancelled: Arc::new(AtomicBool::new(false)),
@@ -1235,25 +1302,54 @@ impl BrokerState {
             return Err(illustrator_bootstrap_timeout_error(&request, "attestation"));
         }
         let key = session_key(HostKind::Illustrator, &request.target);
-        if self.sessions.read().await.contains_key(&key) {
+        if let Some(connection) = self.active_connection_identity(&key).await {
             let identity = self
-                .runtime_identity(RuntimeIdentityQuery {
-                    host: HostKind::Illustrator,
-                    target: Some(request.target.clone()),
-                    expected: None,
-                })
+                .runtime_identity_for_connection(
+                    RuntimeIdentityQuery {
+                        host: HostKind::Illustrator,
+                        target: Some(request.target.clone()),
+                        expected: None,
+                    },
+                    connection,
+                )
                 .await?;
             self.validate_illustrator_bootstrap_identity(&request, &identity, None)?;
-            return self
-                .record_illustrator_bootstrap_result(
-                    identity,
-                    &request,
-                    &module_sha256,
-                    IllustratorBootstrapStatus::AlreadyReady,
-                    deadline,
-                    None,
-                )
-                .await;
+            let associated_receipt = {
+                let mut receipts = self.illustrator_bootstrap_receipts.lock().await;
+                let now = epoch_ms();
+                receipts.retain(|_, receipt| receipt.expires_at_epoch_ms >= now);
+                receipts
+                    .values()
+                    .find(|receipt| {
+                        receipt.result.status == IllustratorBootstrapStatus::Ready
+                            && receipt.connection == connection
+                            && receipt.identity == identity
+                            && receipt.request.bootstrap_version
+                                == backend_request.bootstrap_version
+                            && receipt.request.target == backend_request.target
+                            && receipt.request.host == backend_request.host
+                            && receipt.request.plugin == backend_request.plugin
+                            && receipt.result.plugin.module_sha256 == module_sha256
+                    })
+                    .cloned()
+            };
+            if let Some(receipt) = associated_receipt {
+                self.validate_illustrator_receipt_filesystem(&receipt, deadline)
+                    .await?;
+                return self
+                    .record_illustrator_bootstrap_result(
+                        identity,
+                        &request,
+                        &module_sha256,
+                        deadline,
+                        IllustratorPublicationContext {
+                            status: IllustratorBootstrapStatus::AlreadyReady,
+                            owner_key: None,
+                            connection,
+                        },
+                    )
+                    .await;
+            }
         }
 
         let nonce = random_nonce();
@@ -1273,6 +1369,7 @@ impl BrokerState {
                     request: backend_request.clone(),
                     nonce: nonce.clone(),
                     nonce_claimed: false,
+                    claimed_connection: None,
                     observed: None,
                     launched: None,
                     launch_cancelled: Arc::new(AtomicBool::new(false)),
@@ -1344,7 +1441,9 @@ impl BrokerState {
                 }
                 Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
                     ownership_cancelled.store(true, Ordering::SeqCst);
-                    Err(anyhow!("Illustrator transaction ownership worker failed closed"))
+                    Err(anyhow!(
+                        "Illustrator transaction ownership worker failed closed"
+                    ))
                 }
                 Ok(transaction) => transaction,
             }
@@ -1430,7 +1529,9 @@ impl BrokerState {
                 let target = backend_request.host.clone();
                 let launch_cancelled = launch_cancelled.clone();
                 self.bootstrap_blocking
-                    .execute(deadline, move || backend.launch_owned(&target, launch_cancelled))
+                    .execute(deadline, move || {
+                        backend.launch_owned(&target, launch_cancelled)
+                    })
                     .await
             };
             let launched = match launched {
@@ -1445,12 +1546,12 @@ impl BrokerState {
                 Ok(launched) => launched,
             };
             let launched = launched.map_err(|_| {
-                    identity_error(
-                        ERROR_IDENTITY_UNAVAILABLE,
-                        "the selected Illustrator instance could not be launched",
-                        json!({"stage": "launch"}),
-                    )
-                })?;
+                identity_error(
+                    ERROR_IDENTITY_UNAVAILABLE,
+                    "the selected Illustrator instance could not be launched",
+                    json!({"stage": "launch"}),
+                )
+            })?;
             let mut launched = Some(launched);
             let inserted_launch = {
                 let mut grants = self.bootstrap_grants.lock().await;
@@ -1484,21 +1585,29 @@ impl BrokerState {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(illustrator_bootstrap_timeout_error(&request, "verify"));
                 }
+                let (observed, claimed_connection) = self
+                    .bootstrap_grants
+                    .lock()
+                    .await
+                    .get(&key)
+                    .map(|grant| (grant.observed.clone(), grant.claimed_connection))
+                    .unwrap_or((None, None));
+                let Some(claimed_connection) = claimed_connection else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                };
                 match self
-                    .runtime_identity(RuntimeIdentityQuery {
-                        host: HostKind::Illustrator,
-                        target: Some(request.target.clone()),
-                        expected: None,
-                    })
+                    .runtime_identity_for_connection(
+                        RuntimeIdentityQuery {
+                            host: HostKind::Illustrator,
+                            target: Some(request.target.clone()),
+                            expected: None,
+                        },
+                        claimed_connection,
+                    )
                     .await
                 {
                     Ok(identity) => {
-                        let observed = self
-                            .bootstrap_grants
-                            .lock()
-                            .await
-                            .get(&key)
-                            .and_then(|grant| grant.observed.clone());
                         self.validate_illustrator_bootstrap_identity(
                             &request,
                             &identity,
@@ -1527,13 +1636,11 @@ impl BrokerState {
                             Err(BlockingBoundaryError::TimedOut) => {
                                 transaction.revoke();
                                 return Err(illustrator_bootstrap_timeout_error(
-                                    &request,
-                                    "commit",
+                                    &request, "commit",
                                 ));
                             }
                             Err(
-                                BlockingBoundaryError::Overloaded
-                                | BlockingBoundaryError::Panicked,
+                                BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked,
                             ) => {
                                 transaction.revoke();
                                 Err(anyhow!("Illustrator commit worker failed closed"))
@@ -1565,9 +1672,12 @@ impl BrokerState {
                                 identity,
                                 &request,
                                 &module_sha256,
-                                IllustratorBootstrapStatus::Ready,
                                 deadline,
-                                Some(&key),
+                                IllustratorPublicationContext {
+                                    status: IllustratorBootstrapStatus::Ready,
+                                    owner_key: Some(key.clone()),
+                                    connection: claimed_connection,
+                                },
                             )
                             .await;
                     }
@@ -1597,9 +1707,9 @@ impl BrokerState {
     async fn complete_illustrator_bootstrap_failure(
         &self,
         key: &str,
-        mut primary_error: Box<RpcErrorResponse>,
+        primary_error: Box<RpcErrorResponse>,
     ) -> IllustratorResult {
-        let (transaction, launched) = {
+        let recovery = {
             let mut grants = self.bootstrap_grants.lock().await;
             let Some(grant) = grants.get_mut(key) else {
                 return Err(primary_error);
@@ -1608,48 +1718,57 @@ impl BrokerState {
             if let Some(transaction) = grant.transaction.as_ref() {
                 transaction.revoke();
             }
-            (grant.transaction.take(), grant.launched.take())
-        };
-        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
-        let host_failed = if let Some(launched) = launched {
-            launched.terminate_and_reap(cleanup_deadline).await.is_err()
-        } else {
-            false
-        };
-        let rollback_failed = if let Some(transaction) = transaction {
-            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
-            !matches!(
-                self.bootstrap_blocking
-                    .execute_cleanup(cleanup_deadline, move || transaction.rollback())
-                    .await,
-                Ok(Ok(()))
+            (
+                grant.nonce.clone(),
+                grant.completion.clone(),
+                grant.transaction.take(),
+                grant.launched.take(),
             )
-        } else {
-            false
         };
-        let mut failed_components = Vec::new();
-        if host_failed {
-            failed_components.push("host");
-        }
-        if rollback_failed {
-            failed_components.push("configuration");
-        }
-        if !failed_components.is_empty() {
-            let data = primary_error.error.data.get_or_insert_with(|| json!({}));
-            if let Some(data) = data.as_object_mut() {
-                data.insert(
-                    "secondaryDiagnostic".into(),
-                    json!({
-                        "code": ERROR_IDENTITY_STALE,
-                        "stage": "recovery",
-                        "status": "failed",
-                        "failedComponents": failed_components
-                    }),
-                );
+        let grants = self.bootstrap_grants.clone();
+        let blocking = self.bootstrap_blocking.clone();
+        let key = key.to_owned();
+        tokio::spawn(async move {
+            let (nonce, completion, transaction, launched) = recovery;
+            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+            let host_failed = if let Some(launched) = launched {
+                launched.terminate_and_reap(cleanup_deadline).await.is_err()
+            } else {
+                false
+            };
+            let rollback_failed = if let Some(transaction) = transaction {
+                let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+                !matches!(
+                    blocking
+                        .execute_cleanup(cleanup_deadline, move || transaction.rollback())
+                        .await,
+                    Ok(Ok(()))
+                )
+            } else {
+                false
+            };
+            let recovery_failed = host_failed || rollback_failed;
+            let recovery_result = if recovery_failed {
+                Err(bootstrap_recovery_error(
+                    "Illustrator bootstrap recovery did not quiesce",
+                ))
+            } else {
+                Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap recovery completed",
+                    json!({"stage": "recovery"}),
+                ))
+            };
+            if recovery_failed {
+                completion.send_replace(Some(recovery_result));
+            } else {
+                let mut grants = grants.lock().await;
+                if grants.get(&key).is_some_and(|grant| grant.nonce == nonce) {
+                    grants.remove(&key);
+                }
+                completion.send_replace(Some(recovery_result));
             }
-        }
-        let mut grants = self.bootstrap_grants.lock().await;
-        grants.remove(key);
+        });
         Err(primary_error)
     }
 
@@ -1708,10 +1827,22 @@ impl BrokerState {
         identity: RuntimeIdentityAttestation,
         request: &IllustratorBootstrapRequest,
         module_sha256: &str,
-        status: IllustratorBootstrapStatus,
         deadline: tokio::time::Instant,
-        owner_key: Option<&str>,
+        publication: IllustratorPublicationContext,
     ) -> IllustratorResult {
+        let IllustratorPublicationContext {
+            status,
+            owner_key,
+            connection,
+        } = publication;
+        let key = session_key(HostKind::Illustrator, &request.target);
+        if self.active_connection_identity(&key).await != Some(connection) {
+            return Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "Illustrator bridge connection changed before attestation",
+                json!({"field": "bridge.connectionId"}),
+            ));
+        }
         let broker_sha256 = {
             let backend = self.illustrator_bootstrap_backend.clone();
             let executable_path = identity.broker.executable_path.clone();
@@ -1742,7 +1873,38 @@ impl BrokerState {
                 "broker_attestation",
             ));
         }
+        let filesystem_receipt = {
+            let backend = self.illustrator_bootstrap_backend.clone();
+            let backend_request = illustrator_backend_request(request);
+            match run_blocking_until(deadline, move |control| {
+                backend.capture_illustrator_receipt_bounded(&backend_request, control)
+            })
+            .await
+            {
+                BlockingCall::Completed(Ok(receipt)) => receipt,
+                BlockingCall::TimedOut => {
+                    return Err(illustrator_bootstrap_timeout_error(
+                        request,
+                        "plugin_attestation",
+                    ));
+                }
+                BlockingCall::Completed(Err(_)) | BlockingCall::Panicked => {
+                    return Err(identity_error(
+                        ERROR_IDENTITY_UNAVAILABLE,
+                        "the fixed Illustrator CEP bridge identity is unavailable",
+                        json!({"stage": "plugin_attestation"}),
+                    ));
+                }
+            }
+        };
         let fingerprint = identity_fingerprint(&identity)?;
+        if self.active_connection_identity(&key).await != Some(connection) {
+            return Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "Illustrator bridge connection changed during attestation",
+                json!({"field": "bridge.connectionId"}),
+            ));
+        }
         if tokio::time::Instant::now() >= deadline {
             return Err(illustrator_bootstrap_timeout_error(request, "fingerprint"));
         }
@@ -1790,10 +1952,13 @@ impl BrokerState {
         };
         let receipt = IllustratorBootstrapReceipt {
             identity,
+            connection,
+            request: illustrator_backend_request(request),
+            filesystem_receipt,
             result: result.clone(),
             expires_at_epoch_ms: epoch_ms() + 120_000,
         };
-        if let Some(key) = owner_key {
+        if let Some(key) = owner_key.as_deref() {
             let transaction = {
                 let grants = self.bootstrap_grants.lock().await;
                 grants
@@ -1824,7 +1989,9 @@ impl BrokerState {
                 }
                 Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
                     transaction.revoke();
-                    Err(anyhow!("Illustrator commit confirmation worker failed closed"))
+                    Err(anyhow!(
+                        "Illustrator commit confirmation worker failed closed"
+                    ))
                 }
                 Ok(confirmation) => confirmation,
             }
@@ -1850,7 +2017,9 @@ impl BrokerState {
                 }
                 Err(BlockingBoundaryError::Overloaded | BlockingBoundaryError::Panicked) => {
                     transaction.revoke();
-                    Err(anyhow!("Illustrator commit confirmation worker failed closed"))
+                    Err(anyhow!(
+                        "Illustrator commit confirmation worker failed closed"
+                    ))
                 }
                 Ok(publication) => publication,
             }
@@ -1864,6 +2033,27 @@ impl BrokerState {
             if tokio::time::Instant::now() >= deadline {
                 transaction.revoke();
                 return Err(illustrator_bootstrap_timeout_error(request, "receipt"));
+            }
+            let active_senders = self.bridge_senders.read().await;
+            if !active_senders
+                .get(key)
+                .is_some_and(|sender| sender.connection_id == connection.connection_id)
+            {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bridge connection changed before publication",
+                    json!({"field": "bridge.connectionId"}),
+                ));
+            }
+            let sessions = self.sessions.read().await;
+            if !sessions.get(key).is_some_and(|session| {
+                session.connected_at_epoch_ms == connection.connected_at_epoch_ms
+            }) {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bridge connection changed before publication",
+                    json!({"field": "bridge.connectedAtEpochMs"}),
+                ));
             }
             let mut owned_hosts = self.bootstrap_owned_hosts.lock().await;
             let mut grants = self.bootstrap_grants.lock().await;
@@ -1881,6 +2071,13 @@ impl BrokerState {
                     ERROR_IDENTITY_STALE,
                     "Illustrator bootstrap commit ownership is stale",
                     json!({"stage": "receipt"}),
+                ));
+            }
+            if grants.get(key).and_then(|grant| grant.claimed_connection) != Some(connection) {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bootstrap connection ownership is stale",
+                    json!({"stage": "receipt", "field": "bridge.connectionId"}),
                 ));
             }
             let mut receipts = self.illustrator_bootstrap_receipts.lock().await;
@@ -1906,6 +2103,27 @@ impl BrokerState {
             receipts.insert(receipt_id, receipt);
             grants.remove(key);
         } else {
+            let active_senders = self.bridge_senders.read().await;
+            if !active_senders
+                .get(&key)
+                .is_some_and(|sender| sender.connection_id == connection.connection_id)
+            {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bridge connection changed before receipt publication",
+                    json!({"field": "bridge.connectionId"}),
+                ));
+            }
+            let sessions = self.sessions.read().await;
+            if !sessions.get(&key).is_some_and(|session| {
+                session.connected_at_epoch_ms == connection.connected_at_epoch_ms
+            }) {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "Illustrator bridge connection changed before receipt publication",
+                    json!({"field": "bridge.connectedAtEpochMs"}),
+                ));
+            }
             let mut receipts = self.illustrator_bootstrap_receipts.lock().await;
             if tokio::time::Instant::now() >= deadline {
                 return Err(illustrator_bootstrap_timeout_error(request, "receipt"));
@@ -1915,6 +2133,40 @@ impl BrokerState {
             receipts.insert(receipt_id, receipt);
         }
         Ok(result)
+    }
+
+    async fn validate_illustrator_receipt_filesystem(
+        &self,
+        receipt: &IllustratorBootstrapReceipt,
+        deadline: tokio::time::Instant,
+    ) -> ValidationResult {
+        let backend = self.illustrator_bootstrap_backend.clone();
+        let request = receipt.request.clone();
+        let filesystem_receipt = receipt.filesystem_receipt.clone();
+        let expected_module_sha256 = receipt.result.plugin.module_sha256.clone();
+        match run_blocking_until(deadline, move |control| {
+            let actual_module_sha256 = backend.attest_bounded(&request, control)?;
+            if let Some(receipt) = filesystem_receipt.as_ref() {
+                receipt.validate_bounded(control)?;
+            }
+            Ok(actual_module_sha256)
+        })
+        .await
+        {
+            BlockingCall::Completed(Ok(actual_module_sha256))
+                if actual_module_sha256 == expected_module_sha256 =>
+            {
+                Ok(())
+            }
+            BlockingCall::Completed(Ok(_))
+            | BlockingCall::Completed(Err(_))
+            | BlockingCall::TimedOut
+            | BlockingCall::Panicked => Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "Illustrator CEP bridge identity changed after bootstrap",
+                json!({"field": "plugin.moduleSha256"}),
+            )),
+        }
     }
 
     async fn verify_illustrator_bootstrap(&self, receipt_id: &str) -> IllustratorResult {
@@ -1939,12 +2191,19 @@ impl BrokerState {
                     json!({"field": "receiptId"}),
                 )
             })?;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(receipt.result.continuation.timeout_ms);
+        self.validate_illustrator_receipt_filesystem(&receipt, deadline)
+            .await?;
         let actual = self
-            .runtime_identity(RuntimeIdentityQuery {
-                host: HostKind::Illustrator,
-                target: Some(receipt.identity.bridge.target.clone()),
-                expected: Some(receipt.identity.clone()),
-            })
+            .runtime_identity_for_connection(
+                RuntimeIdentityQuery {
+                    host: HostKind::Illustrator,
+                    target: Some(receipt.identity.bridge.target.clone()),
+                    expected: Some(receipt.identity.clone()),
+                },
+                receipt.connection,
+            )
             .await?;
         let observed = ObservedHostProcess {
             pid: actual.host.pid,
@@ -1959,6 +2218,16 @@ impl BrokerState {
                 ERROR_IDENTITY_STALE,
                 "Illustrator process identity changed after bootstrap",
                 json!({"field": "host.processStartIdentity"}),
+            ));
+        }
+        self.validate_illustrator_receipt_filesystem(&receipt, deadline)
+            .await?;
+        let key = session_key(HostKind::Illustrator, &receipt.identity.bridge.target);
+        if self.active_connection_identity(&key).await != Some(receipt.connection) {
+            return Err(identity_error(
+                ERROR_IDENTITY_STALE,
+                "Illustrator bridge connection changed after bootstrap",
+                json!({"field": "bridge.connectionId"}),
             ));
         }
         Ok(receipt.result)
@@ -2693,21 +2962,16 @@ impl BrokerState {
 
     async fn disconnect_session(&self, key: &str, connection_id: u64, message: impl Into<String>) {
         let message = message.into();
-        let removed_current = {
+        {
             let mut senders = self.bridge_senders.write().await;
             if senders
                 .get(key)
                 .is_some_and(|current| current.connection_id == connection_id)
             {
                 senders.remove(key);
-                true
-            } else {
-                false
+                self.sessions.write().await.remove(key);
+                self.session_identities.write().await.remove(key);
             }
-        };
-        if removed_current {
-            self.sessions.write().await.remove(key);
-            self.session_identities.write().await.remove(key);
         }
         let drained = {
             let mut pending = self.pending.lock().await;
@@ -3006,13 +3270,15 @@ async fn bridge_socket(mut socket: WebSocket, state: BrokerState, expected_host:
     }
     let key = session_key(expected_host, &target);
     let connection_id = state.next_connection_id();
+    let connected_at_epoch_ms = epoch_ms();
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut active_senders = state.bridge_senders.write().await;
     state.sessions.write().await.insert(
         key.clone(),
         BridgeSessionInfo {
             target,
             capabilities,
-            connected_at_epoch_ms: epoch_ms(),
+            connected_at_epoch_ms,
         },
     );
     if let Some(identity) = identity {
@@ -3024,13 +3290,26 @@ async fn bridge_socket(mut socket: WebSocket, state: BrokerState, expected_host:
     } else {
         state.session_identities.write().await.remove(&key);
     }
-    state.bridge_senders.write().await.insert(
+    active_senders.insert(
         key.clone(),
         BridgeSender {
             connection_id,
             sender: tx,
         },
     );
+    if expected_host == HostKind::Illustrator {
+        if let Some(nonce) = bootstrap_nonce.as_deref() {
+            if let Some(grant) = state.bootstrap_grants.lock().await.get_mut(&key) {
+                if grant.nonce == nonce && grant.nonce_claimed {
+                    grant.claimed_connection = Some(BridgeConnectionIdentity {
+                        connection_id,
+                        connected_at_epoch_ms,
+                    });
+                }
+            }
+        }
+    }
+    drop(active_senders);
     let (mut sender, mut receiver) = socket.split();
     loop {
         tokio::select! {
@@ -3897,6 +4176,7 @@ mod tests {
     #[derive(Default)]
     struct FakeBootstrapBackend {
         attest_arrivals: AtomicUsize,
+        attest_completions: AtomicUsize,
         attest_wait_for: AtomicUsize,
         attest_delay_ms: AtomicU64,
         first_attest_delay_ms: AtomicU64,
@@ -3920,8 +4200,10 @@ mod tests {
         rollback_delay_ms: Arc<AtomicU64>,
         rollback_fails: Arc<AtomicBool>,
         terminations: Arc<AtomicUsize>,
+        termination_delay_ms: Arc<AtomicU64>,
         rollback_panics: Arc<AtomicBool>,
         process_valid: AtomicBool,
+        attestation_valid: AtomicBool,
         config_state: Arc<AtomicUsize>,
         executable_sha256_delay_ms: AtomicU64,
     }
@@ -3930,6 +4212,7 @@ mod tests {
         fn ready() -> Arc<Self> {
             Arc::new(Self {
                 process_valid: AtomicBool::new(true),
+                attestation_valid: AtomicBool::new(true),
                 config_state: Arc::new(AtomicUsize::new(1)),
                 ..Self::default()
             })
@@ -4086,6 +4369,10 @@ mod tests {
                 self.attest_delay_ms.load(Ordering::SeqCst)
             };
             std::thread::sleep(Duration::from_millis(delay_ms));
+            if !self.attestation_valid.load(Ordering::SeqCst) {
+                return Err(anyhow!("simulated CEP receipt drift"));
+            }
+            self.attest_completions.fetch_add(1, Ordering::SeqCst);
             Ok("d".repeat(64))
         }
 
@@ -4157,6 +4444,7 @@ mod tests {
                 },
                 self.launch_live.clone(),
                 self.terminations.clone(),
+                self.termination_delay_ms.clone(),
             ))
         }
 
@@ -4169,11 +4457,6 @@ mod tests {
                 self.executable_sha256_delay_ms.load(Ordering::SeqCst),
             ));
             Ok("c".repeat(64))
-        }
-
-        fn terminate(&self, _observed: &ObservedHostProcess) -> anyhow::Result<()> {
-            self.terminations.fetch_add(1, Ordering::SeqCst);
-            Ok(())
         }
 
         fn attest_bounded(
@@ -4195,6 +4478,10 @@ mod tests {
                 self.attest_delay_ms.load(Ordering::SeqCst)
             };
             deadline.interruptible_sleep(Duration::from_millis(delay_ms))?;
+            if !self.attestation_valid.load(Ordering::SeqCst) {
+                return Err(anyhow!("simulated CEP receipt drift"));
+            }
+            self.attest_completions.fetch_add(1, Ordering::SeqCst);
             Ok("d".repeat(64))
         }
 
@@ -4208,7 +4495,6 @@ mod tests {
             ))?;
             Ok("c".repeat(64))
         }
-
     }
 
     struct CountingBootstrapTransaction {
@@ -4537,7 +4823,46 @@ mod tests {
             },
         );
         state.session_identities.write().await.insert(key, bound);
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        state.bridge_senders.write().await.insert(
+            session_key(HostKind::Illustrator, "illustration"),
+            BridgeSender {
+                connection_id: 41,
+                sender,
+            },
+        );
+        state
+            .bootstrap_grants
+            .lock()
+            .await
+            .get_mut(&session_key(HostKind::Illustrator, "illustration"))
+            .expect("Illustrator bootstrap grant remains active")
+            .claimed_connection = Some(BridgeConnectionIdentity {
+            connection_id: 41,
+            connected_at_epoch_ms: 1_720_000_000_000,
+        });
         assert_eq!(observed.pid, 4200);
+    }
+
+    async fn wait_for_illustrator_recovery(state: &BrokerState, key: &str) -> bool {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = {
+                    let grants = state.bootstrap_grants.lock().await;
+                    match grants.get(key) {
+                        None => Some(true),
+                        Some(grant) if grant.completion.borrow().is_some() => Some(false),
+                        Some(_) => None,
+                    }
+                };
+                if let Some(removed) = state {
+                    return removed;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Illustrator recovery must reach a terminal state")
     }
 
     async fn insert_identity_session(
@@ -5323,6 +5648,9 @@ mod tests {
         assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
         assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
         assert_eq!(backend.finalizes.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.confirmations.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.confirmed.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 3);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 0);
 
         let repeated = state.bootstrap_illustrator(request.clone()).await.unwrap();
@@ -5333,6 +5661,14 @@ mod tests {
             .await
             .unwrap();
 
+        backend.attestation_valid.store(false, Ordering::SeqCst);
+        let error = state
+            .verify_illustrator_bootstrap(&result.continuation.receipt_id)
+            .await
+            .expect_err("verify must fail when the receipted CEP tree has drifted");
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+        backend.attestation_valid.store(true, Ordering::SeqCst);
+
         backend.process_valid.store(false, Ordering::SeqCst);
         let error = state
             .verify_illustrator_bootstrap(&result.continuation.receipt_id)
@@ -5342,6 +5678,92 @@ mod tests {
         let public = serde_json::to_string(&error).unwrap();
         assert!(!public.contains("PRIVATE_TEST_TOKEN"));
         assert!(!public.contains("Program Files"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn illustrator_bootstrap_relaunches_an_unreceipted_session_after_disk_bytes_are_restored()
+    {
+        let backend = FakeBootstrapBackend::ready();
+        let state = illustrator_bootstrap_state(backend.clone());
+        let key = session_key(HostKind::Illustrator, "illustration");
+        state.sessions.write().await.insert(
+            key.clone(),
+            BridgeSessionInfo {
+                target: "illustration".into(),
+                capabilities: illustrator_caps(),
+                connected_at_epoch_ms: 1_710_000_000_000,
+            },
+        );
+        state
+            .session_identities
+            .write()
+            .await
+            .insert(key.clone(), illustrator_identity_claim());
+
+        let mut owner = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .bootstrap_illustrator(illustrator_bootstrap_request(1_000))
+                    .await
+            }
+        });
+        let grant_started = async {
+            loop {
+                if state.bootstrap_grants.lock().await.contains_key(&key) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let result = tokio::select! {
+            result = &mut owner => result.expect("bootstrap task must join"),
+            _ = grant_started => {
+                publish_matching_illustrator_session(&state).await;
+                owner.await.expect("bootstrap task must join")
+            }
+        }
+        .expect("restored disk bytes require a nonce-bound relaunch");
+
+        assert_eq!(result.status, IllustratorBootstrapStatus::Ready);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.confirmed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn illustrator_verify_rechecks_the_receipted_cep_tree_after_runtime_identity() {
+        let backend = FakeBootstrapBackend::ready();
+        let state = illustrator_bootstrap_state(backend.clone());
+        let request = illustrator_bootstrap_request(1_000);
+        let owner = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_illustrator(request).await }
+        });
+        publish_matching_illustrator_session(&state).await;
+        let result = owner.await.unwrap().unwrap();
+
+        let previous_completions = backend.attest_completions.load(Ordering::SeqCst);
+        let sessions_guard = state.sessions.write().await;
+        let verification = tokio::spawn({
+            let state = state.clone();
+            let receipt_id = result.continuation.receipt_id.clone();
+            async move { state.verify_illustrator_bootstrap(&receipt_id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.attest_completions.load(Ordering::SeqCst) == previous_completions {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("verify must finish its first CEP receipt attestation");
+        backend.attestation_valid.store(false, Ordering::SeqCst);
+        drop(sessions_guard);
+
+        let error = verification
+            .await
+            .unwrap()
+            .expect_err("CEP drift during runtime identity verification must fail closed");
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
     }
 
     #[tokio::test]
@@ -5448,6 +5870,13 @@ mod tests {
             .bootstrap_illustrator(illustrator_bootstrap_request(50))
             .await
             .unwrap_err();
+        assert!(
+            wait_for_illustrator_recovery(
+                &state,
+                &session_key(HostKind::Illustrator, "illustration")
+            )
+            .await
+        );
         assert_eq!(error.error.code, ERROR_TIMEOUT);
         assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
         assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
@@ -5458,6 +5887,45 @@ mod tests {
         let public = serde_json::to_string(&error).unwrap();
         assert!(!public.contains("PRIVATE_TEST_TOKEN"));
         assert!(!public.contains("Program Files"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn illustrator_timeout_returns_at_deadline_while_owned_recovery_quiesces_in_background() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.termination_delay_ms.store(125, Ordering::SeqCst);
+        backend.rollback_delay_ms.store(125, Ordering::SeqCst);
+        let state = illustrator_bootstrap_state(backend.clone());
+        let key = session_key(HostKind::Illustrator, "illustration");
+
+        let started = std::time::Instant::now();
+        let error = state
+            .bootstrap_illustrator(illustrator_bootstrap_request(50))
+            .await
+            .expect_err("missing nonce-bound connection must time out");
+        let elapsed = started.elapsed();
+
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "50 ms request waited {elapsed:?} for sequential host and rollback recovery"
+        );
+        assert!(
+            state.bootstrap_grants.lock().await.contains_key(&key),
+            "background recovery must retain the fail-closed reservation"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !state.bootstrap_grants.lock().await.contains_key(&key) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background recovery must quiesce");
+        assert_eq!(backend.terminations.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5539,6 +6007,8 @@ mod tests {
                 .bootstrap_illustrator(illustrator_bootstrap_request(50))
                 .await
                 .unwrap_err();
+            let key = session_key(HostKind::Illustrator, "illustration");
+            assert!(!wait_for_illustrator_recovery(&state, &key).await);
 
             assert_eq!(error.error.code, ERROR_TIMEOUT);
             assert_eq!(
@@ -5549,24 +6019,13 @@ mod tests {
                     .and_then(|data| data["stage"].as_str()),
                 Some("verify")
             );
-            assert_eq!(
-                error
-                    .error
-                    .data
-                    .as_ref()
-                    .and_then(|data| data["secondaryDiagnostic"]["code"].as_i64()),
-                Some(i64::from(ERROR_IDENTITY_STALE))
-            );
-            assert_eq!(
-                error
-                    .error
-                    .data
-                    .as_ref()
-                    .and_then(|data| data["secondaryDiagnostic"]["stage"].as_str()),
-                Some("recovery")
-            );
             assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
-            assert!(state.bootstrap_grants.lock().await.is_empty());
+            assert!(state.bootstrap_grants.lock().await.contains_key(&key));
+            let competing = state
+                .bootstrap_illustrator(illustrator_bootstrap_request(50))
+                .await
+                .expect_err("failed recovery must retain the reservation fail closed");
+            assert_eq!(competing.error.code, ERROR_IDENTITY_AMBIGUOUS);
             let public = serde_json::to_string(&error).unwrap();
             assert!(!public.contains("PRIVATE_HOSTILE_ROLLBACK_PANIC"));
             assert!(!public.contains("deterministic rollback failure"));
@@ -5603,10 +6062,18 @@ mod tests {
             .launch_delay_ms
             .store(1_000, Ordering::SeqCst);
         let started = std::time::Instant::now();
-        let error = illustrator_bootstrap_state(launch_backend.clone())
+        let launch_state = illustrator_bootstrap_state(launch_backend.clone());
+        let error = launch_state
             .bootstrap_illustrator(illustrator_bootstrap_request(50))
             .await
             .unwrap_err();
+        assert!(
+            wait_for_illustrator_recovery(
+                &launch_state,
+                &session_key(HostKind::Illustrator, "illustration")
+            )
+            .await
+        );
         assert_eq!(error.error.code, ERROR_TIMEOUT);
         assert_eq!(
             error
@@ -5636,6 +6103,13 @@ mod tests {
             .bootstrap_illustrator(illustrator_bootstrap_request(1_000))
             .await
             .unwrap_err();
+        assert!(
+            wait_for_illustrator_recovery(
+                &state,
+                &session_key(HostKind::Illustrator, "illustration")
+            )
+            .await
+        );
 
         assert_eq!(error.error.code, ERROR_IDENTITY_UNAVAILABLE);
         assert_eq!(
@@ -5677,6 +6151,14 @@ mod tests {
             });
             publish_matching_illustrator_session(&state).await;
             let error = owner.await.unwrap().unwrap_err();
+            assert!(
+                wait_for_illustrator_recovery(
+                    &state,
+                    &session_key(HostKind::Illustrator, "illustration")
+                )
+                .await,
+                "recovery must succeed for hash_stage={hash_stage}"
+            );
             assert_eq!(error.error.code, ERROR_TIMEOUT);
             assert_eq!(
                 error
@@ -7095,6 +7577,172 @@ mod tests {
         assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
         assert!(state.bootstrap_grants.lock().await.is_empty());
         assert!(state.bootstrap_receipts.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn illustrator_cancellation_recovery_failure_retains_terminal_ownership() {
+        for (termination_delay_ms, rollback_fails) in [(500, false), (0, true)] {
+            let backend = FakeBootstrapBackend::ready();
+            backend
+                .termination_delay_ms
+                .store(termination_delay_ms, Ordering::SeqCst);
+            backend
+                .rollback_fails
+                .store(rollback_fails, Ordering::SeqCst);
+            let state = illustrator_bootstrap_state(backend.clone());
+            let key = session_key(HostKind::Illustrator, "illustration");
+            let owner = tokio::spawn({
+                let state = state.clone();
+                async move {
+                    state
+                        .bootstrap_illustrator(illustrator_bootstrap_request(1_000))
+                        .await
+                }
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let launch_is_owned = state
+                        .bootstrap_grants
+                        .lock()
+                        .await
+                        .get(&key)
+                        .is_some_and(|grant| grant.launched.is_some());
+                    if launch_is_owned {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Illustrator launch must reach broker-owned recovery state");
+
+            owner.abort();
+            assert!(owner.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while backend.rollbacks.load(Ordering::SeqCst) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancellation recovery must reach one rollback attempt");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+
+            assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+            assert!(
+                state.bootstrap_grants.lock().await.contains_key(&key),
+                "failed cancellation recovery must retain terminal ownership: termination_delay_ms={termination_delay_ms}, rollback_fails={rollback_fails}"
+            );
+            let competing = state
+                .bootstrap_illustrator(illustrator_bootstrap_request(50))
+                .await
+                .expect_err("failed recovery must fail closed to a competing owner");
+            assert_eq!(competing.error.code, ERROR_IDENTITY_AMBIGUOUS);
+        }
+    }
+
+    #[tokio::test]
+    async fn illustrator_receipt_rejects_a_new_connection_in_the_same_millisecond_epoch() {
+        let backend = FakeBootstrapBackend::ready();
+        let state = illustrator_bootstrap_state(backend);
+        let request = illustrator_bootstrap_request(1_000);
+        let owner = tokio::spawn({
+            let state = state.clone();
+            async move { state.bootstrap_illustrator(request).await }
+        });
+        publish_matching_illustrator_session(&state).await;
+        let key = session_key(HostKind::Illustrator, "illustration");
+        let (old_sender, _old_receiver) = mpsc::unbounded_channel();
+        state.bridge_senders.write().await.insert(
+            key.clone(),
+            BridgeSender {
+                connection_id: 41,
+                sender: old_sender,
+            },
+        );
+        let result = owner.await.unwrap().unwrap();
+
+        let same_epoch_session = state.sessions.read().await.get(&key).unwrap().clone();
+        let same_instance_claim = state
+            .session_identities
+            .read()
+            .await
+            .get(&key)
+            .unwrap()
+            .clone();
+        let (new_sender, _new_receiver) = mpsc::unbounded_channel();
+        state
+            .sessions
+            .write()
+            .await
+            .insert(key.clone(), same_epoch_session);
+        state
+            .session_identities
+            .write()
+            .await
+            .insert(key.clone(), same_instance_claim);
+        state.bridge_senders.write().await.insert(
+            key,
+            BridgeSender {
+                connection_id: 42,
+                sender: new_sender,
+            },
+        );
+
+        let error = state
+            .verify_illustrator_bootstrap(&result.continuation.receipt_id)
+            .await
+            .expect_err("a receipt must reject a distinct connection even when epoch_ms collides");
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn illustrator_cancellation_rollback_failure_retains_terminal_ownership() {
+        let backend = FakeBootstrapBackend::ready();
+        backend.rollback_fails.store(true, Ordering::SeqCst);
+        let state = illustrator_bootstrap_state(backend.clone());
+        let key = session_key(HostKind::Illustrator, "illustration");
+        let owner = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .bootstrap_illustrator(illustrator_bootstrap_request(1_000))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .bootstrap_grants
+                    .lock()
+                    .await
+                    .get(&key)
+                    .is_some_and(|grant| grant.launched.is_some())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Illustrator launch must reach broker-owned recovery state");
+
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.rollbacks.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation recovery must attempt rollback exactly once");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert!(
+            state.bootstrap_grants.lock().await.contains_key(&key),
+            "failed rollback must preserve terminal recovery ownership"
+        );
     }
 
     #[tokio::test]
