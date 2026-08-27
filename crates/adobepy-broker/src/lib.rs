@@ -285,7 +285,7 @@ impl BootstrapBlockingBoundary {
                 .map_err(|_| BlockingBoundaryError::Panicked);
             let failed = outcome.is_err();
             if cleanup {
-                boundary.finish_cleanup(epoch, !failed);
+                boundary.finish_cleanup(epoch, matches!(&outcome, Ok(Ok(_))));
                 let _ = sender.send(outcome);
             } else {
                 if failed {
@@ -3390,6 +3390,38 @@ mod tests {
         for task in queued {
             let _ = task.await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_error_keeps_boundary_poisoned_and_forward_blocked() {
+        let boundary = BootstrapBlockingBoundary::default();
+        boundary.poison(0);
+
+        let cleanup = boundary
+            .execute_cleanup(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                || -> anyhow::Result<()> { Err(anyhow!("deterministic rollback failure")) },
+            )
+            .await;
+        assert!(matches!(cleanup, Ok(Err(_))));
+        assert_eq!(boundary.state.lock().unwrap().poisoned_epoch, Some(0));
+        assert!(boundary.poisoned.load(Ordering::SeqCst));
+
+        let forwarded = Arc::new(AtomicBool::new(false));
+        let forward = {
+            let forwarded = forwarded.clone();
+            boundary
+                .execute(
+                    tokio::time::Instant::now() + Duration::from_millis(50),
+                    move || {
+                        forwarded.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+        };
+        assert!(matches!(forward, Err(BlockingBoundaryError::TimedOut)));
+        assert!(!forwarded.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
