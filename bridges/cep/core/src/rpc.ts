@@ -7,7 +7,7 @@ export interface CepConfig {
   token: string;
   target: string;
   capabilities: Capabilities;
-  identityProvider?: () => Promise<BridgeIdentityClaim | undefined>;
+  identityProvider?: () => Promise<BridgeIdentityClaim | undefined> | BridgeIdentityClaim | undefined;
 }
 
 declare const WebSocket: any;
@@ -23,7 +23,10 @@ export function startCepBridge(config: CepConfig): void {
     let identity: BridgeIdentityClaim | undefined;
     if (config.identityProvider) {
       try {
-        identity = await config.identityProvider();
+        const provided = config.identityProvider();
+        identity = provided && typeof (provided as any).then === "function"
+          ? await (provided as Promise<BridgeIdentityClaim | undefined>)
+          : provided as BridgeIdentityClaim | undefined;
       } catch {
         console.error("[adobepy] runtime identity is unavailable; exact-instance verification will fail closed.");
       }

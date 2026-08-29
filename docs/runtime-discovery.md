@@ -141,6 +141,20 @@ OS process observations and its owned install receipt. A missing
 `__ADOBEPY_HOST_IDENTITY` launch context therefore remains fail-closed even when
 `/health` and `/v1/capabilities` succeed.
 
+### 3.1 After Effects CEP identity
+
+After Effects CEP identity is currently fail-closed. The broker does not return
+a complete runtime attestation from CEP self-reported globals: an
+adapter-owned launch/install receipt, including OS-bound host identity and
+installed/loaded module evidence, is required first. The receipt plumbing is a
+follow-up scope; until it exists, the broker rejects After Effects identity
+claims with `ERROR_IDENTITY_UNAVAILABLE` and no After Effects identity-backed
+bootstrap or readiness claim is made.
+
+No After Effects bootstrap endpoint is exposed until a host-specific launch,
+receipt, and nonce transaction exists. Adapters must not treat CEP identity or
+compile/package evidence as a bootstrap success signal.
+
 ---
 
 ## 4. Environment Variables for Consumer Handoff

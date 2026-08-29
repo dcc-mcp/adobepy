@@ -51,6 +51,7 @@ async function main() {
     evalScript(script, callback) {
       if (script.startsWith("$.evalFile(")) { loadedScripts.push(script); callback("true"); return; }
       if (script.includes("typeof adobepyDispatch")) { runtimeChecks.push(script); callback("ready"); return; }
+      if (script.includes("typeof app === \"object\"")) { callback("25.0.0"); return; }
       evalScripts.push(script);
       const match = script.match(/^adobepyDispatch\((.*)\)$/);
       assert.ok(match, `unexpected evalScript payload: ${script}`);
@@ -89,6 +90,7 @@ async function main() {
   context.globalThis = context;
   vm.runInNewContext(fs.readFileSync(bundlePath, "utf8"), context, { filename: bundlePath });
   await waitForMicrotasks();
+  await waitForMicrotasks();
 
   assert.ok(socketInstance);
   assert.ok(loadedScripts[0].includes("/dist/json.jsx"));
@@ -98,6 +100,8 @@ async function main() {
   assert.ok(runtimeChecks[0].includes("typeof adobepyDomHasMethod"));
   assert.strictEqual(sent[0].type, "hello");
   assert.strictEqual(sent[0].capabilities.host, "after-effects");
+  assert.strictEqual(sent[0].identity.bridge.installedPluginRoot, "C:/extension");
+  assert.strictEqual(sent[0].identity.bridge.moduleOrigin, "C:/extension/dist/main.js");
   assert.ok(sent[0].capabilities.methods.dom.includes("snapshot"));
   assert.deepStrictEqual(sent[0].capabilities.methods.raw, ["evalExtendScript"]);
   await testIllustratorIdentityHello();

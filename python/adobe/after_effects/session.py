@@ -13,6 +13,7 @@ class AfterEffectsSession(HostSession):
         self.app = AfterEffectsApp(self)
 
 
+
 class AfterEffects(AfterEffectsSession):
     def __init__(
         self,
