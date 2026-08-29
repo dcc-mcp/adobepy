@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -59,6 +59,20 @@ type IllustratorResult = Result<IllustratorBootstrapResult, Box<RpcErrorResponse
 const BOOTSTRAP_BLOCKING_CAPACITY: usize = 2;
 const BOOTSTRAP_BLOCKING_QUEUE: usize = 2;
 const BOOTSTRAP_CLEANUP_CAPACITY: usize = 1;
+const BOOTSTRAP_RECOVERY_GRACE_MS: u64 = 175;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+enum BootstrapPhase {
+    Reservation = 0,
+    Prepare = 1,
+    Transaction = 2,
+    Launch = 3,
+    Verify = 4,
+    Commit = 5,
+    ReceiptConfirmation = 6,
+    ReceiptPersistence = 7,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockingBoundaryError {
@@ -395,6 +409,7 @@ struct BootstrapGrant {
     module_sha256: String,
     transaction: Option<Arc<dyn PhotoshopBootstrapTransaction>>,
     completion: watch::Sender<Option<BootstrapResult>>,
+    phase: Arc<AtomicU8>,
 }
 
 struct BootstrapTransactionGuard {
@@ -850,7 +865,7 @@ impl BrokerState {
             let grants = self.bootstrap_grants.lock().await;
             grants.get(&key).map(|grant| {
                 if grant.request == request {
-                    Ok(grant.completion.subscribe())
+                    Ok((grant.completion.subscribe(), grant.phase.clone()))
                 } else {
                     Err(identity_error(
                         ERROR_IDENTITY_AMBIGUOUS,
@@ -864,8 +879,14 @@ impl BrokerState {
             return Err(bootstrap_timeout_error(&request, "reservation"));
         }
         if let Some(waiter) = initial_waiter {
+            let (completion, phase) = waiter?;
             return self
-                .wait_for_bootstrap_completion(&request, deadline, waiter?)
+                .wait_for_bootstrap_completion_with_phase(
+                    &request,
+                    deadline,
+                    completion,
+                    Some(phase),
+                )
                 .await;
         }
 
@@ -878,7 +899,7 @@ impl BrokerState {
                 let grants = self.bootstrap_grants.lock().await;
                 grants.get(&key).map(|grant| {
                     if grant.request == request {
-                        Ok(grant.completion.subscribe())
+                        Ok((grant.completion.subscribe(), grant.phase.clone()))
                     } else {
                         Err(identity_error(
                             ERROR_IDENTITY_AMBIGUOUS,
@@ -892,8 +913,14 @@ impl BrokerState {
                 return Err(bootstrap_timeout_error(&request, "reservation"));
             }
             if let Some(waiter) = in_flight_waiter {
+                let (completion, phase) = waiter?;
                 return self
-                    .wait_for_bootstrap_completion(&request, deadline, waiter?)
+                    .wait_for_bootstrap_completion_with_phase(
+                        &request,
+                        deadline,
+                        completion,
+                        Some(phase),
+                    )
                     .await;
             }
             let identity = self
@@ -917,6 +944,7 @@ impl BrokerState {
                     PhotoshopBootstrapStatus::AlreadyReady,
                     deadline,
                     None,
+                    None,
                 )
                 .await;
         }
@@ -935,7 +963,7 @@ impl BrokerState {
                         json!({"target": request.target}),
                     ));
                 }
-                Some(grant) => Some(grant.completion.subscribe()),
+                Some(grant) => Some((grant.completion.subscribe(), grant.phase.clone())),
                 None => {
                     let (completion, _) = watch::channel::<Option<BootstrapResult>>(None);
                     grants.insert(
@@ -951,6 +979,7 @@ impl BrokerState {
                             module_sha256: module_sha256.clone(),
                             transaction: None,
                             completion,
+                            phase: Arc::new(AtomicU8::new(BootstrapPhase::Reservation as u8)),
                         },
                     );
                     None
@@ -958,8 +987,14 @@ impl BrokerState {
             }
         };
         if let Some(waiter) = follower {
+            let (completion, phase) = waiter;
             return self
-                .wait_for_bootstrap_completion(&request, deadline, waiter)
+                .wait_for_bootstrap_completion_with_phase(
+                    &request,
+                    deadline,
+                    completion,
+                    Some(phase),
+                )
                 .await;
         }
         let mut transaction_guard = BootstrapTransactionGuard::new(
@@ -968,8 +1003,16 @@ impl BrokerState {
             self.bootstrap_blocking.clone(),
             "Photoshop",
         );
+        let phase = {
+            let grants = self.bootstrap_grants.lock().await;
+            grants
+                .get(&key)
+                .map(|grant| grant.phase.clone())
+                .expect("bootstrap owner grant is present")
+        };
 
         let owner_result: BootstrapResult = async {
+            phase.store(BootstrapPhase::Prepare as u8, Ordering::SeqCst);
             let prepared = {
                 let backend = self.bootstrap_backend.clone();
                 let request = request.clone();
@@ -999,6 +1042,7 @@ impl BrokerState {
                 )
             })?;
             let ownership_cancelled = Arc::new(AtomicBool::new(false));
+            phase.store(BootstrapPhase::Transaction as u8, Ordering::SeqCst);
             let transaction = {
                 let backend = self.bootstrap_backend.clone();
                 let ownership_cancelled = ownership_cancelled.clone();
@@ -1088,6 +1132,7 @@ impl BrokerState {
                 transaction.revoke();
                 return Err(bootstrap_timeout_error(&request, "prepare_activation"));
             }
+            phase.store(BootstrapPhase::Launch as u8, Ordering::SeqCst);
             let launch_cancelled = {
                 let grants = self.bootstrap_grants.lock().await;
                 grants
@@ -1158,6 +1203,7 @@ impl BrokerState {
                 return Err(bootstrap_timeout_error(&request, "launch"));
             }
 
+            phase.store(BootstrapPhase::Verify as u8, Ordering::SeqCst);
             loop {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(bootstrap_timeout_error(&request, "verify"));
@@ -1200,6 +1246,7 @@ impl BrokerState {
                             };
                             transaction
                         };
+                        phase.store(BootstrapPhase::Commit as u8, Ordering::SeqCst);
                         let finalize = {
                             let transaction = transaction.clone();
                             self.bootstrap_blocking
@@ -1239,6 +1286,7 @@ impl BrokerState {
                                     json!({"stage": "commit"}),
                                 )
                             })?;
+                        phase.store(BootstrapPhase::ReceiptConfirmation as u8, Ordering::SeqCst);
                         return self
                             .record_bootstrap_result(
                                 identity,
@@ -1247,6 +1295,7 @@ impl BrokerState {
                                 PhotoshopBootstrapStatus::Ready,
                                 deadline,
                                 Some(&key),
+                                Some(&phase),
                             )
                             .await;
                     }
@@ -1376,6 +1425,7 @@ impl BrokerState {
                     module_sha256: module_sha256.clone(),
                     transaction: None,
                     completion,
+                    phase: Arc::new(AtomicU8::new(BootstrapPhase::Reservation as u8)),
                 },
             );
         }
@@ -2233,21 +2283,65 @@ impl BrokerState {
         Ok(receipt.result)
     }
 
+    #[cfg(test)]
     async fn wait_for_bootstrap_completion(
         &self,
         request: &PhotoshopBootstrapRequest,
         deadline: tokio::time::Instant,
+        completion: watch::Receiver<Option<BootstrapResult>>,
+    ) -> BootstrapResult {
+        self.wait_for_bootstrap_completion_with_phase(request, deadline, completion, None)
+            .await
+    }
+
+    async fn wait_for_bootstrap_completion_with_phase(
+        &self,
+        request: &PhotoshopBootstrapRequest,
+        deadline: tokio::time::Instant,
         mut completion: watch::Receiver<Option<BootstrapResult>>,
+        phase: Option<Arc<AtomicU8>>,
     ) -> BootstrapResult {
         loop {
             if tokio::time::Instant::now() >= deadline {
+                if phase.as_ref().is_some_and(|phase| {
+                    phase.load(Ordering::SeqCst) >= BootstrapPhase::Commit as u8
+                }) {
+                    let recovery_deadline = tokio::time::Instant::now()
+                        + Duration::from_millis(BOOTSTRAP_RECOVERY_GRACE_MS);
+                    if let Ok(Ok(())) =
+                        tokio::time::timeout_at(recovery_deadline, completion.changed()).await
+                    {
+                        if let Some(outcome) = completion.borrow().clone() {
+                            return outcome;
+                        }
+                    } else if let Some(outcome) = completion.borrow().clone() {
+                        return outcome;
+                    }
+                }
                 return Err(bootstrap_timeout_error(request, "transaction"));
             }
             if let Some(outcome) = completion.borrow().clone() {
                 return outcome;
             }
             match tokio::time::timeout_at(deadline, completion.changed()).await {
-                Err(_) => return Err(bootstrap_timeout_error(request, "transaction")),
+                Err(_) => {
+                    if phase.as_ref().is_some_and(|phase| {
+                        phase.load(Ordering::SeqCst) >= BootstrapPhase::Commit as u8
+                    }) {
+                        let recovery_deadline = tokio::time::Instant::now()
+                            + Duration::from_millis(BOOTSTRAP_RECOVERY_GRACE_MS);
+                        if let Ok(Ok(())) =
+                            tokio::time::timeout_at(recovery_deadline, completion.changed()).await
+                        {
+                            if let Some(outcome) = completion.borrow().clone() {
+                                return outcome;
+                            }
+                        } else if let Some(outcome) = completion.borrow().clone() {
+                            return outcome;
+                        }
+                    }
+                    return Err(bootstrap_timeout_error(request, "transaction"));
+                }
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     if let Some(outcome) = completion.borrow().clone() {
@@ -2380,6 +2474,7 @@ impl BrokerState {
         status: PhotoshopBootstrapStatus,
         deadline: tokio::time::Instant,
         owner_key: Option<&str>,
+        phase: Option<&Arc<AtomicU8>>,
     ) -> BootstrapResult {
         let broker_attestation = {
             let backend = self.bootstrap_backend.clone();
@@ -2518,6 +2613,9 @@ impl BrokerState {
                     json!({"stage": "receipt"}),
                 )
             })?;
+            if let Some(phase) = phase {
+                phase.store(BootstrapPhase::ReceiptPersistence as u8, Ordering::SeqCst);
+            }
             if tokio::time::Instant::now() >= deadline {
                 transaction.revoke();
                 return Err(bootstrap_timeout_error(request, "receipt"));
@@ -3705,6 +3803,86 @@ fn validate_bridge_identity_claim(
             ));
         }
     }
+    if capabilities.host == HostKind::AfterEffects {
+        validate_after_effects_identity_claim(capabilities, host, bridge)?;
+    }
+    Ok(())
+}
+
+fn validate_after_effects_identity_claim(
+    capabilities: &adobepy_protocol::Capabilities,
+    host: &adobepy_protocol::HostIdentityClaim,
+    bridge: &adobepy_protocol::BridgeInstanceClaim,
+) -> Result<(), Box<RpcErrorResponse>> {
+    if capabilities.bridge_kind != adobepy_protocol::BridgeKind::Cep {
+        return Err(identity_error(
+            ERROR_IDENTITY_MISMATCH,
+            "After Effects runtime identity requires the CEP bridge",
+            json!({"field": "bridge.bridgeKind"}),
+        ));
+    }
+    let executable = host
+        .executable_path
+        .as_deref()
+        .and_then(|path| normalized_absolute_path(path))
+        .and_then(|path| path.rsplit('/').next().map(str::to_ascii_lowercase));
+    if !matches!(executable.as_deref(), Some("afterfx.exe" | "afterfx")) {
+        return Err(identity_error(
+            ERROR_IDENTITY_MISMATCH,
+            "After Effects runtime identity requires an AfterFX executable",
+            json!({"field": "host.executablePath"}),
+        ));
+    }
+    let Some(plugin_root) = bridge
+        .installed_plugin_root
+        .as_deref()
+        .and_then(normalized_absolute_path)
+    else {
+        return Err(identity_error(
+            ERROR_IDENTITY_UNAVAILABLE,
+            "After Effects CEP plugin identity is unavailable",
+            json!({"missingFields": ["bridge.installedPluginRoot"]}),
+        ));
+    };
+    let Some(module_origin) = bridge
+        .module_origin
+        .as_deref()
+        .and_then(normalized_absolute_path)
+    else {
+        return Err(identity_error(
+            ERROR_IDENTITY_UNAVAILABLE,
+            "After Effects CEP module identity is unavailable",
+            json!({"missingFields": ["bridge.moduleOrigin"]}),
+        ));
+    };
+    let case_insensitive = plugin_root.as_bytes().get(1) == Some(&b':');
+    let (root, module) = if case_insensitive {
+        (
+            plugin_root.to_ascii_lowercase(),
+            module_origin.to_ascii_lowercase(),
+        )
+    } else {
+        (plugin_root.clone(), module_origin)
+    };
+    if !root.ends_with("/com.adobepy.bridge.after-effects")
+        || module != format!("{root}/dist/main.js")
+    {
+        return Err(identity_error(
+            ERROR_IDENTITY_MISMATCH,
+            "After Effects CEP module origin is not the installed entrypoint",
+            json!({"field": "bridge.moduleOrigin"}),
+        ));
+    }
+    if host.profile_id.as_deref().is_some_and(|profile| {
+        let profile = profile.to_ascii_lowercase();
+        profile.contains("illustrator") || profile.contains("photoshop")
+    }) {
+        return Err(identity_error(
+            ERROR_IDENTITY_MISMATCH,
+            "After Effects runtime identity profile belongs to a foreign host",
+            json!({"field": "host.profileId"}),
+        ));
+    }
     Ok(())
 }
 
@@ -4781,6 +4959,37 @@ mod tests {
         }
     }
 
+    fn after_effects_caps() -> Capabilities {
+        let mut methods = BTreeMap::new();
+        methods.insert("app".into(), vec!["getVersion".into()]);
+        Capabilities {
+            host: HostKind::AfterEffects,
+            bridge_kind: BridgeKind::Cep,
+            bridge_version: "0.1.0".into(),
+            host_version: Some("25.0.0".into()),
+            namespaces: vec!["app".into()],
+            features: vec![],
+            methods,
+        }
+    }
+
+    fn after_effects_identity_claim() -> BridgeIdentityClaim {
+        BridgeIdentityClaim {
+            host: adobepy_protocol::HostIdentityClaim {
+                pid: Some(4200),
+                process_start_identity: Some("windows:133700000000000100".into()),
+                executable_path: Some("C:/Program Files/Adobe/After Effects 2025/Support Files/AfterFX.exe".into()),
+                host_version: Some("25.0.0".into()),
+                profile_id: Some("after-effects-production".into()),
+            },
+            bridge: adobepy_protocol::BridgeInstanceClaim {
+                instance_id: Some("9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99".into()),
+                installed_plugin_root: Some("C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.after-effects".into()),
+                module_origin: Some("C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.after-effects/dist/main.js".into()),
+            },
+        }
+    }
+
     async fn publish_matching_illustrator_session(state: &BrokerState) {
         let (nonce, observed) = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -5577,6 +5786,57 @@ mod tests {
         version_mismatch.host.host_version = Some("25.0".into());
         let error = validate_bridge_identity_claim("default", &caps(), Some(&version_mismatch))
             .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
+    }
+
+    #[test]
+    fn after_effects_identity_is_host_specific_and_entrypoint_bound() {
+        let caps = after_effects_caps();
+        let valid = after_effects_identity_claim();
+        validate_bridge_identity_claim("default", &caps, Some(&valid)).unwrap();
+
+        for (claim, field) in [
+            (
+                {
+                    let mut claim = valid.clone();
+                    claim.host.executable_path = Some("C:/Adobe/Illustrator.exe".into());
+                    claim
+                },
+                "host.executablePath",
+            ),
+            (
+                {
+                    let mut claim = valid.clone();
+                    claim.bridge.module_origin = Some("C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.after-effects/dist/shadow.js".into());
+                    claim
+                },
+                "bridge.moduleOrigin",
+            ),
+            (
+                {
+                    let mut claim = valid.clone();
+                    claim.host.profile_id = Some("illustrator-production".into());
+                    claim
+                },
+                "host.profileId",
+            ),
+        ] {
+            let error = validate_bridge_identity_claim("default", &caps, Some(&claim)).unwrap_err();
+            assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH, "{field}");
+            assert_eq!(
+                error
+                    .error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data["field"].as_str()),
+                Some(field)
+            );
+        }
+
+        let mut wrong_bridge = caps.clone();
+        wrong_bridge.bridge_kind = BridgeKind::Uxp;
+        let error =
+            validate_bridge_identity_claim("default", &wrong_bridge, Some(&valid)).unwrap_err();
         assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
     }
 
@@ -6726,7 +6986,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         stages.sort_unstable();
-        assert_eq!(stages, ["receipt", "transaction"]);
+        assert_eq!(stages, ["receipt", "receipt"]);
         assert_eq!(backend.finalizes.load(Ordering::SeqCst), 1);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
         assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
@@ -7220,6 +7480,23 @@ mod tests {
             let state = state.clone();
             async move { state.bootstrap_photoshop(request).await }
         });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let follower_is_waiting = state
+                    .bootstrap_grants
+                    .lock()
+                    .await
+                    .get(&session_key(HostKind::Photoshop, "retouch"))
+                    .is_some_and(|grant| grant.completion.receiver_count() >= 1);
+                if follower_is_waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the confirmation follower must subscribe before the deadline");
 
         let owner_error = tokio::time::timeout(Duration::from_millis(500), owner)
             .await

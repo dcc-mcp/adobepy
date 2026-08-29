@@ -51,6 +51,7 @@ async function main() {
     evalScript(script, callback) {
       if (script.startsWith("$.evalFile(")) { loadedScripts.push(script); callback("true"); return; }
       if (script.includes("typeof adobepyDispatch")) { runtimeChecks.push(script); callback("ready"); return; }
+      if (script.includes("typeof app === \"object\"")) { callback("25.0.0"); return; }
       evalScripts.push(script);
       const match = script.match(/^adobepyDispatch\((.*)\)$/);
       assert.ok(match, `unexpected evalScript payload: ${script}`);
@@ -88,6 +89,7 @@ async function main() {
   };
   context.globalThis = context;
   vm.runInNewContext(fs.readFileSync(bundlePath, "utf8"), context, { filename: bundlePath });
+  await waitForMicrotasks();
   await waitForMicrotasks();
 
   assert.ok(socketInstance);
