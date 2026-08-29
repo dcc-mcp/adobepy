@@ -412,6 +412,13 @@ struct BootstrapGrant {
     phase: Arc<AtomicU8>,
 }
 
+struct BootstrapRecordContext<'a> {
+    status: PhotoshopBootstrapStatus,
+    deadline: tokio::time::Instant,
+    owner_key: Option<&'a str>,
+    phase: Option<&'a Arc<AtomicU8>>,
+}
+
 struct BootstrapTransactionGuard {
     key: String,
     grants: Arc<Mutex<HashMap<String, BootstrapGrant>>>,
@@ -941,10 +948,12 @@ impl BrokerState {
                     identity,
                     &request,
                     &module_sha256,
-                    PhotoshopBootstrapStatus::AlreadyReady,
-                    deadline,
-                    None,
-                    None,
+                    BootstrapRecordContext {
+                        status: PhotoshopBootstrapStatus::AlreadyReady,
+                        deadline,
+                        owner_key: None,
+                        phase: None,
+                    },
                 )
                 .await;
         }
@@ -1292,10 +1301,12 @@ impl BrokerState {
                                 identity,
                                 &request,
                                 &grant_module_sha256,
-                                PhotoshopBootstrapStatus::Ready,
-                                deadline,
-                                Some(&key),
-                                Some(&phase),
+                                BootstrapRecordContext {
+                                    status: PhotoshopBootstrapStatus::Ready,
+                                    deadline,
+                                    owner_key: Some(&key),
+                                    phase: Some(&phase),
+                                },
                             )
                             .await;
                     }
@@ -2471,11 +2482,14 @@ impl BrokerState {
         identity: RuntimeIdentityAttestation,
         request: &PhotoshopBootstrapRequest,
         module_sha256: &str,
-        status: PhotoshopBootstrapStatus,
-        deadline: tokio::time::Instant,
-        owner_key: Option<&str>,
-        phase: Option<&Arc<AtomicU8>>,
+        context: BootstrapRecordContext<'_>,
     ) -> BootstrapResult {
+        let BootstrapRecordContext {
+            status,
+            deadline,
+            owner_key,
+            phase,
+        } = context;
         let broker_attestation = {
             let backend = self.bootstrap_backend.clone();
             let path = identity.broker.executable_path.clone();
@@ -3824,7 +3838,7 @@ fn validate_after_effects_identity_claim(
     let executable = host
         .executable_path
         .as_deref()
-        .and_then(|path| normalized_absolute_path(path))
+        .and_then(normalized_absolute_path)
         .and_then(|path| path.rsplit('/').next().map(str::to_ascii_lowercase));
     if !matches!(executable.as_deref(), Some("afterfx.exe" | "afterfx")) {
         return Err(identity_error(
@@ -3899,6 +3913,17 @@ fn complete_runtime_identity(
             json!({"host": session.capabilities.host.as_str(), "target": session.target, "missingFields": ["identity"]}),
         ));
     };
+    if session.capabilities.host == HostKind::AfterEffects {
+        return Err(identity_error(
+            ERROR_IDENTITY_UNAVAILABLE,
+            "After Effects runtime identity requires an adapter-owned launch receipt",
+            json!({
+                "host": session.capabilities.host.as_str(),
+                "target": session.target,
+                "missingFields": ["adapterOwnedLaunchReceipt"]
+            }),
+        ));
+    }
     let mut missing = Vec::new();
     if identity.host.pid.is_none() {
         missing.push("host.pid");
