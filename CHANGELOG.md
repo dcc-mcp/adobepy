@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.9.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.8.0...adobepy-v0.9.0) (2026-08-28)
+
+
+### Features
+
+* attest Illustrator CEP readiness ([befeb82](https://github.com/dcc-mcp/adobepy/commit/befeb8287321aa13452c435190f14c6422a42079))
+* bound bootstrap transaction ownership ([aaa4785](https://github.com/dcc-mcp/adobepy/commit/aaa4785139357d959dc877e730075ae125057a0f))
+
+
+### Bug Fixes
+
+* bind Illustrator recovery and connection ownership ([9854a23](https://github.com/dcc-mcp/adobepy/commit/9854a230e382e10874315e6884eb0a33ef97c557))
+* bound bootstrap commit confirmation ([fb7172f](https://github.com/dcc-mcp/adobepy/commit/fb7172f9573a829c7a77b6834d367e4646946d04))
+* **broker:** make bootstrap recovery cancellation-safe ([5d18d0e](https://github.com/dcc-mcp/adobepy/commit/5d18d0e0dc17ec9f8fdd598a8c24846d63be5d3e))
+* **broker:** release failed config reservations ([60b92fa](https://github.com/dcc-mcp/adobepy/commit/60b92fabd84566f012f0cee1122b2a129010633e))
+* **broker:** retain poison after rollback errors ([5a0a418](https://github.com/dcc-mcp/adobepy/commit/5a0a418f678965ef160b57ace3b121b3fa422f45))
+* **broker:** revalidate bootstrap commit ownership ([6c7255c](https://github.com/dcc-mcp/adobepy/commit/6c7255cf8113596b0dd4255e0d56373b73cf37f5))
+* close bootstrap ownership gaps ([1ceb3fa](https://github.com/dcc-mcp/adobepy/commit/1ceb3fac8e2a3d8596d62c0f2809b5d687979c08))
+* gate Windows bootstrap test hook ([834a56d](https://github.com/dcc-mcp/adobepy/commit/834a56d970acb254bfdc85104c3546c7d952a215))
+* harden bootstrap process ownership ([d8de492](https://github.com/dcc-mcp/adobepy/commit/d8de49254b1ed19c8990734369e2da7af4cbab25))
+* harden Illustrator bootstrap transaction ([1749476](https://github.com/dcc-mcp/adobepy/commit/174947644c5ceaf85b7dcdf56549bc08284fdbdd))
+* reserve bootstrap cleanup capacity ([35ae662](https://github.com/dcc-mcp/adobepy/commit/35ae6620476318df8b8b49ee6b20e0fe8a9dc6cb))
+* stabilize bootstrap ownership gates ([866548b](https://github.com/dcc-mcp/adobepy/commit/866548bb6a90aea2da4dce9813200c1ee9315bb2))
+* wire public bootstrap ownership ([1daf290](https://github.com/dcc-mcp/adobepy/commit/1daf290eaa7215074d3d072ac1830d3bff14046a))
+
 ## [0.8.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.7.0...adobepy-v0.8.0) (2026-08-25)
 
 
