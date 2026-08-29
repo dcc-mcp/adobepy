@@ -25,6 +25,7 @@ pub const ERROR_IDENTITY_MISMATCH: i32 = -32013;
 pub const RUNTIME_IDENTITY_VERSION: u8 = 1;
 pub const PHOTOSHOP_BOOTSTRAP_VERSION: u8 = 1;
 pub const ILLUSTRATOR_BOOTSTRAP_VERSION: u8 = 1;
+pub const AFTER_EFFECTS_BOOTSTRAP_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HostKind {
@@ -541,6 +542,20 @@ pub struct IllustratorBootstrapResult {
 pub struct IllustratorBootstrapVerifyRequest {
     pub receipt_id: String,
 }
+
+/// After Effects CEP uses the same bounded, fixed-file bootstrap shape as the
+/// Illustrator CEP bridge. Keep a distinct public name so adapters cannot
+/// accidentally target the wrong host route.
+pub type AfterEffectsHostTarget = IllustratorHostTarget;
+pub type AfterEffectsPluginTarget = IllustratorPluginTarget;
+pub type AfterEffectsBootstrapRequest = IllustratorBootstrapRequest;
+pub type AfterEffectsBootstrapStatus = IllustratorBootstrapStatus;
+pub type AfterEffectsBrokerBinding = IllustratorBrokerBinding;
+pub type AfterEffectsHostBinding = IllustratorHostBinding;
+pub type AfterEffectsPluginBinding = IllustratorPluginBinding;
+pub type AfterEffectsBootstrapContinuation = IllustratorBootstrapContinuation;
+pub type AfterEffectsBootstrapResult = IllustratorBootstrapResult;
+pub type AfterEffectsBootstrapVerifyRequest = IllustratorBootstrapVerifyRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

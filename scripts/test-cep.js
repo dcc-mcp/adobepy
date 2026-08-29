@@ -98,6 +98,8 @@ async function main() {
   assert.ok(runtimeChecks[0].includes("typeof adobepyDomHasMethod"));
   assert.strictEqual(sent[0].type, "hello");
   assert.strictEqual(sent[0].capabilities.host, "after-effects");
+  assert.strictEqual(sent[0].identity.bridge.installedPluginRoot, "C:/extension");
+  assert.strictEqual(sent[0].identity.bridge.moduleOrigin, "C:/extension/dist/main.js");
   assert.ok(sent[0].capabilities.methods.dom.includes("snapshot"));
   assert.deepStrictEqual(sent[0].capabilities.methods.raw, ["evalExtendScript"]);
   await testIllustratorIdentityHello();

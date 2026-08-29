@@ -15,6 +15,12 @@ from .illustrator_bootstrap import (
     IllustratorBootstrapRequest,
     IllustratorBootstrapResult,
 )
+from .after_effects_bootstrap import (
+    AFTER_EFFECTS_VERIFY_PATH,
+    AfterEffectsBootstrapContinuation,
+    AfterEffectsBootstrapRequest,
+    AfterEffectsBootstrapResult,
+)
 from .photoshop_bootstrap import (
     PhotoshopBootstrapContinuation,
     PhotoshopBootstrapRequest,
@@ -173,6 +179,42 @@ class BrokerClient:
         self, continuation: IllustratorBootstrapContinuation
     ) -> IllustratorBootstrapResult:
         return await _to_thread(self.verify_illustrator_bootstrap, continuation)
+
+    def bootstrap_after_effects_cep(
+        self, request: AfterEffectsBootstrapRequest
+    ) -> AfterEffectsBootstrapResult:
+        data = self._post_json("/v1/after-effects/bootstrap", request.to_wire())
+        if "error" in data:
+            raise error_from_rpc(data["error"], data)
+        # The broker keeps one hardened CEP transaction implementation; expose
+        # the host-specific continuation path to callers.
+        if isinstance(data.get("continuation"), dict):
+            data["continuation"]["path"] = AFTER_EFFECTS_VERIFY_PATH
+        return AfterEffectsBootstrapResult.from_broker(data).require_request(request)
+
+    async def bootstrap_after_effects_cep_async(
+        self, request: AfterEffectsBootstrapRequest
+    ) -> AfterEffectsBootstrapResult:
+        return await _to_thread(self.bootstrap_after_effects_cep, request)
+
+    def verify_after_effects_bootstrap(
+        self, continuation: AfterEffectsBootstrapContinuation
+    ) -> AfterEffectsBootstrapResult:
+        data = self._post_json(
+            continuation.path, {"receiptId": continuation.receipt_id}
+        )
+        if "error" in data:
+            raise error_from_rpc(data["error"], data)
+        if isinstance(data.get("continuation"), dict):
+            data["continuation"]["path"] = AFTER_EFFECTS_VERIFY_PATH
+        return AfterEffectsBootstrapResult.from_broker(data).require_continuation(
+            continuation
+        )
+
+    async def verify_after_effects_bootstrap_async(
+        self, continuation: AfterEffectsBootstrapContinuation
+    ) -> AfterEffectsBootstrapResult:
+        return await _to_thread(self.verify_after_effects_bootstrap, continuation)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}

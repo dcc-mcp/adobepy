@@ -1,10 +1,12 @@
 import { startCepBridge } from "../../core/src/rpc";
+import { afterEffectsRuntimeIdentity } from "./identity";
 
 startCepBridge({
   host: "after-effects",
   brokerUrl: (globalThis as any).__ADOBEPY_BROKER_URL || "ws://127.0.0.1:47391/v1/bridge/after-effects/ws",
   token: (globalThis as any).__ADOBEPY_TOKEN || "",
   target: (globalThis as any).__ADOBEPY_TARGET || "default",
+  identityProvider: afterEffectsRuntimeIdentity,
   capabilities: {
     host: "after-effects",
     bridgeKind: "cep",

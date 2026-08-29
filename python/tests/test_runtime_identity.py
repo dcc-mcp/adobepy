@@ -6,6 +6,7 @@ import urllib.request
 from unittest import mock
 
 from adobe.core import (
+    AfterEffectsBootstrapRequest,
     BrokerClient,
     HostSession,
     IdentityAmbiguousError,
@@ -60,6 +61,34 @@ class FakeResponse:
 
 
 class RuntimeIdentityTests(unittest.TestCase):
+    def test_after_effects_bootstrap_surface_is_bounded_and_typed(self):
+        request = AfterEffectsBootstrapRequest.from_mapping(
+            {
+                "bootstrapVersion": 1,
+                "target": "default",
+                "timeoutMs": 1000,
+                "host": {
+                    "executablePath": "C:/Adobe/AfterFX.exe",
+                    "executableBytes": 1,
+                    "executableSha256": "a" * 64,
+                    "hostVersion": "24.0.0",
+                    "profileId": "default",
+                },
+                "plugin": {
+                    "installedPluginRoot": "C:/CEP/com.adobepy.bridge.after-effects",
+                    "moduleOrigin": "C:/CEP/com.adobepy.bridge.after-effects/dist/main.js",
+                    "bridgeVersion": "0.1.0",
+                    "manifestBytes": 1,
+                    "manifestSha256": "b" * 64,
+                    "indexBytes": 1,
+                    "indexSha256": "c" * 64,
+                    "moduleBytes": 1,
+                    "moduleSha256": "d" * 64,
+                },
+            }
+        )
+        self.assertEqual(request.target, "default")
+        self.assertNotIn("token", json.dumps(request.to_wire()).lower())
     def test_typed_identity_roundtrip_is_bounded_and_secret_free(self):
         identity = RuntimeIdentityAttestation.from_broker(IDENTITY)
         self.assertEqual(identity.host.pid, 4200)

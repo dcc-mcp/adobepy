@@ -141,6 +141,21 @@ OS process observations and its owned install receipt. A missing
 `__ADOBEPY_HOST_IDENTITY` launch context therefore remains fail-closed even when
 `/health` and `/v1/capabilities` succeed.
 
+### 3.1 After Effects CEP identity
+
+The After Effects CEP hello includes a bounded `identity` claim. The broker
+returns a typed attestation containing broker PID/start identity, signed host
+executable path and version/profile, and CEP target, bridge version, connection
+epoch, installed plugin root, and loaded module origin. `moduleOrigin` must be
+`<installedPluginRoot>/dist/main.js`; path traversal, shadowed modules, stale
+PID/start pairs, foreign product/profile, target, or connection epoch are
+rejected with stable identity error codes (`-32010` through `-32013`).
+
+Bootstrap callers use `BrokerClient.bootstrap_after_effects_cep()` and then the
+fixed `POST /v1/after-effects/bootstrap/verify` continuation. The continuation
+is machine-executable and bounded; no arbitrary JSX, command, or UI fallback is
+part of the bootstrap contract.
+
 ---
 
 ## 4. Environment Variables for Consumer Handoff
