@@ -143,14 +143,13 @@ OS process observations and its owned install receipt. A missing
 
 ### 3.1 After Effects CEP identity
 
-The After Effects CEP hello includes a bounded `identity` claim. The broker
-validates the CEP bridge, `AfterFX` executable, fixed extension id, and exact
-`<installedPluginRoot>/dist/main.js` entrypoint. Path traversal, shadowed
-modules, stale PID/start pairs, foreign product/profile, target, or connection
-epoch are rejected with stable identity error codes (`-32010` through
-`-32013`). A complete runtime attestation is fail-closed until the adapter
-provides an adapter-owned launch/install receipt; CEP self-reported globals and
-package/build evidence are not host or installation proof.
+After Effects CEP identity is currently fail-closed. The broker does not return
+a complete runtime attestation from CEP self-reported globals: an
+adapter-owned launch/install receipt, including OS-bound host identity and
+installed/loaded module evidence, is required first. The receipt plumbing is a
+follow-up scope; until it exists, the broker rejects After Effects identity
+claims with `ERROR_IDENTITY_UNAVAILABLE` and no After Effects identity-backed
+bootstrap or readiness claim is made.
 
 No After Effects bootstrap endpoint is exposed until a host-specific launch,
 receipt, and nonce transaction exists. Adapters must not treat CEP identity or

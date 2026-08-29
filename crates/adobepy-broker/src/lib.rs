@@ -3738,6 +3738,17 @@ fn validate_bridge_identity_claim(
             json!({"field": "target"}),
         ));
     }
+    if capabilities.host == HostKind::AfterEffects {
+        return Err(identity_error(
+            ERROR_IDENTITY_UNAVAILABLE,
+            "After Effects runtime identity requires an adapter-owned launch receipt",
+            json!({
+                "host": capabilities.host.as_str(),
+                "target": target,
+                "missingFields": ["adapterOwnedLaunchReceipt"]
+            }),
+        ));
+    }
     if !is_bounded_text(&capabilities.bridge_version, 64)
         || capabilities
             .host_version
@@ -3817,86 +3828,6 @@ fn validate_bridge_identity_claim(
             ));
         }
     }
-    if capabilities.host == HostKind::AfterEffects {
-        validate_after_effects_identity_claim(capabilities, host, bridge)?;
-    }
-    Ok(())
-}
-
-fn validate_after_effects_identity_claim(
-    capabilities: &adobepy_protocol::Capabilities,
-    host: &adobepy_protocol::HostIdentityClaim,
-    bridge: &adobepy_protocol::BridgeInstanceClaim,
-) -> Result<(), Box<RpcErrorResponse>> {
-    if capabilities.bridge_kind != adobepy_protocol::BridgeKind::Cep {
-        return Err(identity_error(
-            ERROR_IDENTITY_MISMATCH,
-            "After Effects runtime identity requires the CEP bridge",
-            json!({"field": "bridge.bridgeKind"}),
-        ));
-    }
-    let executable = host
-        .executable_path
-        .as_deref()
-        .and_then(normalized_absolute_path)
-        .and_then(|path| path.rsplit('/').next().map(str::to_ascii_lowercase));
-    if !matches!(executable.as_deref(), Some("afterfx.exe" | "afterfx")) {
-        return Err(identity_error(
-            ERROR_IDENTITY_MISMATCH,
-            "After Effects runtime identity requires an AfterFX executable",
-            json!({"field": "host.executablePath"}),
-        ));
-    }
-    let Some(plugin_root) = bridge
-        .installed_plugin_root
-        .as_deref()
-        .and_then(normalized_absolute_path)
-    else {
-        return Err(identity_error(
-            ERROR_IDENTITY_UNAVAILABLE,
-            "After Effects CEP plugin identity is unavailable",
-            json!({"missingFields": ["bridge.installedPluginRoot"]}),
-        ));
-    };
-    let Some(module_origin) = bridge
-        .module_origin
-        .as_deref()
-        .and_then(normalized_absolute_path)
-    else {
-        return Err(identity_error(
-            ERROR_IDENTITY_UNAVAILABLE,
-            "After Effects CEP module identity is unavailable",
-            json!({"missingFields": ["bridge.moduleOrigin"]}),
-        ));
-    };
-    let case_insensitive = plugin_root.as_bytes().get(1) == Some(&b':');
-    let (root, module) = if case_insensitive {
-        (
-            plugin_root.to_ascii_lowercase(),
-            module_origin.to_ascii_lowercase(),
-        )
-    } else {
-        (plugin_root.clone(), module_origin)
-    };
-    if !root.ends_with("/com.adobepy.bridge.after-effects")
-        || module != format!("{root}/dist/main.js")
-    {
-        return Err(identity_error(
-            ERROR_IDENTITY_MISMATCH,
-            "After Effects CEP module origin is not the installed entrypoint",
-            json!({"field": "bridge.moduleOrigin"}),
-        ));
-    }
-    if host.profile_id.as_deref().is_some_and(|profile| {
-        let profile = profile.to_ascii_lowercase();
-        profile.contains("illustrator") || profile.contains("photoshop")
-    }) {
-        return Err(identity_error(
-            ERROR_IDENTITY_MISMATCH,
-            "After Effects runtime identity profile belongs to a foreign host",
-            json!({"field": "host.profileId"}),
-        ));
-    }
     Ok(())
 }
 
@@ -3913,17 +3844,6 @@ fn complete_runtime_identity(
             json!({"host": session.capabilities.host.as_str(), "target": session.target, "missingFields": ["identity"]}),
         ));
     };
-    if session.capabilities.host == HostKind::AfterEffects {
-        return Err(identity_error(
-            ERROR_IDENTITY_UNAVAILABLE,
-            "After Effects runtime identity requires an adapter-owned launch receipt",
-            json!({
-                "host": session.capabilities.host.as_str(),
-                "target": session.target,
-                "missingFields": ["adapterOwnedLaunchReceipt"]
-            }),
-        ));
-    }
     let mut missing = Vec::new();
     if identity.host.pid.is_none() {
         missing.push("host.pid");
@@ -5818,51 +5738,16 @@ mod tests {
     fn after_effects_identity_is_host_specific_and_entrypoint_bound() {
         let caps = after_effects_caps();
         let valid = after_effects_identity_claim();
-        validate_bridge_identity_claim("default", &caps, Some(&valid)).unwrap();
-
-        for (claim, field) in [
-            (
-                {
-                    let mut claim = valid.clone();
-                    claim.host.executable_path = Some("C:/Adobe/Illustrator.exe".into());
-                    claim
-                },
-                "host.executablePath",
-            ),
-            (
-                {
-                    let mut claim = valid.clone();
-                    claim.bridge.module_origin = Some("C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.after-effects/dist/shadow.js".into());
-                    claim
-                },
-                "bridge.moduleOrigin",
-            ),
-            (
-                {
-                    let mut claim = valid.clone();
-                    claim.host.profile_id = Some("illustrator-production".into());
-                    claim
-                },
-                "host.profileId",
-            ),
-        ] {
-            let error = validate_bridge_identity_claim("default", &caps, Some(&claim)).unwrap_err();
-            assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH, "{field}");
-            assert_eq!(
-                error
-                    .error
-                    .data
-                    .as_ref()
-                    .and_then(|data| data["field"].as_str()),
-                Some(field)
-            );
-        }
-
-        let mut wrong_bridge = caps.clone();
-        wrong_bridge.bridge_kind = BridgeKind::Uxp;
-        let error =
-            validate_bridge_identity_claim("default", &wrong_bridge, Some(&valid)).unwrap_err();
-        assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
+        let error = validate_bridge_identity_claim("default", &caps, Some(&valid)).unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_UNAVAILABLE);
+        assert_eq!(
+            error
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data["missingFields"][0].as_str()),
+            Some("adapterOwnedLaunchReceipt")
+        );
     }
 
     #[tokio::test]
