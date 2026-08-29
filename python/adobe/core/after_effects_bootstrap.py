@@ -1,7 +1,7 @@
 """Bounded After Effects CEP bootstrap contract."""
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict
 
 from .illustrator_bootstrap import (
     IllustratorAdapterContinuation,
@@ -30,7 +30,7 @@ class AfterEffectsBootstrapContinuation(IllustratorBootstrapContinuation):
         parsed = IllustratorBootstrapContinuation.from_mapping(normalized)
         return cls(parsed.method, AFTER_EFFECTS_VERIFY_PATH, parsed.receipt_id, parsed.timeout_ms)
 
-    def to_wire(self) -> dict[str, Any]:
+    def to_wire(self) -> Dict[str, Any]:
         return {"method": "POST", "path": AFTER_EFFECTS_VERIFY_PATH, "receiptId": self.receipt_id, "timeoutMs": self.timeout_ms}
 
 
