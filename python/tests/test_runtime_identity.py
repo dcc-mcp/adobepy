@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import inspect
 import unittest
 import urllib.request
 from unittest import mock
 
 from adobe.core import (
-    AfterEffectsBootstrapRequest,
     BrokerClient,
     HostSession,
     IdentityAmbiguousError,
@@ -15,11 +13,6 @@ from adobe.core import (
     IdentityStaleError,
     IdentityUnavailableError,
     RuntimeIdentityAttestation,
-)
-from adobe.core.after_effects_bootstrap import (
-    AFTER_EFFECTS_VERIFY_PATH,
-    AfterEffectsBootstrapContinuation,
-    AfterEffectsBootstrapResult,
 )
 from adobe.core.errors import error_from_rpc
 
@@ -67,85 +60,6 @@ class FakeResponse:
 
 
 class RuntimeIdentityTests(unittest.TestCase):
-    def test_after_effects_bootstrap_module_imports_on_python_38(self):
-        from adobe.core import after_effects_bootstrap
-
-        # Python 3.8 evaluates annotations at class definition time. Keep the
-        # module on typing.Dict rather than PEP 585 built-in generics.
-        self.assertIn("Dict[str, Any]", inspect.getsource(after_effects_bootstrap))
-
-    def test_after_effects_bootstrap_surface_is_bounded_and_typed(self):
-        request = AfterEffectsBootstrapRequest.from_mapping(
-            {
-                "bootstrapVersion": 1,
-                "target": "default",
-                "timeoutMs": 1000,
-                "host": {
-                    "executablePath": "C:/Adobe/AfterFX.exe",
-                    "executableBytes": 1,
-                    "executableSha256": "a" * 64,
-                    "hostVersion": "24.0.0",
-                    "profileId": "default",
-                },
-                "plugin": {
-                    "installedPluginRoot": "C:/CEP/com.adobepy.bridge.after-effects",
-                    "moduleOrigin": "C:/CEP/com.adobepy.bridge.after-effects/dist/main.js",
-                    "bridgeVersion": "0.1.0",
-                    "manifestBytes": 1,
-                    "manifestSha256": "b" * 64,
-                    "indexBytes": 1,
-                    "indexSha256": "c" * 64,
-                    "moduleBytes": 1,
-                    "moduleSha256": "d" * 64,
-                },
-            }
-        )
-        self.assertEqual(request.target, "default")
-        self.assertNotIn("token", json.dumps(request.to_wire()).lower())
-
-    def test_after_effects_fixed_continuation_and_result_are_strict(self):
-        continuation = AfterEffectsBootstrapContinuation.from_mapping(
-            {
-                "method": "POST",
-                "path": AFTER_EFFECTS_VERIFY_PATH,
-                "receiptId": IDENTITY["broker"]["instanceId"],
-                "timeoutMs": 1000,
-            }
-        )
-        self.assertEqual(continuation.to_wire()["path"], AFTER_EFFECTS_VERIFY_PATH)
-        payload = {
-            "bootstrapVersion": 1,
-            "status": "ready",
-            "identityFingerprint": "a" * 64,
-            "broker": {
-                "pid": 1,
-                "processStartIdentity": "windows:1",
-                "runtimeVersion": "0.9.0",
-                "instanceId": IDENTITY["broker"]["instanceId"],
-                "executableSha256": "b" * 64,
-            },
-            "host": {
-                "pid": 2,
-                "processStartIdentity": "windows:2",
-                "hostVersion": "24.0.0",
-                "profileId": "default",
-                "instanceId": IDENTITY["broker"]["instanceId"],
-                "executableSha256": "c" * 64,
-            },
-            "plugin": {
-                "target": "default",
-                "connectedAtEpochMs": 10,
-                "instanceId": IDENTITY["broker"]["instanceId"],
-                "bridgeVersion": "0.1.0",
-                "moduleSha256": "d" * 64,
-            },
-            "continuation": continuation.to_wire(),
-            "adapterContinuation": {"kind": "command", "argv": ["dcc-mcp-after-effects", "verify", "--json"]},
-        }
-        result = AfterEffectsBootstrapResult.from_broker(payload)
-        self.assertEqual(result.adapter_continuation.argv[0], "dcc-mcp-after-effects")
-        with self.assertRaises(ValueError):
-            AfterEffectsBootstrapContinuation.from_mapping({**continuation.to_wire(), "path": "/v1/rpc"})
     def test_typed_identity_roundtrip_is_bounded_and_secret_free(self):
         identity = RuntimeIdentityAttestation.from_broker(IDENTITY)
         self.assertEqual(identity.host.pid, 4200)

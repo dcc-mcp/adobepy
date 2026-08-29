@@ -32,11 +32,6 @@ from .illustrator_bootstrap import (
     IllustratorPluginBinding,
     IllustratorPluginTarget,
 )
-from .after_effects_bootstrap import (
-    AfterEffectsBootstrapContinuation,
-    AfterEffectsBootstrapRequest,
-    AfterEffectsBootstrapResult,
-)
 from .photoshop_bootstrap import (
     PhotoshopBootstrapContinuation,
     PhotoshopBootstrapRequest,
@@ -71,9 +66,6 @@ __all__ = [
     "IdentityMismatchError",
     "IdentityStaleError",
     "IdentityUnavailableError",
-    "AfterEffectsBootstrapContinuation",
-    "AfterEffectsBootstrapRequest",
-    "AfterEffectsBootstrapResult",
     "IllustratorAdapterContinuation",
     "IllustratorBootstrapContinuation",
     "IllustratorBootstrapRequest",

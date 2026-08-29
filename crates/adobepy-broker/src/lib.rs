@@ -1,6 +1,5 @@
 use adobepy_protocol::{
-    session_key, AfterEffectsBootstrapRequest, AfterEffectsBootstrapVerifyRequest,
-    BootstrapAdapterContinuation, BootstrapBrokerBinding, BootstrapHostBinding,
+    session_key, BootstrapAdapterContinuation, BootstrapBrokerBinding, BootstrapHostBinding,
     BootstrapPluginBinding, BridgeIdentityClaim, BridgeInbound, BridgeOutbound,
     BridgeRuntimeIdentity, BridgeSessionInfo, BrokerRuntimeIdentity, HostKind, HostRuntimeIdentity,
     IllustratorBootstrapContinuation, IllustratorBootstrapRequest, IllustratorBootstrapResult,
@@ -3019,11 +3018,6 @@ fn broker_router(state: BrokerState) -> Router {
             "/v1/illustrator/bootstrap/verify",
             post(verify_illustrator_bootstrap),
         )
-        .route("/v1/after-effects/bootstrap", post(after_effects_bootstrap))
-        .route(
-            "/v1/after-effects/bootstrap/verify",
-            post(verify_after_effects_bootstrap),
-        )
         .route("/v1/rpc", post(http_rpc))
         .route("/v1/client/ws", get(client_ws))
         .route("/v1/bridge/{host}/ws", get(bridge_ws))
@@ -3112,39 +3106,6 @@ async fn verify_illustrator_bootstrap(
     State(state): State<BrokerState>,
     headers: HeaderMap,
     Json(request): Json<IllustratorBootstrapVerifyRequest>,
-) -> Response {
-    if !state.authorized(&headers) {
-        return unauthorized_response();
-    }
-    match state
-        .verify_illustrator_bootstrap(&request.receipt_id)
-        .await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(error) => Json(*error).into_response(),
-    }
-}
-
-async fn after_effects_bootstrap(
-    State(state): State<BrokerState>,
-    headers: HeaderMap,
-    Json(request): Json<AfterEffectsBootstrapRequest>,
-) -> Response {
-    if !state.authorized(&headers) {
-        return unauthorized_response();
-    }
-    // The bounded CEP transaction is shared with the Illustrator backend, but
-    // the route and typed request remain host-specific for adapter contracts.
-    match state.bootstrap_illustrator(request).await {
-        Ok(result) => Json(result).into_response(),
-        Err(error) => Json(*error).into_response(),
-    }
-}
-
-async fn verify_after_effects_bootstrap(
-    State(state): State<BrokerState>,
-    headers: HeaderMap,
-    Json(request): Json<AfterEffectsBootstrapVerifyRequest>,
 ) -> Response {
     if !state.authorized(&headers) {
         return unauthorized_response();

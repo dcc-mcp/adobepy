@@ -3,12 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from adobe.core import (
-    AfterEffectsBootstrapContinuation,
-    AfterEffectsBootstrapRequest,
-    AfterEffectsBootstrapResult,
-    BrokerClient,
-)
+from adobe.core import BrokerClient
 from adobe.core.session import HostSession
 
 
@@ -17,11 +12,6 @@ class AfterEffectsSession(HostSession):
         super().__init__("after-effects", client)
         self.app = AfterEffectsApp(self)
 
-    def bootstrap_cep(self, request: AfterEffectsBootstrapRequest) -> AfterEffectsBootstrapResult:
-        return self.client.bootstrap_after_effects_cep(request)
-
-    def verify_bootstrap(self, continuation: AfterEffectsBootstrapContinuation) -> AfterEffectsBootstrapResult:
-        return self.client.verify_after_effects_bootstrap(continuation)
 
 
 class AfterEffects(AfterEffectsSession):

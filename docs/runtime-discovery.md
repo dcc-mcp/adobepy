@@ -151,10 +151,9 @@ epoch, installed plugin root, and loaded module origin. `moduleOrigin` must be
 PID/start pairs, foreign product/profile, target, or connection epoch are
 rejected with stable identity error codes (`-32010` through `-32013`).
 
-Bootstrap callers use `BrokerClient.bootstrap_after_effects_cep()` and then the
-fixed `POST /v1/after-effects/bootstrap/verify` continuation. The continuation
-is machine-executable and bounded; no arbitrary JSX, command, or UI fallback is
-part of the bootstrap contract.
+No After Effects bootstrap endpoint is exposed until a host-specific launch,
+receipt, and nonce transaction exists. Adapters must not treat CEP identity or
+compile/package evidence as a bootstrap success signal.
 
 ---
 
