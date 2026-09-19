@@ -60,6 +60,17 @@ const BOOTSTRAP_BLOCKING_CAPACITY: usize = 2;
 const BOOTSTRAP_BLOCKING_QUEUE: usize = 2;
 const BOOTSTRAP_CLEANUP_CAPACITY: usize = 1;
 const BOOTSTRAP_RECOVERY_GRACE_MS: u64 = 175;
+/// Floor for the deadline handed to `BootstrapBlockingBoundary` when it wraps a
+/// host process probe.
+///
+/// A probe is real work: it acquires a permit from a pool of
+/// `BOOTSTRAP_BLOCKING_CAPACITY` workers and is dispatched onto the blocking
+/// pool. Deriving its deadline straight from `default_timeout_ms` lets a
+/// degenerate config value (the test harness uses `1`) turn every probe into an
+/// instant timeout, which then surfaces as an identity mismatch instead of a
+/// timeout. The floor keeps the probe schedulable on a loaded machine while
+/// still bounding it.
+const BOOTSTRAP_PROBE_MIN_TIMEOUT_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -590,6 +601,18 @@ struct BrokerState {
 }
 
 impl BrokerState {
+    /// Deadline budget for a host process probe dispatched onto the blocking
+    /// boundary.
+    ///
+    /// `default_timeout_ms` is the deadline for a whole broker operation, but a
+    /// probe is a single step inside one and still has to be scheduled onto a
+    /// worker. Reusing the operation budget verbatim lets a very small
+    /// `default_timeout_ms` (the test harness uses `1`) expire before the probe
+    /// is ever dispatched, so the floor keeps the probe runnable.
+    fn probe_timeout(&self) -> Duration {
+        Duration::from_millis(self.default_timeout_ms.max(BOOTSTRAP_PROBE_MIN_TIMEOUT_MS))
+    }
+
     fn new(config: &BrokerConfig) -> anyhow::Result<Self> {
         Self::with_bootstrap_backends(
             config,
@@ -2730,17 +2753,17 @@ impl BrokerState {
         let process_matches = {
             let backend = self.bootstrap_backend.clone();
             let observed = observed.clone();
-            let deadline =
-                tokio::time::Instant::now() + Duration::from_millis(self.default_timeout_ms.max(1));
+            let deadline = tokio::time::Instant::now() + self.probe_timeout();
             self.bootstrap_blocking
                 .execute(deadline, move || Ok(backend.process_matches(&observed)))
                 .await
         };
         if !matches!(process_matches, Ok(Ok(true))) {
-            return Err(identity_error(
-                ERROR_IDENTITY_STALE,
+            return Err(process_probe_error(
+                HostKind::Photoshop,
+                &process_matches,
+                "verify",
                 "Photoshop process identity changed after bootstrap",
-                json!({"field": "host.processStartIdentity"}),
             ));
         }
         Ok(receipt.result)
@@ -2814,8 +2837,7 @@ impl BrokerState {
         let process_matches = {
             let backend = self.bootstrap_backend.clone();
             let observed_for_validation = observed.clone();
-            let deadline =
-                tokio::time::Instant::now() + Duration::from_millis(self.default_timeout_ms.max(1));
+            let deadline = tokio::time::Instant::now() + self.probe_timeout();
             self.bootstrap_blocking
                 .execute(deadline, move || {
                     Ok(backend.process_matches(&observed_for_validation))
@@ -2823,10 +2845,11 @@ impl BrokerState {
                 .await
         };
         if !matches!(process_matches, Ok(Ok(true))) {
-            return Err(identity_error(
-                ERROR_IDENTITY_STALE,
+            return Err(process_probe_error(
+                HostKind::Photoshop,
+                &process_matches,
+                "bind",
                 "selected Photoshop process identity changed before bridge connection",
-                json!({"field": "host.processStartIdentity"}),
             ));
         }
         let Some(mut identity) = identity else {
@@ -2963,7 +2986,7 @@ impl BrokerState {
             return Err(identity_error(
                 ERROR_IDENTITY_STALE,
                 "selected Illustrator process identity changed before bridge connection",
-                json!({"field": "host.processStartIdentity"}),
+                json!({"field": "host.processStartIdentity", "stage": "bind"}),
             ));
         }
         let Some(mut identity) = identity else {
@@ -3465,6 +3488,47 @@ async fn handle_bridge_message(state: &BrokerState, text: &str) {
 
 fn identity_error(code: i32, message: &str, data: serde_json::Value) -> Box<RpcErrorResponse> {
     Box::new(RpcErrorResponse::new(None, code, message).with_data(data))
+}
+
+/// Turn the outcome of a host process probe into a precise RPC error.
+///
+/// The probe can fail without the host process having changed at all: the
+/// blocking boundary can time out, run out of workers, or catch a panic inside
+/// the probe. Reporting all of those as "identity changed" sends an operator
+/// hunting for a process swap that never happened. Only `Ok(Ok(false))` means
+/// the observed process genuinely no longer matches, so callers keep their own
+/// wording for that case and this helper only reshapes the rest.
+fn process_probe_error(
+    host: HostKind,
+    outcome: &Result<anyhow::Result<bool>, BlockingBoundaryError>,
+    stage: &str,
+    stale_message: &str,
+) -> Box<RpcErrorResponse> {
+    let host_name = match host {
+        HostKind::Photoshop => "Photoshop",
+        HostKind::Illustrator => "Illustrator",
+        _ => "host",
+    };
+    let field = json!({ "field": "host.processStartIdentity", "stage": stage });
+    match outcome {
+        Ok(Ok(true)) => unreachable!("process_probe_error is only called on failure"),
+        Ok(Ok(false)) => identity_error(ERROR_IDENTITY_STALE, stale_message, field),
+        Ok(Err(_)) | Err(BlockingBoundaryError::Panicked) => identity_error(
+            ERROR_IDENTITY_UNAVAILABLE,
+            &format!("{host_name} process identity probe failed"),
+            field,
+        ),
+        Err(BlockingBoundaryError::TimedOut) => identity_error(
+            ERROR_TIMEOUT,
+            &format!("{host_name} process identity probe exceeded its bounded operation deadline"),
+            field,
+        ),
+        Err(BlockingBoundaryError::Overloaded) => identity_error(
+            ERROR_IDENTITY_UNAVAILABLE,
+            &format!("{host_name} process identity probe could not be scheduled"),
+            field,
+        ),
+    }
 }
 
 fn bootstrap_timeout_error(
@@ -4328,6 +4392,7 @@ mod tests {
         process_valid: AtomicBool,
         attestation_valid: AtomicBool,
         config_state: Arc<AtomicUsize>,
+        process_matches_delay_ms: AtomicU64,
         executable_sha256_delay_ms: AtomicU64,
     }
 
@@ -4572,6 +4637,10 @@ mod tests {
         }
 
         fn process_matches(&self, _observed: &ObservedHostProcess) -> bool {
+            let delay_ms = self.process_matches_delay_ms.load(Ordering::SeqCst);
+            if delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
             self.process_valid.load(Ordering::SeqCst)
         }
 
@@ -6518,6 +6587,144 @@ mod tests {
         assert_eq!(backend.finalizes.load(Ordering::SeqCst), 1);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 0);
         assert!(state.bootstrap_grants.lock().await.is_empty());
+    }
+
+    // Regression: the identity probe is dispatched onto `BootstrapBlockingBoundary`,
+    // which holds only `BOOTSTRAP_BLOCKING_CAPACITY` workers. Its deadline used to
+    // be `default_timeout_ms` verbatim, and the test harness sets that to `1`, so on
+    // a loaded runner the probe expired before it was ever scheduled. The bind path
+    // reported that timeout as `ERROR_IDENTITY_STALE` / `host.processStartIdentity`,
+    // i.e. as if Photoshop had been swapped out from under us.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slow_identity_probe_still_binds_rather_than_reporting_a_stale_identity() {
+        let backend = FakeBootstrapBackend::ready();
+        // Comfortably longer than `default_timeout_ms` (1ms) but well inside the
+        // probe floor, so a correct implementation waits for the probe instead of
+        // giving up on it.
+        backend
+            .process_matches_delay_ms
+            .store(120, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(1_000);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let task = std::thread::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
+        barrier.wait();
+        let (nonce, observed) = loop {
+            let value = state
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&session_key(HostKind::Photoshop, "retouch"))
+                .and_then(|grant| {
+                    grant
+                        .observed
+                        .clone()
+                        .map(|observed| (grant.nonce.clone(), observed))
+                });
+            if let Some(value) = value {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let mut claim = identity_claim();
+        let profile_id = claim.host.profile_id.clone();
+        claim.host = adobepy_protocol::HostIdentityClaim::default();
+        claim.host.profile_id = profile_id;
+        let bound = state
+            .bind_photoshop_bootstrap_claim("retouch", &caps(), Some(claim), Some(&nonce))
+            .await
+            .expect("a slow probe must not be reported as an identity failure")
+            .expect("the claim binds once the probe reports a match");
+        assert_eq!(bound.host.pid, Some(observed.pid));
+        insert_identity_session(&state, "retouch", 1_720_000_000_000, Some(bound)).await;
+
+        let result = task.join().unwrap().unwrap();
+        assert_eq!(result.status, PhotoshopBootstrapStatus::Ready);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+    }
+
+    // Complements the case above: a probe that cannot finish inside its budget is a
+    // timeout, not evidence that the host process changed. Callers key off the error
+    // code, so mislabelling this sends them down the wrong recovery path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn identity_probe_timeout_is_reported_as_timeout_not_identity_stale() {
+        let backend = FakeBootstrapBackend::ready();
+        backend
+            .process_matches_delay_ms
+            .store(BOOTSTRAP_PROBE_MIN_TIMEOUT_MS * 4, Ordering::SeqCst);
+        let state = bootstrap_state(backend.clone());
+        let request = bootstrap_request(1_000);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let task = std::thread::spawn({
+            let state = state.clone();
+            let request = request.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(state.bootstrap_photoshop(request))
+            }
+        });
+        barrier.wait();
+        let nonce = loop {
+            let value = state
+                .bootstrap_grants
+                .lock()
+                .await
+                .get(&session_key(HostKind::Photoshop, "retouch"))
+                .filter(|grant| grant.observed.is_some())
+                .map(|grant| grant.nonce.clone());
+            if let Some(value) = value {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let mut claim = identity_claim();
+        let profile_id = claim.host.profile_id.clone();
+        claim.host = adobepy_protocol::HostIdentityClaim::default();
+        claim.host.profile_id = profile_id;
+        let error = state
+            .bind_photoshop_bootstrap_claim("retouch", &caps(), Some(claim), Some(&nonce))
+            .await
+            .expect_err("a probe that overruns its budget must fail");
+        assert_eq!(error.error.code, ERROR_TIMEOUT);
+        assert_ne!(error.error.code, ERROR_IDENTITY_STALE);
+        assert_eq!(
+            error.error.data,
+            Some(json!({
+                "field": "host.processStartIdentity",
+                "stage": "bind"
+            }))
+        );
+
+        // Join rather than detach: the worker's probe is still running on its
+        // 8s delay, and dropping the handle would leave an orphan thread
+        // holding the pool after this test has been reported.
+        let outcome = task.join().expect("probe-timeout worker must not panic");
+        if let Ok(result) = outcome {
+            assert_ne!(
+                result.status,
+                PhotoshopBootstrapStatus::Ready,
+                "a bind that failed its identity probe must not bootstrap"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

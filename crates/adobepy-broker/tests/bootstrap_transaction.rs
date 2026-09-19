@@ -14,6 +14,16 @@ fn helper_program() -> HelperProgram {
     )
 }
 
+/// Budget for one helper round-trip that expects to succeed.
+///
+/// These assertions are about reuse and capacity, not about latency, so the
+/// deadline only has to be generous enough that a successful round-trip never
+/// races it. Each call spawns or reattaches a real helper process, and on a
+/// loaded CI runner process creation alone can outrun a few hundred
+/// milliseconds. Keep this well above that; the SLO tests below pin the actual
+/// latency bounds.
+const IPC_ROUND_TRIP_BUDGET: Duration = Duration::from_secs(10);
+
 fn isolated_dir(label: &str) -> std::path::PathBuf {
     let path =
         std::env::temp_dir().join(format!("adobepy-{label}-{}", uuid::Uuid::new_v4().simple()));
@@ -198,7 +208,7 @@ async fn persistent_helper_is_reused_without_replacement_or_capacity_growth() {
         assert_eq!(
             pool.execute(
                 HelperRequest::Sleep { millis: 0 },
-                tokio::time::Instant::now() + Duration::from_millis(250),
+                tokio::time::Instant::now() + IPC_ROUND_TRIP_BUDGET,
             )
             .await
             .unwrap(),
@@ -210,7 +220,7 @@ async fn persistent_helper_is_reused_without_replacement_or_capacity_growth() {
     }
 
     assert!(
-        pool.shutdown(tokio::time::Instant::now() + Duration::from_millis(500))
+        pool.shutdown(tokio::time::Instant::now() + IPC_ROUND_TRIP_BUDGET)
             .await
     );
     assert_eq!(pool.snapshot().owned_children, 0);
