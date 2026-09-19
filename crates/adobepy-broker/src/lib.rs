@@ -6714,7 +6714,17 @@ mod tests {
             }))
         );
 
-        drop(task);
+        // Join rather than detach: the worker's probe is still running on its
+        // 8s delay, and dropping the handle would leave an orphan thread
+        // holding the pool after this test has been reported.
+        let outcome = task.join().expect("probe-timeout worker must not panic");
+        if let Ok(result) = outcome {
+            assert_ne!(
+                result.status,
+                PhotoshopBootstrapStatus::Ready,
+                "a bind that failed its identity probe must not bootstrap"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

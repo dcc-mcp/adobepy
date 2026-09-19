@@ -38,17 +38,21 @@ jobs:
       tag: ${{ steps.target.outputs.tag }}
     steps:
       - id: target
+        env:
+          RELEASE_EVENT_TAG: ${{ github.event.release.tag_name }}
+          DISPATCH_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            tag="${{ github.event.release.tag_name }}"
+          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
+            tag="$RELEASE_EVENT_TAG"
           else
-            tag="${{ inputs.release_tag }}"
+            tag="$DISPATCH_RELEASE_TAG"
           fi
-          if [ -z "$tag" ]; then
-            echo "No release tag; assets will be built but not attached."
-          else
-            echo "Attaching assets to $tag"
-          fi
+          case "$tag" in
+            "" ) echo "No release tag; assets will be built but not attached." ;;
+            *[!A-Za-z0-9._-]* )
+              echo "::error::release tag must match [A-Za-z0-9._-]"; exit 1 ;;
+            * ) echo "Attaching assets to $tag" ;;
+          esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   python-package:
@@ -95,6 +99,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -140,6 +146,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -202,6 +210,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -264,6 +274,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
