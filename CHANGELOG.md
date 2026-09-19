@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.10.0...adobepy-v0.10.1) (2026-09-19)
+
+
+### Bug Fixes
+
+* **broker:** stop reporting a slow identity probe as a stale identity ([#80](https://github.com/dcc-mcp/adobepy/issues/80)) ([e97fa26](https://github.com/dcc-mcp/adobepy/commit/e97fa26bbc13e50648a8eb99652e555df75b5466))
+
 ## [0.10.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.9.0...adobepy-v0.10.0) (2026-08-29)
 
 
