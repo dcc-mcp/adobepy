@@ -12,11 +12,10 @@ on:
   # Manual escape hatch. Normal releases never need it.
   workflow_dispatch:
 
+# Least privilege: only the release-please job writes. Every other job inherits
+# read-only and declares what it needs on the job itself.
 permissions:
-  contents: write
-  pull-requests: write
-  # Needed to start the CI workflow on the release PR branch.
-  actions: write
+  contents: read
 
 # Serialize runs so a scheduled run and a push run never race to tag the same
 # release.
@@ -27,6 +26,11 @@ concurrency:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      # Needed to start the CI workflow on the release PR branch.
+      actions: write
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
@@ -46,26 +50,71 @@ jobs:
       #
       # This removes the human merge click without removing the quality gate:
       # branch protection still decides whether the release PR may land.
+      # Every step below is idempotent. This job runs every 30 minutes, so a
+      # plain "start CI and enable auto-merge" loop would re-run the full CI
+      # matrix every half hour for as long as a release PR stays open.
+      #
+      # Failures must fail the run. Silently downgrading them to a log line
+      # would turn "someone clicks merge" into "someone watches for a stall",
+      # which is the manual step this workflow exists to remove.
       - name: Verify and auto-merge the release PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          # A release PR that is still open after this many hours is stuck:
+          # auto-merge should have landed it as soon as the checks went green.
+          STALL_HOURS: "6"
         run: |
           set -euo pipefail
-          prs=$(gh pr list --state open --json number,headRefName \
+          prs=$(gh pr list --base main --limit 100 --state open --json number,headRefName \
             --jq '.[] | select(.headRefName | startswith("release-please--branches--main"))')
           if [ -z "$prs" ]; then
             echo "No open release PR; nothing to fast-forward."
             exit 0
           fi
-          echo "$prs" | jq -r '"\(.number) \(.headRefName)"' | while read -r number branch; do
-            echo "Requesting CI for release PR #$number on $branch"
-            gh workflow run ci.yml --ref "$branch" \
-              || echo "CI dispatch failed for $branch; the scheduled run will retry."
-            echo "Enabling auto-merge for release PR #$number"
-            gh pr merge --auto --squash "$number" \
-              || echo "Auto-merge request failed for #$number; the scheduled run will retry."
+
+          mapfile -t entries < <(echo "$prs" | jq -r '"\(.number) \(.headRefName)"')
+          if [ "${#entries[@]}" -ne 1 ]; then
+            echo "::warning title=Unexpected release PR count::Found ${#entries[@]} open release PRs; merging more than one would collide on PyPI."
+          fi
+
+          fail=0
+          for entry in "${entries[@]}"; do
+            number="${entry%% *}"
+            branch="${entry#* }"
+            echo "Release PR #$number on $branch"
+
+            inflight=$(gh run list --branch "$branch" --workflow ci.yml --limit 20 \
+              --json status --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length')
+            if [ "$inflight" -eq 0 ]; then
+              echo "Requesting CI on $branch"
+              if ! gh workflow run ci.yml --ref "$branch"; then
+                echo "::error title=CI dispatch failed::Could not start ci.yml on $branch"
+                fail=1
+              fi
+            else
+              echo "CI already running on $branch; skipping dispatch."
+            fi
+
+            if [ "$(gh pr view "$number" --json autoMergeRequest --jq '.autoMergeRequest == null')" = "true" ]; then
+              echo "Enabling auto-merge for release PR #$number"
+              if ! gh pr merge --auto --squash "$number"; then
+                echo "::error title=Auto-merge request failed::Could not enable auto-merge for #$number"
+                fail=1
+              fi
+            else
+              echo "Auto-merge already enabled for release PR #$number."
+            fi
+
+            created_at=$(gh pr view "$number" --json createdAt --jq .createdAt)
+            age_hours=$(( ($(date -u +%s) - $(date -u -d "$created_at" +%s)) / 3600 ))
+            if [ "$age_hours" -ge "$STALL_HOURS" ]; then
+              echo "::error title=Release PR is stalled::PR #$number has been open ${age_hours}h; auto-merge should have landed it once the required checks were green."
+              fail=1
+            fi
           done
+
+          exit "$fail"
 
   python-package:
     name: Build Python package
