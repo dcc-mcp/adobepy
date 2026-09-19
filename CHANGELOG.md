@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.9.0...adobepy-v0.10.0) (2026-08-29)
+
+
+### Features
+
+* attest After Effects CEP runtime identity ([#78](https://github.com/dcc-mcp/adobepy/issues/78)) ([d32f146](https://github.com/dcc-mcp/adobepy/commit/d32f146708df2bca4d3537f3f32d2b122c6cf6c1))
+
 ## [0.9.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.8.0...adobepy-v0.9.0) (2026-08-28)
 
 
