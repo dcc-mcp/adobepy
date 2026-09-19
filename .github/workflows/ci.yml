@@ -49,6 +49,28 @@ jobs:
       - run: npm ci
       - run: npm run test:bridges
 
+  # `scripts/package-release.ps1` gates the published Windows artifact behind
+  # `npm run test:all`, but the packaging job below only exercises it with
+  # `-SkipTests`. That left the release-time verification command unrun until
+  # after the tag was published. Running the same command here keeps the PR gate
+  # and the release pipeline on one definition of "verified".
+  release-parity:
+    name: Release command parity
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: python -m pip install --upgrade "coverage[toml]" setuptools wheel
+      - run: npm run test:all
+
   quality:
     name: Quality gates
     runs-on: ubuntu-latest
