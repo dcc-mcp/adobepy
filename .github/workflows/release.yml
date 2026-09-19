@@ -1,12 +1,13 @@
 name: Release
 
-# Manual release entry point. Also triggered by `release: published` when
-# a release is manually created from the GitHub UI.
-# Automated releases are handled by release-please.yml (push to main).
+# Manual release tool. Automated releases are handled end to end by
+# release-please.yml (tag, release, PyPI upload, release assets).
+#
+# There is deliberately no `release: published` trigger. A GitHub Release
+# published from the UI can no longer publish to PyPI here, and keeping the
+# trigger would run four packaging jobs only to attach assets to a release
+# without publishing it. Publish with `workflow_dispatch` instead.
 on:
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
       publish_to_pypi:
@@ -78,7 +79,10 @@ jobs:
     name: Publish Python package
     runs-on: ubuntu-latest
     needs: python-package
-    if: github.event_name == 'release' || inputs.publish_to_pypi == true
+    # Automated releases are published by release-please.yml, which already
+    # creates the tag right before this upload. Publishing here on a `release`
+    # event as well would try to upload the same version twice and fail.
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_to_pypi == true
     environment: pypi
     permissions:
       contents: read
