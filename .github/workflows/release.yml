@@ -14,11 +14,43 @@ on:
         required: true
         type: boolean
         default: false
+      release_tag:
+        description: "Attach the built assets to this existing release tag. Leave empty for a build-only dry run that uploads nothing."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
+  # Resolves the release the built assets are attached to, if any.
+  #
+  # A `release: published` event always has a tag. A manual dispatch attaches
+  # nothing unless `release_tag` is supplied, which keeps a plain dispatch a
+  # harmless build-only dry run. That opt-in is what makes it possible to
+  # rebuild and re-attach assets for a release whose original upload job failed,
+  # without deleting or re-creating the tag.
+  resolve-target:
+    name: Resolve release target
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.target.outputs.tag }}
+    steps:
+      - id: target
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag="${{ github.event.release.tag_name }}"
+          else
+            tag="${{ inputs.release_tag }}"
+          fi
+          if [ -z "$tag" ]; then
+            echo "No release tag; assets will be built but not attached."
+          else
+            echo "Attaching assets to $tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   python-package:
     name: Build Python package
     runs-on: ubuntu-latest
@@ -55,6 +87,8 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   windows-package:
+    needs:
+      - resolve-target
     name: Build Windows package artifact
     runs-on: windows-latest
     permissions:
@@ -87,16 +121,19 @@ jobs:
             dist/*.zip
             dist/*.zip.sha256
       - name: Upload to GitHub Release
-        if: github.event_name == 'release'
+        if: needs.resolve-target.outputs.tag != ''
         shell: pwsh
         run: |
           $assets = @(Get-ChildItem "dist/*" -Include "*.zip","*.zip.sha256" | ForEach-Object { $_.FullName })
           if ($assets.Count -eq 0) { throw "No release assets found in dist/" }
-          gh release upload ${{ github.event.release.tag_name }} $assets --clobber
+          gh release upload "$TAG" $assets --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve-target.outputs.tag }}
 
   windows-standalone-package:
+    needs:
+      - resolve-target
     name: Build Windows standalone interpreter (PyOxidizer)
     runs-on: windows-latest
     permissions:
@@ -146,16 +183,19 @@ jobs:
             dist/adobepy-standalone-*.zip
             dist/adobepy-standalone-*.zip.sha256
       - name: Upload to GitHub Release
-        if: github.event_name == 'release'
+        if: needs.resolve-target.outputs.tag != ''
         shell: pwsh
         run: |
           $assets = @(Get-ChildItem "dist/*" -Include "adobepy-standalone-*.zip","adobepy-standalone-*.zip.sha256" | ForEach-Object { $_.FullName })
           if ($assets.Count -eq 0) { throw "No standalone release assets found in dist/" }
-          gh release upload ${{ github.event.release.tag_name }} $assets --clobber
+          gh release upload "$TAG" $assets --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve-target.outputs.tag }}
 
   macos-standalone-package:
+    needs:
+      - resolve-target
     name: Build macOS standalone interpreter (PyOxidizer)
     runs-on: macos-latest
     permissions:
@@ -205,16 +245,19 @@ jobs:
             dist/adobepy-standalone-*.zip
             dist/adobepy-standalone-*.zip.sha256
       - name: Upload to GitHub Release
-        if: github.event_name == 'release'
+        if: needs.resolve-target.outputs.tag != ''
         shell: bash
         run: |
           assets=$(ls dist/adobepy-standalone-*.zip dist/adobepy-standalone-*.zip.sha256 2>/dev/null | tr '\n' ' ')
           if [ -z "$assets" ]; then echo "No standalone release assets found in dist/"; exit 1; fi
-          gh release upload ${{ github.event.release.tag_name }} $assets --clobber
+          gh release upload "$TAG" $assets --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve-target.outputs.tag }}
 
   linux-standalone-package:
+    needs:
+      - resolve-target
     name: Build Linux standalone interpreter (PyOxidizer)
     runs-on: ubuntu-latest
     permissions:
@@ -264,11 +307,12 @@ jobs:
             dist/adobepy-standalone-*.zip
             dist/adobepy-standalone-*.zip.sha256
       - name: Upload to GitHub Release
-        if: github.event_name == 'release'
+        if: needs.resolve-target.outputs.tag != ''
         shell: bash
         run: |
           assets=$(ls dist/adobepy-standalone-*.zip dist/adobepy-standalone-*.zip.sha256 2>/dev/null | tr '\n' ' ')
           if [ -z "$assets" ]; then echo "No standalone release assets found in dist/"; exit 1; fi
-          gh release upload ${{ github.event.release.tag_name }} $assets --clobber
+          gh release upload "$TAG" $assets --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve-target.outputs.tag }}
