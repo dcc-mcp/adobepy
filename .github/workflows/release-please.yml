@@ -4,9 +4,10 @@ on:
   push:
     branches:
       - main
-  # Safety net. A release is tagged once its release PR is merged; if that
-  # merge ever fails to start this workflow, the scheduled run finishes the
-  # release instead of leaving it half-published.
+  # Backstop only. A release is tagged once its release PR is merged, and
+  # GitHub throttles this far below the declared cadence (six runs landed
+  # across 2026-09-27 instead of 48), so the merge step below re-dispatches
+  # this workflow instead of waiting on the cron.
   schedule:
     - cron: "*/30 * * * *"
   # Manual escape hatch. Normal releases never need it.
@@ -29,6 +30,11 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # Needed to read the release PR's check runs before merging it. GitHub
+      # scopes the installation token to exactly the permissions listed here
+      # and zeroes everything else, so without this the gate's first
+      # check-runs call is rejected and the release PR is never merged.
+      checks: read
       # Needed to start the CI workflow on the release PR branch.
       actions: write
     outputs:
@@ -42,77 +48,197 @@ jobs:
           config-file: .github/release-please-config.json
           manifest-file: .github/release-please-manifest.json
 
-      # Release PRs are pushed with GITHUB_TOKEN, and GitHub does not fire
-      # `pull_request` workflows for those pushes, so the PR never reports the
-      # status checks that `main` requires. Start CI on the release branch
-      # explicitly, then let GitHub merge the PR the moment those required
-      # checks are green.
+      # Merging the release PR only advances the manifest. The tag, the GitHub
+      # Release and the PyPI upload are cut by a *later* run of this job. The
+      # merge is performed with GITHUB_TOKEN, and a push made with GITHUB_TOKEN
+      # does not raise a `push` event, so the merge commit never starts this
+      # workflow on its own. This step re-dispatches it once the merge lands,
+      # which is what actually finishes the release.
       #
-      # This removes the human merge click without removing the quality gate:
-      # branch protection still decides whether the release PR may land.
-      # Every step below is idempotent. This job runs every 30 minutes, so a
-      # plain "start CI and enable auto-merge" loop would re-run the full CI
-      # matrix every half hour for as long as a release PR stays open.
+      # The merge is also gated on green checks. `main` declares no required
+      # status checks, so arming auto-merge the moment the release PR is opened
+      # let PR #87 merge seven seconds after it was created and killed both CI
+      # runs that had just started for it. This step supplies the gate that
+      # branch protection does not provide here.
+      #
+      # Every step below is idempotent. CI is only requested when the head of
+      # the release PR carries no verdict — no workflow run, no check runs, or
+      # only cancelled ones — so a release PR whose CI is merely in flight does
+      # not re-run the full matrix on every pass.
+      #
+      # The re-dispatch is loop-free: it only fires in the run that performed
+      # the merge, and the follow-up run finds no open release PR and exits.
       #
       # Failures must fail the run. Silently downgrading them to a log line
       # would turn "someone clicks merge" into "someone watches for a stall",
       # which is the manual step this workflow exists to remove.
-      - name: Verify and auto-merge the release PR
+      - name: Gate and merge the release PR, then finish the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           # A release PR that is still open after this many hours is stuck:
-          # auto-merge should have landed it as soon as the checks went green.
+          # its checks never went green or auto-merge never landed it.
           STALL_HOURS: "6"
+          # Auto-merge armed here has no required checks to wait for, so it
+          # lands in seconds. Bound the wait anyway, so a slow merge cannot
+          # hold this job past the next scheduled pass.
+          MERGE_TIMEOUT_SECONDS: "300"
+          MERGE_POLL_SECONDS: "15"
         run: |
           set -euo pipefail
-          prs=$(gh pr list --base main --limit 100 --state open --json number,headRefName \
-            --jq '.[] | select(.headRefName | startswith("release-please--branches--main"))')
+          prs=$(gh pr list --base main --limit 100 --state open --json number,headRefName,headRefOid \
+            --jq '.[] | select(.headRefName | startswith("release-please--branches--main")) | "\(.number) \(.headRefName) \(.headRefOid)"')
           if [ -z "$prs" ]; then
             echo "No open release PR; nothing to fast-forward."
             exit 0
           fi
 
-          mapfile -t entries < <(echo "$prs" | jq -r '"\(.number) \(.headRefName)"')
+          mapfile -t entries <<< "$prs"
           if [ "${#entries[@]}" -ne 1 ]; then
             echo "::warning title=Unexpected release PR count::Found ${#entries[@]} open release PRs; merging more than one would collide on PyPI."
           fi
 
-          fail=0
-          for entry in "${entries[@]}"; do
-            number="${entry%% *}"
-            branch="${entry#* }"
-            echo "Release PR #$number on $branch"
-
-            inflight=$(gh run list --branch "$branch" --workflow ci.yml --limit 20 \
-              --json status --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length')
-            if [ "$inflight" -eq 0 ]; then
-              echo "Requesting CI on $branch"
-              if ! gh workflow run ci.yml --ref "$branch"; then
-                echo "::error title=CI dispatch failed::Could not start ci.yml on $branch"
-                fail=1
-              fi
-            else
-              echo "CI already running on $branch; skipping dispatch."
-            fi
-
-            if [ "$(gh pr view "$number" --json autoMergeRequest --jq '.autoMergeRequest == null')" = "true" ]; then
-              echo "Enabling auto-merge for release PR #$number"
-              if ! gh pr merge --auto --squash "$number"; then
-                echo "::error title=Auto-merge request failed::Could not enable auto-merge for #$number"
-                fail=1
-              fi
-            else
-              echo "Auto-merge already enabled for release PR #$number."
-            fi
-
-            created_at=$(gh pr view "$number" --json createdAt --jq .createdAt)
-            age_hours=$(( ($(date -u +%s) - $(date -u -d "$created_at" +%s)) / 3600 ))
-            if [ "$age_hours" -ge "$STALL_HOURS" ]; then
-              echo "::error title=Release PR is stalled::PR #$number has been open ${age_hours}h; auto-merge should have landed it once the required checks were green."
+          request_ci() {
+            echo "  requesting CI on $branch"
+            if ! gh workflow run ci.yml --ref "$branch"; then
+              echo "::error title=CI dispatch failed::Could not start ci.yml on $branch"
               fail=1
             fi
+          }
+
+          fail=0
+          merged=0
+          for entry in "${entries[@]}"; do
+            read -r number branch head_sha <<< "$entry"
+            echo "Release PR #$number on $branch at $head_sha"
+            landed=0
+
+            # Check runs are created one job at a time, so "nothing is pending"
+            # is not the same as "every job has run": a pass that lands early
+            # enough could see only a prefix of the CI matrix. The ci.yml run
+            # for this exact head is authoritative for completion, because a
+            # workflow run only reaches `success` once every one of its jobs
+            # has finished successfully.
+            #
+            # Filtering on the head SHA is what makes that safe: release-please
+            # reuses the same branch across release cycles, so an older run on
+            # this branch would otherwise clear a head that was never verified.
+            if ! ci_raw=$(gh run list --branch "$branch" --workflow ci.yml --limit 50 \
+              --json headSha,status,conclusion \
+              --jq '.[] | select(.headSha == "'"$head_sha"'") | "\(.status)|\(.conclusion)"'); then
+              echo "::warning title=CI run query failed::Falling back to check runs for $head_sha"
+              ci_raw=""
+            fi
+            ci_total=0; ci_running=0; ci_ok=0; ci_cancelled=0; ci_broken=0
+            if [ -n "$ci_raw" ]; then
+              mapfile -t ci_runs <<< "$ci_raw"
+              ci_total=${#ci_runs[@]}
+              for run in "${ci_runs[@]}"; do
+                status="${run%%|*}"
+                conclusion="${run##*|}"
+                if [ "$status" != "completed" ]; then
+                  ci_running=$((ci_running + 1))
+                elif [ "$conclusion" = "success" ]; then
+                  ci_ok=$((ci_ok + 1))
+                elif [ "$conclusion" = "cancelled" ]; then
+                  ci_cancelled=$((ci_cancelled + 1))
+                else
+                  ci_broken=$((ci_broken + 1))
+                fi
+              done
+            fi
+            echo "  ci.yml: $ci_ok succeeded, $ci_running running, $ci_cancelled cancelled, $ci_broken failed ($ci_total run(s) for $head_sha)"
+
+            check_url="repos/$GH_REPO/commits/$head_sha/check-runs?per_page=100&filter=latest"
+            if ! raw=$(gh api --paginate "$check_url" --jq '.check_runs[] | "\(.status)|\(.conclusion)"'); then
+              echo "::error title=Check query failed::Could not read check runs for $head_sha"
+              fail=1
+              continue
+            fi
+            total=0; pending=0; passed=0; cancelled=0; broken=0
+            if [ -n "$raw" ]; then
+              mapfile -t runs <<< "$raw"
+              total=${#runs[@]}
+              for run in "${runs[@]}"; do
+                status="${run%%|*}"
+                conclusion="${run##*|}"
+                if [ "$status" != "completed" ]; then
+                  pending=$((pending + 1))
+                elif [ "$conclusion" = "success" ]; then
+                  passed=$((passed + 1))
+                elif [ "$conclusion" = "cancelled" ]; then
+                  cancelled=$((cancelled + 1))
+                elif [ "$conclusion" = "skipped" ] || [ "$conclusion" = "neutral" ]; then
+                  :
+                else
+                  broken=$((broken + 1))
+                fi
+              done
+            fi
+            echo "  checks: $passed passed, $pending pending, $cancelled cancelled, $broken failed, $total total"
+
+            if [ "$ci_total" -eq 0 ] || [ "$total" -eq 0 ]; then
+              echo "  no CI verdict for $head_sha yet"
+              request_ci
+            elif [ "$ci_running" -gt 0 ] || [ "$pending" -gt 0 ]; then
+              echo "  CI still running on $head_sha; waiting for the next pass."
+            elif [ "$broken" -gt 0 ] || [ "$ci_broken" -gt 0 ]; then
+              echo "::error title=Release PR checks are not green::PR #$number at $head_sha reports $broken failing check(s) and $ci_broken failed ci.yml run(s); refusing to merge it."
+              fail=1
+            elif [ "$cancelled" -gt 0 ] || [ "$ci_cancelled" -gt 0 ] || [ "$passed" -eq 0 ]; then
+              # A cancelled job carries no verdict. Counting it as a failure
+              # would strand the release PR until the stall timer fires, so ask
+              # for CI again rather than waiting for that.
+              echo "  no verdict for $head_sha: $cancelled cancelled check(s), $ci_cancelled cancelled ci.yml run(s), $passed successful check(s)"
+              request_ci
+            else
+              if [ "$(gh pr view "$number" --json autoMergeRequest --jq '.autoMergeRequest == null')" = "true" ]; then
+                echo "  checks are green for $head_sha; enabling auto-merge"
+                if ! gh pr merge --auto --squash "$number"; then
+                  echo "::error title=Auto-merge request failed::Could not enable auto-merge for #$number"
+                  fail=1
+                  continue
+                fi
+              else
+                echo "  auto-merge already enabled."
+              fi
+
+              deadline=$(( $(date -u +%s) + MERGE_TIMEOUT_SECONDS ))
+              while [ "$(date -u +%s)" -lt "$deadline" ] \
+                && [ "$(gh pr view "$number" --json state --jq .state)" = "OPEN" ]; do
+                sleep "$MERGE_POLL_SECONDS"
+              done
+
+              if [ "$(gh pr view "$number" --json state --jq .state)" = "MERGED" ]; then
+                echo "  release PR #$number merged"
+                landed=1
+                merged=$((merged + 1))
+              else
+                echo "::warning title=Release PR merge did not land::PR #$number is still open ${MERGE_TIMEOUT_SECONDS}s after auto-merge was armed; the next pass will retry."
+              fi
+            fi
+
+            if [ "$landed" -eq 0 ]; then
+              created_at=$(gh pr view "$number" --json createdAt --jq .createdAt)
+              age_hours=$(( ($(date -u +%s) - $(date -u -d "$created_at" +%s)) / 3600 ))
+              if [ "$age_hours" -ge "$STALL_HOURS" ]; then
+                echo "::error title=Release PR is stalled::PR #$number has been open ${age_hours}h; it should have merged once its checks were green."
+                fail=1
+              fi
+            fi
           done
+
+          if [ "$merged" -eq 0 ]; then
+            exit "$fail"
+          fi
+
+          # The merge commit was pushed by GITHUB_TOKEN, which raises no `push`
+          # event, so ask for the pass that cuts the tag and publishes it.
+          echo "Release PR merged; re-dispatching this workflow to cut the release."
+          if ! gh workflow run release-please.yml --ref main; then
+            echo "::error title=Release dispatch failed::Could not start release-please.yml on main"
+            fail=1
+          fi
 
           exit "$fail"
 
