@@ -12,6 +12,8 @@ possible, while adding Pythonic aliases for agent and script ergonomics.
 Implemented pieces:
 
 - Rust `adobepy` CLI with `broker`, `doctor`, `install-bridge`, and `repl`.
+- `python -m adobe` helpers (`doctor`, `install-bridge`, `broker`) so a
+  wheel-only install can be diagnosed and can stage a bridge from Python.
 - Local JSON-RPC broker with per-session token, target, timeout, and capability gates.
 - Authenticated, typed broker/host/bridge runtime identity attestation for
   exact-instance checks by DCC MCP adapters.
@@ -39,6 +41,12 @@ Bridge bundles under `bridges/**/dist` are generated artifacts and are not
 tracked. `npm run test:all` builds them for local verification; release CI
 rebuilds them before packaging. Run `npm run uxp:build` and `npm run cep:build`
 before using `install-bridge` directly from a source checkout.
+
+The distribution name is `adobepy` and the import name is `adobe`. The PyPI
+wheel carries the SDK and the `python -m adobe` entry point; the broker
+executable and bridge templates ship in the platform bundle on GitHub
+Releases. Run `python -m adobe doctor` to see which parts are present and where
+to obtain the missing ones.
 
 Installation, standalone use, broker startup, bridge loading, and
 troubleshooting are documented in [`install.md`](install.md).

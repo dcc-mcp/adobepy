@@ -21,6 +21,14 @@ needs both must install from both channels.
 Only `adobepy` pure-Python wheel (`py3-none-any`). No native extensions, no Rust
 binaries, no bridge bundles.
 
+The wheel does ship a pure-Python command line entry point, `python -m adobe`,
+so a wheel-only install can be diagnosed (`doctor`), can stage a bridge from any
+resolvable bridge tree (`install-bridge`), and can start a broker that it
+resolves from the environment or PATH (`broker`). `broker` still requires the
+Rust executable from the GitHub Release bundle: the module reports every
+location it probed and where to obtain the binary instead of failing with a
+bare error.
+
 ### Publishing mechanism
 
 Trusted publishing via GitHub Actions. The release workflow
@@ -59,6 +67,9 @@ The CI gate at `scripts/check_wheel_compat.py` rejects any wheel that is not
 site-packages/
   adobe/
     __init__.py
+    __main__.py          # python -m adobe entry point
+    cli.py               # doctor, install-bridge, broker (pure Python)
+    runtime.py           # ensure_broker() helper with actionable errors
     core/
       __init__.py
       errors.py

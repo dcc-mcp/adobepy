@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import time
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import urlsplit
 
 
@@ -30,6 +30,23 @@ class BrokerHandle:
             self.process.wait(timeout=timeout)
 
 
+def _resolve_executable() -> Optional[str]:
+    """Resolve the broker executable through the shared CLI discovery order."""
+
+    from adobe.cli import resolve_broker_executable
+
+    executable, _locations = resolve_broker_executable()
+    return executable
+
+
+def _missing_broker_error() -> FileNotFoundError:
+    """Build the actionable error raised when no broker executable resolves."""
+
+    from adobe.cli import broker_remediation
+
+    return FileNotFoundError(broker_remediation())
+
+
 def ensure_broker(
     *,
     broker_url: str | None = None,
@@ -49,9 +66,9 @@ def ensure_broker(
 
     active_token = configured_token or f"dev-{uuid.uuid4()}"
 
-    executable = broker_path or os.getenv("ADOBEPY_BROKER_PATH") or shutil.which("adobepy")
+    executable = broker_path or _resolve_executable()
     if not executable or not os.path.isfile(executable):
-        raise FileNotFoundError("adobepy broker not found; set ADOBEPY_BROKER_PATH or add adobepy to PATH")
+        raise _missing_broker_error()
 
     parsed = urlsplit(url)
     if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"} or not parsed.port:
