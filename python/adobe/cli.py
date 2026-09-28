@@ -250,7 +250,16 @@ def bridge_config_js(host: str, broker_url: Optional[str], token: str, target: s
     )
 
 
-def _resolve_destination_root(dest: Path) -> Path:
+def _canonical_destination_root(dest: Path) -> Path:
+    """Canonicalize ``dest`` for containment checks only.
+
+    The returned path is never reported to the caller: canonicalization rewrites
+    a Windows path into its 8.3 short form, which would stop installers from
+    matching the destination they created. The Rust CLI keeps the same split: it
+    canonicalizes only to reject a destination inside the source template and
+    reports the destination exactly as it was passed.
+    """
+
     current = dest
     missing: List[str] = []
     while not current.exists():
@@ -312,9 +321,10 @@ def stage_bridge(
                 f"source checkouts must run `npm ci` and `{BRIDGE_BUILD_COMMAND[resolved_kind]}` before install-bridge"
             )
 
-    destination = _resolve_destination_root(Path(dest))
+    destination = Path(dest)
     source_root = source.resolve()
-    if destination == source_root or source_root in destination.parents:
+    canonical_destination = _canonical_destination_root(destination)
+    if canonical_destination == source_root or source_root in canonical_destination.parents:
         raise CliError(f"bridge install destination must not be inside the source template: {dest}")
     _copy_tree(source_root, destination)
     config_path = destination / "adobepy.config.js"

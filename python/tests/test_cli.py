@@ -104,6 +104,24 @@ class StageBridgeTests(unittest.TestCase):
             self.assertIn('token:"secret-token"', config)
             self.assertEqual(payload["config"], str(destination / "adobepy.config.js"))
 
+    def test_reported_destination_is_the_path_the_caller_passed(self):
+        # Windows canonicalization rewrites a path into its 8.3 short form
+        # (for example RUNNER~1). Installers match the reported destination
+        # against the directory they created, so it must be echoed verbatim,
+        # the same way the Rust CLI reports it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _make_bridge_tree(root, "uxp", "photoshop")
+            destination = root / "staged"
+            with mock.patch.object(
+                cli,
+                "_canonical_destination_root",
+                return_value=pathlib.Path("C:/Users/RUNNER~1/staged"),
+            ):
+                payload = cli.stage_bridge("photoshop", destination, "token", bridge_root=root)
+            self.assertEqual(payload["destination"], str(destination))
+            self.assertEqual(payload["config"], str(destination / "adobepy.config.js"))
+
     def test_cep_requires_the_dom_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
