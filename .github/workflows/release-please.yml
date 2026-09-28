@@ -30,6 +30,11 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # Needed to read the release PR's check runs before merging it. GitHub
+      # scopes the installation token to exactly the permissions listed here
+      # and zeroes everything else, so without this the gate's first
+      # check-runs call is rejected and the release PR is never merged.
+      checks: read
       # Needed to start the CI workflow on the release PR branch.
       actions: write
     outputs:
@@ -56,9 +61,10 @@ jobs:
       # runs that had just started for it. This step supplies the gate that
       # branch protection does not provide here.
       #
-      # Every step below is idempotent. CI is only requested when the release
-      # branch reports no check runs at all, so a release PR that is waiting
-      # does not re-run the full CI matrix on every pass.
+      # Every step below is idempotent. CI is only requested when the head of
+      # the release PR carries no verdict — no workflow run, no check runs, or
+      # only cancelled ones — so a release PR whose CI is merely in flight does
+      # not re-run the full matrix on every pass.
       #
       # The re-dispatch is loop-free: it only fires in the run that performed
       # the merge, and the follow-up run finds no open release PR and exits.
@@ -92,6 +98,14 @@ jobs:
             echo "::warning title=Unexpected release PR count::Found ${#entries[@]} open release PRs; merging more than one would collide on PyPI."
           fi
 
+          request_ci() {
+            echo "  requesting CI on $branch"
+            if ! gh workflow run ci.yml --ref "$branch"; then
+              echo "::error title=CI dispatch failed::Could not start ci.yml on $branch"
+              fail=1
+            fi
+          }
+
           fail=0
           merged=0
           for entry in "${entries[@]}"; do
@@ -99,17 +113,52 @@ jobs:
             echo "Release PR #$number on $branch at $head_sha"
             landed=0
 
+            # Check runs are created one job at a time, so "nothing is pending"
+            # is not the same as "every job has run": a pass that lands early
+            # enough could see only a prefix of the CI matrix. The ci.yml run
+            # for this exact head is authoritative for completion, because a
+            # workflow run only reaches `success` once every one of its jobs
+            # has finished successfully.
+            #
+            # Filtering on the head SHA is what makes that safe: release-please
+            # reuses the same branch across release cycles, so an older run on
+            # this branch would otherwise clear a head that was never verified.
+            if ! ci_raw=$(gh run list --branch "$branch" --workflow ci.yml --limit 50 \
+              --json headSha,status,conclusion \
+              --jq '.[] | select(.headSha == "'"$head_sha"'") | "\(.status)|\(.conclusion)"'); then
+              echo "::warning title=CI run query failed::Falling back to check runs for $head_sha"
+              ci_raw=""
+            fi
+            ci_total=0; ci_running=0; ci_ok=0; ci_cancelled=0; ci_broken=0
+            if [ -n "$ci_raw" ]; then
+              mapfile -t ci_runs <<< "$ci_raw"
+              ci_total=${#ci_runs[@]}
+              for run in "${ci_runs[@]}"; do
+                status="${run%%|*}"
+                conclusion="${run##*|}"
+                if [ "$status" != "completed" ]; then
+                  ci_running=$((ci_running + 1))
+                elif [ "$conclusion" = "success" ]; then
+                  ci_ok=$((ci_ok + 1))
+                elif [ "$conclusion" = "cancelled" ]; then
+                  ci_cancelled=$((ci_cancelled + 1))
+                else
+                  ci_broken=$((ci_broken + 1))
+                fi
+              done
+            fi
+            echo "  ci.yml: $ci_ok succeeded, $ci_running running, $ci_cancelled cancelled, $ci_broken failed ($ci_total run(s) for $head_sha)"
+
             check_url="repos/$GH_REPO/commits/$head_sha/check-runs?per_page=100&filter=latest"
             if ! raw=$(gh api --paginate "$check_url" --jq '.check_runs[] | "\(.status)|\(.conclusion)"'); then
               echo "::error title=Check query failed::Could not read check runs for $head_sha"
               fail=1
               continue
             fi
-            if [ -z "$raw" ]; then
-              total=0; pending=0; broken=0; passed=0
-            else
+            total=0; pending=0; passed=0; cancelled=0; broken=0
+            if [ -n "$raw" ]; then
               mapfile -t runs <<< "$raw"
-              total=${#runs[@]}; pending=0; broken=0; passed=0
+              total=${#runs[@]}
               for run in "${runs[@]}"; do
                 status="${run%%|*}"
                 conclusion="${run##*|}"
@@ -117,6 +166,8 @@ jobs:
                   pending=$((pending + 1))
                 elif [ "$conclusion" = "success" ]; then
                   passed=$((passed + 1))
+                elif [ "$conclusion" = "cancelled" ]; then
+                  cancelled=$((cancelled + 1))
                 elif [ "$conclusion" = "skipped" ] || [ "$conclusion" = "neutral" ]; then
                   :
                 else
@@ -124,19 +175,22 @@ jobs:
                 fi
               done
             fi
-            echo "  checks: $passed passed, $pending pending, $broken failed, $total total"
+            echo "  checks: $passed passed, $pending pending, $cancelled cancelled, $broken failed, $total total"
 
-            if [ "$total" -eq 0 ]; then
-              echo "  no checks reported yet; requesting CI on $branch"
-              if ! gh workflow run ci.yml --ref "$branch"; then
-                echo "::error title=CI dispatch failed::Could not start ci.yml on $branch"
-                fail=1
-              fi
-            elif [ "$pending" -gt 0 ]; then
+            if [ "$ci_total" -eq 0 ] || [ "$total" -eq 0 ]; then
+              echo "  no CI verdict for $head_sha yet"
+              request_ci
+            elif [ "$ci_running" -gt 0 ] || [ "$pending" -gt 0 ]; then
               echo "  CI still running on $head_sha; waiting for the next pass."
-            elif [ "$broken" -gt 0 ] || [ "$passed" -eq 0 ]; then
-              echo "::error title=Release PR checks are not green::PR #$number at $head_sha reports $broken failing and $passed successful check(s); refusing to merge it."
+            elif [ "$broken" -gt 0 ] || [ "$ci_broken" -gt 0 ]; then
+              echo "::error title=Release PR checks are not green::PR #$number at $head_sha reports $broken failing check(s) and $ci_broken failed ci.yml run(s); refusing to merge it."
               fail=1
+            elif [ "$cancelled" -gt 0 ] || [ "$ci_cancelled" -gt 0 ] || [ "$passed" -eq 0 ]; then
+              # A cancelled job carries no verdict. Counting it as a failure
+              # would strand the release PR until the stall timer fires, so ask
+              # for CI again rather than waiting for that.
+              echo "  no verdict for $head_sha: $cancelled cancelled check(s), $ci_cancelled cancelled ci.yml run(s), $passed successful check(s)"
+              request_ci
             else
               if [ "$(gh pr view "$number" --json autoMergeRequest --jq '.autoMergeRequest == null')" = "true" ]; then
                 echo "  checks are green for $head_sha; enabling auto-merge"
