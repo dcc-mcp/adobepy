@@ -32,8 +32,16 @@ jobs:
       pull-requests: write
       # Needed to read the release PR's check runs before merging it. GitHub
       # scopes the installation token to exactly the permissions listed here
-      # and zeroes everything else, so without this the gate's first
-      # check-runs call is rejected and the release PR is never merged.
+      # and zeroes everything else, so the gate declares the scope it uses
+      # rather than relying on a default.
+      #
+      # It is not currently load-bearing on this repository: it is public, so
+      # the check-runs call also succeeds on a token without this scope
+      # (measured in probe A of run 36394388128,
+      # https://github.com/dcc-mcp/adobepy/actions/runs/36394388128). It is
+      # kept because it becomes required the moment the repository turns
+      # private or GitHub tightens the default, and a missing scope then
+      # fails as "no verdict" rather than as an error.
       checks: read
       # Needed to start the CI workflow on the release PR branch.
       actions: write
@@ -123,29 +131,35 @@ jobs:
             # Filtering on the head SHA is what makes that safe: release-please
             # reuses the same branch across release cycles, so an older run on
             # this branch would otherwise clear a head that was never verified.
+            #
+            # Only the newest run for that head is adjudicated. A head can
+            # carry several runs — each pass that finds no verdict asks for a
+            # new one, and GitHub keeps the superseded ones — and the check-run
+            # side already collapses those with `filter=latest`. Counting every
+            # run here would leave a cancelled or failed ancestor on the record
+            # forever, so the verdict would keep re-requesting CI on a head
+            # whose latest run already succeeded, and never merge it. `gh run
+            # list` returns runs newest-first, so the first match is the newest.
             if ! ci_raw=$(gh run list --branch "$branch" --workflow ci.yml --limit 50 \
               --json headSha,status,conclusion \
-              --jq '.[] | select(.headSha == "'"$head_sha"'") | "\(.status)|\(.conclusion)"'); then
+              --jq '[.[] | select(.headSha == "'"$head_sha"'") | "\(.status)|\(.conclusion)"] | .[0] // empty'); then
               echo "::warning title=CI run query failed::Falling back to check runs for $head_sha"
               ci_raw=""
             fi
             ci_total=0; ci_running=0; ci_ok=0; ci_cancelled=0; ci_broken=0
             if [ -n "$ci_raw" ]; then
-              mapfile -t ci_runs <<< "$ci_raw"
-              ci_total=${#ci_runs[@]}
-              for run in "${ci_runs[@]}"; do
-                status="${run%%|*}"
-                conclusion="${run##*|}"
-                if [ "$status" != "completed" ]; then
-                  ci_running=$((ci_running + 1))
-                elif [ "$conclusion" = "success" ]; then
-                  ci_ok=$((ci_ok + 1))
-                elif [ "$conclusion" = "cancelled" ]; then
-                  ci_cancelled=$((ci_cancelled + 1))
-                else
-                  ci_broken=$((ci_broken + 1))
-                fi
-              done
+              ci_total=1
+              ci_status="${ci_raw%%|*}"
+              ci_conclusion="${ci_raw##*|}"
+              if [ "$ci_status" != "completed" ]; then
+                ci_running=1
+              elif [ "$ci_conclusion" = "success" ]; then
+                ci_ok=1
+              elif [ "$ci_conclusion" = "cancelled" ]; then
+                ci_cancelled=1
+              else
+                ci_broken=1
+              fi
             fi
             echo "  ci.yml: $ci_ok succeeded, $ci_running running, $ci_cancelled cancelled, $ci_broken failed ($ci_total run(s) for $head_sha)"
 
@@ -192,6 +206,21 @@ jobs:
               echo "  no verdict for $head_sha: $cancelled cancelled check(s), $ci_cancelled cancelled ci.yml run(s), $passed successful check(s)"
               request_ci
             else
+              # Every verdict above was computed against $head_sha. `main`
+              # declares no required status checks, so auto-merge would land
+              # whatever the branch points at when it is armed — including a
+              # commit release-please pushed after those queries ran, which
+              # this pass never looked at. Re-read the head and leave the
+              # round to the next pass instead of merging an unverified
+              # commit; that pass re-runs the whole verdict against the new
+              # head. Deliberately no CI request here: the head that would
+              # need one is the new one, and the next pass discovers it.
+              current_sha=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
+              if [ "$current_sha" != "$head_sha" ]; then
+                echo "  head moved under the verdict: judged $head_sha, now $current_sha; skipping this pass."
+                continue
+              fi
+
               if [ "$(gh pr view "$number" --json autoMergeRequest --jq '.autoMergeRequest == null')" = "true" ]; then
                 echo "  checks are green for $head_sha; enabling auto-merge"
                 if ! gh pr merge --auto --squash "$number"; then
