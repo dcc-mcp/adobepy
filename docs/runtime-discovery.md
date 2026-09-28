@@ -13,7 +13,13 @@ When a DCC MCP adapter needs to locate `adobepy.exe` (the broker CLI), it
 | Priority | Mechanism | Example |
 | --- | --- | --- |
 | 1 | `ADOBEPY_BROKER_PATH` environment variable | `C:\tools\adobepy\bin\adobepy.exe` |
-| 2 | `PATH` search | `where adobepy.exe` / `adobepy` on PATH |
+| 2 | `ADOBEPY_CLI` environment variable | `C:\tools\adobepy\bin\adobepy.exe` |
+| 3 | `PATH` search | `where adobepy.exe` / `adobepy` on PATH |
+| 4 | `ADOBEPY_HOME/bin` | `C:\tools\adobepy\bin\adobepy.exe` |
+
+`adobe.runtime.ensure_broker()` and `python -m adobe broker` implement this
+order in `adobe.cli.resolve_broker_executable()`. A directory may be given in
+place of the executable path, in which case `adobepy[.exe]` inside it is used.
 
 ### 1.1 Environment Variable: `ADOBEPY_BROKER_PATH`
 
@@ -21,19 +27,38 @@ Absolute path to the `adobepy.exe` binary, including the filename. When set,
 the adapter **must** use this value directly and skip all subsequent discovery
 steps.
 
+A set pin that does not resolve is an error, not a reason to continue with the
+remaining steps. Adapters pin the binary they verified by checksum, so falling
+through to `PATH` would start a different, unverified binary for token-bearing
+broker traffic.
+
 ```python
 import os
 import shutil
 
 
 def resolve_adobepy_broker() -> str | None:
-    explicit = os.environ.get("ADOBEPY_BROKER_PATH")
-    if explicit and os.path.isfile(explicit):
-        return explicit
+    # A pin that does not resolve must fail, never fall through to PATH.
+    for variable in ("ADOBEPY_BROKER_PATH", "ADOBEPY_CLI"):
+        explicit = os.environ.get(variable)
+        if not explicit:
+            continue
+        if os.path.isfile(explicit):
+            return explicit
+        candidate = os.path.join(explicit, "adobepy.exe")
+        if os.path.isdir(explicit) and os.path.isfile(candidate):
+            return candidate
+        return None
 
     resolved = shutil.which("adobepy")
     if resolved:
         return resolved
+
+    home = os.environ.get("ADOBEPY_HOME")
+    if home:
+        candidate = os.path.join(home, "bin", "adobepy.exe")
+        if os.path.isfile(candidate):
+            return candidate
 
     return None
 ```

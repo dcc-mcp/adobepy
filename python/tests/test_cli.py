@@ -12,6 +12,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 from adobe import cli
+from adobe.runtime import ensure_broker
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -64,6 +65,14 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn('target:"default"', config)
         self.assertIn("globalThis.__ADOBEPY_TOKEN", config)
         self.assertTrue(config.endswith("}());\n"))
+
+    def test_non_ascii_token_and_target_stay_raw_utf8(self):
+        # serde_json writes raw UTF-8; json.dumps escapes non-ASCII by default.
+        # Installers hash this file, so the bytes must match the Rust CLI.
+        config = cli.bridge_config_js("photoshop", None, "tokén-中文", "目标")
+        self.assertIn('token:"tokén-中文"', config)
+        self.assertIn('target:"目标"', config)
+        self.assertNotIn("\\u", config)
 
     def test_config_is_written_with_lf_newlines(self):
         # Installers compare bridge files by hash and the Rust CLI writes LF on
@@ -132,6 +141,15 @@ class StageBridgeTests(unittest.TestCase):
                 cli.stage_bridge("illustrator", root / "staged", "token", bridge_root=root)
             self.assertIn("npm run cep:build", str(raised.exception))
 
+    def test_explicit_bridges_dir_is_named_in_the_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = pathlib.Path(tmp) / "custom"
+            custom.mkdir()
+            with self.assertRaises(cli.CliError) as raised:
+                cli.stage_bridge("photoshop", pathlib.Path(tmp) / "staged", "token", bridge_root=custom)
+            self.assertIn(str(custom), str(raised.exception))
+            self.assertIn("--bridges-dir", str(raised.exception))
+
     def test_missing_bridge_root_reports_probed_locations(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
@@ -159,6 +177,17 @@ class StageBridgeTests(unittest.TestCase):
             _make_bridge_tree(root, "uxp", "photoshop")
             with self.assertRaises(cli.CliError):
                 cli.stage_bridge("photoshop", pathlib.Path(tmp) / "staged", "   ", bridge_root=root)
+
+    def test_host_must_be_a_known_bridge_host(self):
+        # Without this check a host such as `../../..` would escape the bridge
+        # root; the Rust CLI parses the host into a fixed enum instead.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _make_bridge_tree(root, "uxp", "photoshop")
+            for host in ("../../..", "bogus-host", ""):
+                with self.assertRaises(cli.CliError) as raised:
+                    cli.stage_bridge(host, root / "staged", "token", bridge_root=root)
+                self.assertIn("unsupported bridge host", str(raised.exception))
 
     def test_unknown_kind_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -281,6 +310,51 @@ class BrokerResolutionTests(unittest.TestCase):
                 resolved, locations = cli.resolve_broker_executable()
             self.assertEqual(resolved, str(binary))
             self.assertIn(str(binary), locations)
+
+    def test_unresolvable_pin_never_falls_back_to_path(self):
+        # docs/runtime-discovery.md 1.1: an explicit pin must be used directly
+        # and all later discovery steps skipped. Falling through to PATH here
+        # would start an unverified binary for an adapter that pinned the one it
+        # verified by checksum.
+        with tempfile.TemporaryDirectory() as tmp:
+            on_path = pathlib.Path(tmp) / cli._executable_name("adobepy")
+            on_path.write_text("", encoding="utf-8")
+            missing = pathlib.Path(tmp) / "missing" / "adobepy.exe"
+            with mock.patch.dict(
+                os.environ, {"ADOBEPY_BROKER_PATH": str(missing)}, clear=True
+            ), mock.patch("adobe.cli.shutil.which", return_value=str(on_path)):
+                resolved, _locations = cli.resolve_broker_executable()
+            self.assertIsNone(resolved)
+            with mock.patch.dict(
+                os.environ, {"ADOBEPY_BROKER_PATH": str(missing)}, clear=True
+            ), mock.patch("adobe.cli.shutil.which", return_value=str(on_path)):
+                with mock.patch("adobe.runtime._healthy", return_value=False), self.assertRaises(
+                    FileNotFoundError
+                ):
+                    ensure_broker()
+
+    def test_unresolvable_cli_pin_never_falls_back_to_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            on_path = pathlib.Path(tmp) / cli._executable_name("adobepy")
+            on_path.write_text("", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ, {"ADOBEPY_CLI": str(pathlib.Path(tmp) / "nope" / "adobepy.exe")}, clear=True
+            ), mock.patch("adobe.cli.shutil.which", return_value=str(on_path)):
+                resolved, _locations = cli.resolve_broker_executable()
+            self.assertIsNone(resolved)
+
+    def test_pin_to_a_directory_without_the_executable_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            on_path = pathlib.Path(tmp) / "bin" / cli._executable_name("adobepy")
+            on_path.parent.mkdir()
+            on_path.write_text("", encoding="utf-8")
+            empty_dir = pathlib.Path(tmp) / "empty"
+            empty_dir.mkdir()
+            with mock.patch.dict(
+                os.environ, {"ADOBEPY_BROKER_PATH": str(empty_dir)}, clear=True
+            ), mock.patch("adobe.cli.shutil.which", return_value=str(on_path)):
+                resolved, _locations = cli.resolve_broker_executable()
+            self.assertIsNone(resolved)
 
     def test_missing_broker_names_every_probe(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch(

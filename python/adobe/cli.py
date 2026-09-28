@@ -92,17 +92,28 @@ def broker_probe_locations() -> List[str]:
 
 
 def resolve_broker_executable() -> Tuple[Optional[str], List[str]]:
-    """Return the broker executable path and the locations probed to find it."""
+    """Return the broker executable path and the locations probed to find it.
+
+    An explicit pin (``ADOBEPY_BROKER_PATH`` or ``ADOBEPY_CLI``) is authoritative:
+    when it is set but does not resolve, this fails instead of falling through to
+    ``PATH``. Adapters pin the binary they verified by checksum, so quietly
+    starting an unverified ``PATH`` binary would bypass that check. See
+    ``docs/runtime-discovery.md`` sections 1.1 and 6.
+    """
 
     locations = broker_probe_locations()
     for variable in ("ADOBEPY_BROKER_PATH", "ADOBEPY_CLI"):
         value = _read_env(variable)
-        if value and os.path.isfile(value):
+        if not value:
+            continue
+        if os.path.isfile(value):
             return value, locations
-        if value and os.path.isdir(value):
-            candidate = Path(value) / _executable_name("adobepy")
-            if candidate.is_file():
-                return str(candidate), locations
+        candidate = Path(value) / _executable_name("adobepy")
+        if os.path.isdir(value) and candidate.is_file():
+            return str(candidate), locations
+        # A pin that does not resolve is an error, never a reason to fall
+        # through to PATH.
+        return None, locations
     found = shutil.which("adobepy")
     if found and os.path.isfile(found):
         return found, locations
@@ -238,12 +249,24 @@ def websocket_url(host: str, broker_url: Optional[str]) -> str:
     return f"{converted.rstrip('/')}/v1/bridge/{host}/ws"
 
 
+def _js_string(value: str) -> str:
+    """Serialize a string the way ``serde_json::to_string`` does.
+
+    ``json.dumps`` defaults to ``ensure_ascii=True``, which escapes non-ASCII
+    characters as backslash-u escapes. Rust emits raw UTF-8, so installers that
+    hash the generated bridge would see a different file for a non-ASCII token
+    or target.
+    """
+
+    return json.dumps(value, ensure_ascii=False)
+
+
 def bridge_config_js(host: str, broker_url: Optional[str], token: str, target: str) -> str:
     """Render ``adobepy.config.js`` exactly as the Rust CLI does."""
 
     return (
         "(function(){var config={brokerUrl:"
-        f"{json.dumps(websocket_url(host, broker_url))},token:{json.dumps(token)},target:{json.dumps(target)}"
+        f"{_js_string(websocket_url(host, broker_url))},token:{_js_string(token)},target:{_js_string(target)}"
         "};globalThis.__ADOBEPY_BROKER_URL=globalThis.__ADOBEPY_BROKER_URL||config.brokerUrl;"
         "globalThis.__ADOBEPY_TOKEN=globalThis.__ADOBEPY_TOKEN||config.token;"
         "globalThis.__ADOBEPY_TARGET=globalThis.__ADOBEPY_TARGET||config.target;}());\n"
@@ -300,13 +323,25 @@ def stage_bridge(
 
     if not token.strip():
         raise CliError("a broker token is required; pass --token or set ADOBEPY_TOKEN")
+    # The Rust CLI parses the host into a fixed enum; validate here so a host
+    # such as `../../..` cannot escape the bridge root and copy arbitrary files.
+    if host not in BRIDGE_KIND_BY_HOST:
+        raise CliError(
+            f"unsupported bridge host {host!r}; "
+            f"expected one of: {', '.join(sorted(BRIDGE_KIND_BY_HOST))}"
+        )
     resolved_kind = (kind or "auto").lower()
     if resolved_kind in ("", "auto"):
         resolved_kind = default_bridge_kind(host)
     if resolved_kind not in BRIDGE_REQUIRED_ARTIFACTS:
         raise CliError(f"unsupported bridge kind {resolved_kind!r}; expected 'uxp' or 'cep'")
 
-    root, locations = (Path(bridge_root), list(bridge_probe_locations())) if bridge_root else resolve_bridge_root()
+    if bridge_root is not None:
+        # Name the directory the caller actually passed in the error output.
+        locations = [f"--bridges-dir = {bridge_root}", *bridge_probe_locations()]
+        root: Optional[Path] = Path(bridge_root)
+    else:
+        root, locations = resolve_bridge_root()
     if root is None:
         raise CliError(bridge_remediation(locations))
     source = root / resolved_kind / host
