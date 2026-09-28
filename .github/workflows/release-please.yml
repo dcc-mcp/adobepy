@@ -210,11 +210,18 @@ jobs:
               # declares no required status checks, so auto-merge would land
               # whatever the branch points at when it is armed — including a
               # commit release-please pushed after those queries ran, which
-              # this pass never looked at. Re-read the head and leave the
-              # round to the next pass instead of merging an unverified
-              # commit; that pass re-runs the whole verdict against the new
-              # head. Deliberately no CI request here: the head that would
-              # need one is the new one, and the next pass discovers it.
+              # this pass never looked at. Two layers close that:
+              #
+              # 1. Re-read the head and leave the round to the next pass
+              #    instead of merging an unverified commit; that pass re-runs
+              #    the whole verdict against the new head. Deliberately no CI
+              #    request here: the head that would need one is the new one,
+              #    and the next pass discovers it.
+              # 2. `--match-head-commit` on the merge below. The re-read is
+              #    still check-then-act: the head can move between it and the
+              #    merge call. Handing the SHA to the API makes GitHub enforce
+              #    the match at merge time, so a late move fails the merge
+              #    instead of landing an unverified commit.
               current_sha=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
               if [ "$current_sha" != "$head_sha" ]; then
                 echo "  head moved under the verdict: judged $head_sha, now $current_sha; skipping this pass."
@@ -223,8 +230,8 @@ jobs:
 
               if [ "$(gh pr view "$number" --json autoMergeRequest --jq '.autoMergeRequest == null')" = "true" ]; then
                 echo "  checks are green for $head_sha; enabling auto-merge"
-                if ! gh pr merge --auto --squash "$number"; then
-                  echo "::error title=Auto-merge request failed::Could not enable auto-merge for #$number"
+                if ! gh pr merge --auto --squash --match-head-commit "$head_sha" "$number"; then
+                  echo "::error title=Auto-merge request failed::Could not enable auto-merge for #$number at $head_sha"
                   fail=1
                   continue
                 fi
