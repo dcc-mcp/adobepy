@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.10.1...adobepy-v0.11.0) (2026-09-28)
+
+
+### Features
+
+* **python:** add python -m adobe entry point with broker remediation ([#86](https://github.com/dcc-mcp/adobepy/issues/86)) ([1e8aafe](https://github.com/dcc-mcp/adobepy/commit/1e8aafecdce5c588ee0156a7355eb55ef787a654))
+
 ## [0.10.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.10.0...adobepy-v0.10.1) (2026-09-19)
 
 
