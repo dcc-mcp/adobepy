@@ -39,8 +39,24 @@ Verify the package without starting Adobe or a broker:
 python -c "from adobe.photoshop import Photoshop; from adobe.indesign import InDesign; from adobe.premiere import Premiere; from adobe.after_effects import AfterEffects; from adobe.illustrator import Illustrator; print('adobepy SDK import OK')"
 ~~~
 
-This installation provides the Python facades only. It does not provide the
-`adobepy` broker executable or Adobe bridge templates.
+This installation provides the Python facades and the `python -m adobe`
+helpers. It does not provide the `adobepy` broker executable or the Adobe
+bridge templates, so it cannot drive an Adobe host on its own.
+
+Verify what this installation can and cannot do:
+
+~~~powershell
+python -m adobe doctor
+~~~
+
+`doctor` reports the SDK, the Python runtime, a resolvable broker executable,
+the broker health endpoint, and a resolvable bridge template tree. Every failed
+check names the locations that were probed and where to obtain the missing
+part. Add `--json` for machine-readable output:
+
+~~~powershell
+python -m adobe doctor --json
+~~~
 
 ## Option 2: Install the Windows runtime bundle
 
@@ -130,6 +146,17 @@ and CEP for the last two. Use the Adobe UXP Developer Tool or the applicable CEP
 development workflow to load the copied directory into the matching Adobe
 application.
 
+A wheel-only install can run the same step through Python, for example on
+macOS and Linux where no broker binary is published:
+
+~~~bash
+python -m adobe install-bridge photoshop \
+  --dest ./bridges/photoshop \
+  --broker-url http://127.0.0.1:47391 \
+  --token "$ADOBEPY_TOKEN" \
+  --json
+~~~
+
 The generated `adobepy.config.js` contains the broker URL, target, and token.
 Treat it as a secret-bearing local file. Regenerate it if the token changes.
 
@@ -215,7 +242,18 @@ pyoxidizer build --path pyadobe --var ADOBEPY_WHEEL $wheel.FullName
 
 ### `adobepy` is not recognized
 
-Open a new terminal after `-AddToUserPath`, or invoke the executable directly:
+`pip install adobepy` does not provide the `adobepy` executable. The PyPI wheel
+ships the Python SDK and the `python -m adobe` helpers; the broker executable
+and bridge templates ship in the Windows runtime bundle described in Option 2.
+
+Run the Python entry point to see what is missing and where to get it:
+
+~~~powershell
+python -m adobe doctor
+~~~
+
+After installing the runtime bundle, open a new terminal after
+`-AddToUserPath`, or invoke the executable directly:
 
 ~~~powershell
 .\bin\adobepy.exe doctor
@@ -229,6 +267,17 @@ interpreter and reinstall into that same environment:
 ~~~powershell
 python -c "import sys; print(sys.executable)"
 python -m pip install --force-reinstall adobepy==0.5.2
+~~~
+
+### `No module named 'adobepy'` after installing `adobepy`
+
+The distribution name and the import name differ: install `adobepy`, import
+`adobe`. `import adobepy` fails by design and does not mean the installation is
+broken. Confirm the install with the import name and the entry point:
+
+~~~powershell
+python -c "import adobe; print('SDK import OK')"
+python -m adobe doctor
 ~~~
 
 ### `broker_port` is unhealthy
