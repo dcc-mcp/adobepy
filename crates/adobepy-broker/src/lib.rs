@@ -5137,6 +5137,25 @@ mod tests {
         observed
     }
 
+    /// Fresh directory under the system temp dir, with symlinks resolved.
+    ///
+    /// Configuration receipts reject a parent path that contains a symlink, and
+    /// on macOS the system temp dir is reached through one: `TMPDIR` is
+    /// `/var/folders/...`, a symlink to `/private/var/folders/...`. A directory
+    /// created under the unresolved `temp_dir()` therefore yields a parent chain
+    /// the production guard rejects, so any test that captures a receipt inside
+    /// it fails on macOS only. Canonicalizing here leaves the guard's own
+    /// coverage intact: a symlink a test introduces deliberately is created
+    /// after this call and is still rejected.
+    fn isolated_config_dir(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "adobepy-public-{label}-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::canonicalize(&root).unwrap_or(root)
+    }
+
     async fn wait_for_bootstrap_blocking_quiescence(state: &BrokerState, bound: Duration) {
         tokio::time::timeout(bound, async {
             loop {
@@ -7439,11 +7458,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn public_confirmation_rejects_a_config_edit_after_preflight_without_ready() {
-        let root = std::env::temp_dir().join(format!(
-            "adobepy-public-confirmation-{}",
-            Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir(&root).unwrap();
+        let root = isolated_config_dir("confirmation");
         let config_path = root.join("adobepy.config.js");
         std::fs::write(&config_path, b"old").unwrap();
         let fake = FakeBootstrapBackend::ready();

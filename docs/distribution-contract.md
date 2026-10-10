@@ -7,10 +7,19 @@
 | `adobepy` Python wheel | PyPI | DCC MCP adapters, skill scripts, end-user Python code |
 | `adobepy-<version>-windows-x64.zip` | GitHub Release | dcc-mcp-photoshop, host runners, manual installs |
 | `adobepy-<version>-windows-x64.zip.sha256` | GitHub Release | Integrity verification |
+| `adobepy-standalone-<version>-macos-arm64.zip` | GitHub Release | macOS arm64 standalone interpreter |
+| `adobepy-standalone-<version>-macos-arm64.zip.sha256` | GitHub Release | Integrity verification |
+| `adobepy-standalone-<version>-linux-x64.zip` | GitHub Release | Linux x86_64 standalone interpreter |
+| `adobepy-standalone-<version>-linux-x64.zip.sha256` | GitHub Release | Integrity verification |
 
 The two channels are independent: PyPI contains **only** the Python SDK, and the
 GitHub Release asset contains **only** the broker/runtime bundle. A consumer that
 needs both must install from both channels.
+
+The Windows bundle and the two standalone archives are different artifacts, not
+the same bundle built three times. The standalone archives ship a PyOxidizer
+interpreter with the SDK embedded; they carry no bridge tree, no install script,
+and no native broker CLI. See [section 2b](#2b-github-release--standalone-interpreter-bundles).
 
 ---
 
@@ -158,20 +167,82 @@ named `adobepy-windows-x64`.
 
 ### Release workflow
 
-1. A maintainer creates a GitHub Release from a tag (e.g. `v0.1.0`).
-2. The `release.yml` workflow runs:
+1. Release Please opens a release PR; once it merges, the release workflow cuts
+   the tag and the GitHub Release.
+2. The `release-please.yml` workflow runs:
    - `python-package`: builds, checks, and smoke-installs the Python wheel.
-   - `pypi`: publishes the wheel to PyPI (only on `release` event or manual
-     `publish_to_pypi=true`).
-   - `windows-package`: builds the full Windows bundle and uploads artifacts.
-3. After the workflow completes, the release draft is published so the `.zip`
-   artifact is attached to the GitHub Release page.
+   - `pypi`: publishes the wheel to PyPI.
+   - `windows-package`: builds the full Windows bundle and uploads it to the
+     release.
+   - `standalone-package`: builds the macOS arm64 and Linux x86_64 standalone
+     interpreters and uploads them to the same release.
+
+`release-please.yml` is the only workflow that publishes to a release tag.
+`release.yml` is the manual rebuild path (`workflow_dispatch` with an explicit
+`release_tag`); its macOS and Linux standalone jobs are disabled with `if: false`
+so the two workflows can never upload the same asset name for one release.
 
 ### Version scheme
 
 Semantic versioning (`<major>.<minor>.<patch>`). Pre-release suffixes (e.g.
-`-alpha.1`, `-rc.1`) are allowed during development. The Python wheel and the
-Windows bundle share the same version string.
+`-alpha.1`, `-rc.1`) are allowed during development. The Python wheel, the
+Windows bundle, and both standalone archives share the same version string.
+
+---
+
+## 2b. GitHub Release — Standalone Interpreter Bundles
+
+### Archive naming
+
+```
+adobepy-standalone-<version>-macos-arm64.zip
+adobepy-standalone-<version>-macos-arm64.zip.sha256
+adobepy-standalone-<version>-linux-x64.zip
+adobepy-standalone-<version>-linux-x64.zip.sha256
+```
+
+The runtime id in the filename is asserted, not derived: each job fails if the
+runner does not report the architecture its asset name claims. A macOS runner
+that silently falls back to x86_64 is never published as `macos-arm64`.
+
+### What is inside
+
+A PyOxidizer build of the interpreter with the `adobepy` SDK embedded, rooted at
+the PyOxidizer `install` directory. The entry point is `adobepy-python`.
+
+These archives are deliberately narrower than the Windows bundle: they carry no
+bridge tree, no `install.ps1`, and no native broker CLI. They exist so the SDK
+is importable on a machine with no Python installed, not to replace the runtime
+bundle.
+
+### Build pipeline
+
+Built by the `standalone-package` matrix in `release-please.yml`, on
+`macos-latest` and `ubuntu-latest` respectively. Each leg builds the wheel, runs
+`pyoxidizer build`, asserts the runner architecture, packages the `install`
+directory as a zip plus sha256, and then smoke-tests the unpacked interpreter
+before uploading.
+
+The smoke test runs:
+
+```python
+from adobe.photoshop import Photoshop
+```
+
+That import only loads the SDK — it opens no connection — so it passes with no
+Adobe host present. This is what makes the Linux leg meaningful at all: it
+proves the interpreter boots and the SDK is importable, not that a live host is
+reachable. The Linux archive therefore carries no claim of Photoshop support.
+
+### Platform coverage
+
+| Runtime id | Status |
+| --- | --- |
+| `macos-arm64` | Published |
+| `linux-x64` | Published |
+| `windows-x64` | Published, as the Windows runtime bundle in section 2 |
+| macOS x86_64 | Not published |
+| Linux arm64 | Not published |
 
 ---
 
@@ -193,6 +264,7 @@ Python SDK version is bumped to match.
 | Install bridge templates | No | Yes (manual copy from archive) |
 | CI dependency (`adobepy>=0.1.0`) | Yes | No |
 | Manual Windows install | Recommend both | Yes |
+| macOS arm64 / Linux x86_64 SDK import | No | Yes (standalone archive) |
 | macOS / Linux brokering | No | No (Phase 1) |
 
 ---
