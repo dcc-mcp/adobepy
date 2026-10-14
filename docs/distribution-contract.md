@@ -12,9 +12,10 @@
 | `adobepy-standalone-<version>-linux-x64.zip` | GitHub Release | Linux x86_64 standalone interpreter |
 | `adobepy-standalone-<version>-linux-x64.zip.sha256` | GitHub Release | Integrity verification |
 
-The two channels are independent: PyPI contains **only** the Python SDK, and the
-GitHub Release asset contains **only** the broker/runtime bundle. A consumer that
-needs both must install from both channels.
+The two channels are independent: PyPI contains the Python SDK **and the built
+bridge templates** (under `adobe/_bridges`), and the GitHub Release asset contains
+**only** the broker/runtime bundle. A consumer that needs the broker must install
+from the release channel; bridge templates install from either.
 
 The Windows bundle and the two standalone archives are different artifacts, not
 the same bundle built three times. The standalone archives ship a PyOxidizer
@@ -238,8 +239,8 @@ reachable. The Linux archive therefore carries no claim of Photoshop support.
 
 | Runtime id | Status |
 | --- | --- |
-| `macos-arm64` | Published |
-| `linux-x64` | Published |
+| `macos-arm64` | Built by `release-please.yml`; not yet published (no release has cut it) |
+| `linux-x64` | Built by `release-please.yml`; not yet published (no release has cut it) |
 | `windows-x64` | Published, as the Windows runtime bundle in section 2 |
 | macOS x86_64 | Not published |
 | Linux arm64 | Not published |

@@ -27,6 +27,7 @@ from scripts.check_native_abi3_config import (
 )
 from scripts.stage_wheel_bridges import (
     BridgeStagingError,
+    assert_staged_matches_source,
     discover_hosts,
     stage_bridges,
 )
@@ -262,8 +263,13 @@ if (response.result !== 5) {
             self.assertIn("stage_wheel_bridges.py", str(raised.exception))
 
     def test_release_jobs_build_bridges_before_the_wheel(self):
-        # Every workflow that builds a wheel must run the npm bridge builds and
-        # the staging step first, or the published wheel ships without bridges.
+        # Every job that builds a wheel must run the npm bridge builds and the
+        # staging step first, or the published wheel ships without bridges.
+        #
+        # Ordering is asserted per job, not across the file: a workflow declares
+        # several independent jobs, so a file-wide index comparison would pit one
+        # job's staging step against another job's build step and stay green even
+        # when a single job is ordered wrongly.
         for name in ("ci.yml", "release.yml", "release-please.yml"):
             workflow = (REPO_ROOT / ".github" / "workflows" / name).read_text(
                 encoding="utf-8"
@@ -271,17 +277,49 @@ if (response.result !== 5) {
             self.assertIn("stage_wheel_bridges.py", workflow, name)
             self.assertIn("npm run uxp:build", workflow, name)
             self.assertIn("npm run cep:build", workflow, name)
-            self.assertLess(
-                workflow.index("npm run uxp:build"),
-                workflow.index("stage_wheel_bridges.py"),
-                name,
-            )
-            if "check_wheel_bridges.py" in workflow:
+            jobs = [
+                block
+                for block in re.split(r"(?m)^  [A-Za-z0-9_-]+:\s*$", workflow)
+                if "stage_wheel_bridges.py" in block
+            ]
+            self.assertTrue(jobs, f"{name}: no job stages bridge templates")
+            for index, job in enumerate(jobs):
+                where = f"{name} job {index}"
+                self.assertIn("npm run uxp:build", job, where)
+                self.assertIn("npm run cep:build", job, where)
                 self.assertLess(
-                    workflow.index("-m build"),
-                    workflow.rindex("check_wheel_bridges.py"),
-                    name,
+                    job.index("npm run uxp:build"),
+                    job.index("stage_wheel_bridges.py"),
+                    where,
                 )
+                # The regression this test is named for: staging must precede the
+                # wheel build inside the same job. Without this, a job that stages
+                # bridges after `python -m build` still passes every assertion
+                # above, which is exactly what a mutation probe confirmed.
+                #
+                # Anchor on the `- run:` / `python3 -m build --wheel` command
+                # lines rather than a bare substring: `-m build` also appears in
+                # `pip install --upgrade build twine`, and `python -m build`
+                # appears inside explanatory comments.
+                build_lines = [
+                    match.start()
+                    for match in re.finditer(
+                        r"(?m)^\s*(?:- run:\s*|[a-z0-9_]+=\()?\s*python3?(?:\.exe)? -m build\b",
+                        job,
+                    )
+                ]
+                self.assertTrue(build_lines, f"{where}: no wheel build command found")
+                self.assertLess(
+                    job.index("stage_wheel_bridges.py"),
+                    build_lines[0],
+                    where,
+                )
+                if "check_wheel_bridges.py" in job:
+                    self.assertLess(
+                        build_lines[0],
+                        job.index("check_wheel_bridges.py"),
+                        where,
+                    )
 
     def test_stage_bridges_copies_every_built_host(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -345,6 +383,47 @@ if (response.result !== 5) {
                 ),
                 "fresh\n",
             )
+
+    def test_staged_tree_matches_the_built_source_byte_for_byte(self):
+        # The staged copies are tracked, so a clean checkout can build a wheel
+        # without running the npm builds. That only stays safe while the committed
+        # tree matches what `bridges/` actually builds.
+        assert_staged_matches_source(REPO_ROOT / "bridges", REPO_ROOT / "python" / "adobe" / "_bridges")
+
+    def test_staged_tree_is_rejected_when_it_drifts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            source = root / "bridges" / "uxp" / "photoshop"
+            (source / "dist").mkdir(parents=True)
+            (source / "dist" / "main.js").write_text("fresh\n", encoding="utf-8")
+            (source / "index.html").write_text("<html/>\n", encoding="utf-8")
+            (source / "manifest.json").write_text("{}\n", encoding="utf-8")
+            stage_root = root / "staged"
+            stage_bridges(root / "bridges", stage_root)
+            assert_staged_matches_source(root / "bridges", stage_root)
+
+            (stage_root / "uxp" / "photoshop" / "dist" / "main.js").write_text(
+                "stale\n", encoding="utf-8"
+            )
+            with self.assertRaises(BridgeStagingError) as raised:
+                assert_staged_matches_source(root / "bridges", stage_root)
+            self.assertIn("stale", str(raised.exception))
+
+    def test_staged_tree_rejects_files_the_source_no_longer_builds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            source = root / "bridges" / "uxp" / "photoshop"
+            (source / "dist").mkdir(parents=True)
+            (source / "dist" / "main.js").write_text("// bridge\n", encoding="utf-8")
+            (source / "index.html").write_text("<html/>\n", encoding="utf-8")
+            (source / "manifest.json").write_text("{}\n", encoding="utf-8")
+            stage_root = root / "staged"
+            stage_bridges(root / "bridges", stage_root)
+            stray = stage_root / "uxp" / "photoshop" / "dist" / "retired.js"
+            stray.write_text("// gone\n", encoding="utf-8")
+            with self.assertRaises(BridgeStagingError) as raised:
+                assert_staged_matches_source(root / "bridges", stage_root)
+            self.assertIn("retired.js", str(raised.exception))
 
     def test_native_abi3_contract_rejects_wrong_pyo3_floor(self):
         with tempfile.TemporaryDirectory() as tmp:

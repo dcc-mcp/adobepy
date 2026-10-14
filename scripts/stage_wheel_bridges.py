@@ -108,6 +108,64 @@ def stage_bridges(
     return staged
 
 
+def assert_staged_matches_source(
+    bridge_root: pathlib.Path = BRIDGE_ROOT,
+    stage_root: pathlib.Path = STAGE_ROOT,
+) -> List[str]:
+    """Verify the staged tree is byte-for-byte identical to the built source.
+
+    The staged files are tracked in git, so a clean checkout can build a wheel
+    without running the npm bridge builds. That convenience becomes a hazard if
+    the committed copy silently drifts from `bridges/`: the wheel would ship
+    stale templates and nothing would notice. Compare contents, not just
+    presence, so drift fails loudly.
+    """
+
+    compared: List[str] = []
+    for kind in KINDS:
+        for host in discover_hosts(bridge_root, kind):
+            source_host = bridge_root / kind / host
+            staged_host = stage_root / kind / host
+            source_files = sorted(
+                path.relative_to(source_host).as_posix()
+                for path in source_host.rglob("*")
+                if path.is_file()
+            )
+            for relative in source_files:
+                staged_file = staged_host / relative
+                if not staged_file.is_file():
+                    raise BridgeStagingError(
+                        f"staged bridge tree is missing {kind}/{host}/{relative}; "
+                        "run `python scripts/stage_wheel_bridges.py`"
+                    )
+                source_bytes = (source_host / relative).read_bytes()
+                staged_bytes = staged_file.read_bytes()
+                if source_bytes != staged_bytes:
+                    raise BridgeStagingError(
+                        f"staged bridge file is stale: {kind}/{host}/{relative} differs "
+                        "from the built source; run `python scripts/stage_wheel_bridges.py` "
+                        "and commit the refreshed tree"
+                    )
+                compared.append(f"{kind}/{host}/{relative}")
+            # Files staged for a host that no longer exists upstream are drift too.
+            if staged_host.is_dir():
+                stray = sorted(
+                    path.relative_to(staged_host).as_posix()
+                    for path in staged_host.rglob("*")
+                    if path.is_file()
+                )
+                for relative in stray:
+                    if relative not in source_files:
+                        raise BridgeStagingError(
+                            f"staged bridge tree has a file the source no longer builds: "
+                            f"{kind}/{host}/{relative}; run "
+                            "`python scripts/stage_wheel_bridges.py`"
+                        )
+    if not compared:
+        raise BridgeStagingError(f"no bridge templates were found under {bridge_root}")
+    return compared
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Stage built bridge templates into the wheel package data tree."
@@ -137,6 +195,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise BridgeStagingError(
                     f"staged bridge tree is missing: {args.stage_root}"
                 )
+            assert_staged_matches_source(args.bridge_root, args.stage_root)
             staged: List[str] = []
             for kind in KINDS:
                 for host in discover_hosts(args.bridge_root, kind):

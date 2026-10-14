@@ -28,7 +28,17 @@ fn isolated_dir(label: &str) -> std::path::PathBuf {
     let path =
         std::env::temp_dir().join(format!("adobepy-{label}-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir(&path).unwrap();
-    path
+    // On macOS the system temp dir is reached through a symlink (`TMPDIR` is
+    // `/var/folders/...`, resolving to `/private/var/folders/...`), and the
+    // production receipt guards reject a parent path containing one. Canonicalize
+    // so fixtures land on the resolved path, matching `src/lib.rs`.
+    match std::fs::canonicalize(&path) {
+        Ok(canonical) => canonical,
+        // `canonicalize` needs the path to exist, which it does, so a failure
+        // here is environmental rather than a test condition. Fall back to the
+        // unresolved root instead of masking it.
+        Err(_) => path,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
