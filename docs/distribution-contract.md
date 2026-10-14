@@ -12,10 +12,9 @@
 | `adobepy-standalone-<version>-linux-x64.zip` | GitHub Release | Linux x86_64 standalone interpreter |
 | `adobepy-standalone-<version>-linux-x64.zip.sha256` | GitHub Release | Integrity verification |
 
-The two channels are independent: PyPI contains the Python SDK **and the built
-bridge templates** (under `adobe/_bridges`), and the GitHub Release asset contains
-**only** the broker/runtime bundle. A consumer that needs the broker must install
-from the release channel; bridge templates install from either.
+The two channels are independent: PyPI contains **only** the Python SDK, and the
+GitHub Release asset contains **only** the broker/runtime bundle. A consumer that
+needs both must install from both channels.
 
 The Windows bundle and the two standalone archives are different artifacts, not
 the same bundle built three times. The standalone archives ship a PyOxidizer
@@ -262,7 +261,7 @@ Python SDK version is bumped to match.
 | --- | --- | --- |
 | Install Python SDK only | Yes | No |
 | Run broker + CLI | No | Yes |
-| Install bridge templates | Yes (bundled in `adobe/_bridges`) | Yes (manual copy from archive) |
+| Install bridge templates | No | Yes (manual copy from archive) |
 | CI dependency (`adobepy>=0.1.0`) | Yes | No |
 | Manual Windows install | Recommend both | Yes |
 | macOS arm64 / Linux x86_64 SDK import | No | Yes (standalone archive) |

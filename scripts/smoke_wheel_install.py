@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 import venv
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Sequence
 
 SMOKE_SOURCE = """
 from adobe.photoshop import Photoshop
@@ -54,93 +53,8 @@ def venv_python(venv_dir: pathlib.Path) -> pathlib.Path:
     return venv_dir / "bin" / "python"
 
 
-def run(
-    command: Sequence[str], *, cwd: pathlib.Path, env: Optional[dict] = None
-) -> None:
-    subprocess.run(command, cwd=str(cwd), check=True, env=env)
-
-
-# The wheel-only path that used to fail outright: no release bundle, no
-# ADOBEPY_* overrides, and a cwd outside any source checkout.
-BRIDGE_SMOKE_SOURCE = """
-import json
-import pathlib
-import subprocess
-import sys
-
-destination = pathlib.Path(sys.argv[1])
-result = subprocess.run(
-    [
-        sys.executable,
-        "-m",
-        "adobe",
-        "install-bridge",
-        "photoshop",
-        "--dest",
-        str(destination),
-        "--token",
-        "smoke-token",
-        "--json",
-    ],
-    capture_output=True,
-    text=True,
-)
-if result.returncode != 0:
-    raise SystemExit(
-        "install-bridge failed with exit code "
-        f"{result.returncode}\\nstdout: {result.stdout}\\nstderr: {result.stderr}"
-    )
-payload = json.loads(result.stdout)
-assert payload["success"] is True, payload
-for artifact in (
-    "manifest.json",
-    "index.html",
-    "adobepy.config.js",
-    "src/main.ts",
-    "dist/main.js",
-):
-    if not (destination / artifact).is_file():
-        raise SystemExit(f"staged bridge is missing {artifact}")
-print("adobepy wheel bridge install smoke passed")
-"""
-
-
-def bridge_smoke_environment() -> dict:
-    """Strip every ADOBEPY_* override so only bundled assets can resolve."""
-
-    return {key: value for key, value in os.environ.items() if not key.startswith("ADOBEPY_")}
-
-
-def smoke_bridge_install(python: pathlib.Path, cwd: pathlib.Path) -> None:
-    destination = cwd / "staged-bridge"
-    run(
-        [
-            str(python),
-            "-c",
-            BRIDGE_SMOKE_SOURCE,
-            str(destination),
-        ],
-        cwd=cwd,
-        env=bridge_smoke_environment(),
-    )
-    doctor = subprocess.run(
-        [str(python), "-m", "adobe", "doctor", "--json"],
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        env=bridge_smoke_environment(),
-    )
-    checks = {check["name"]: check for check in json.loads(doctor.stdout)}
-    if not checks["bridge_templates"]["ok"]:
-        raise SystemExit(
-            "doctor did not resolve bundled bridge templates: "
-            + checks["bridge_templates"]["detail"]
-        )
-    if "_bridges" not in checks["bridge_templates"]["detail"]:
-        raise SystemExit(
-            "doctor resolved bridge templates from somewhere other than adobe/_bridges: "
-            + checks["bridge_templates"]["detail"]
-        )
+def run(command: Sequence[str], *, cwd: pathlib.Path) -> None:
+    subprocess.run(command, cwd=str(cwd), check=True)
 
 
 def smoke_wheel(wheel: pathlib.Path) -> None:
@@ -153,10 +67,9 @@ def smoke_wheel(wheel: pathlib.Path) -> None:
             [str(python), "-m", "pip", "install", "--no-deps", str(wheel)], cwd=tmp_path
         )
         run([str(python), "-c", SMOKE_SOURCE], cwd=tmp_path)
-        smoke_bridge_install(python, tmp_path)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Smoke-test built adobepy wheels in a temporary venv"
     )

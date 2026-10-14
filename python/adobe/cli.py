@@ -414,8 +414,8 @@ def doctor(*, json_output: bool, broker_url: Optional[str] = None) -> int:
             print(f"{status}  {check['name']:<18} {check['detail']}")
         if not all(check["ok"] for check in checks):
             print(
-                "\nSome checks need attention. The PyPI wheel ships the Python SDK and\n"
-                f"the bridge templates; only the broker ships in the runtime bundle at {RELEASES_URL}."
+                "\nSome checks need attention. The PyPI wheel ships the Python SDK only;\n"
+                f"the broker and bridge templates ship in the runtime bundle at {RELEASES_URL}."
             )
     return EXIT_OK if all(check["ok"] for check in checks) else EXIT_FAILURE
 

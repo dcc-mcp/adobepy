@@ -269,38 +269,6 @@ class BridgeRootResolutionTests(unittest.TestCase):
         with mock.patch("adobe.cli._distribution_version", side_effect=cli.PackageNotFoundError("adobepy")):
             self.assertEqual(cli.sdk_version(), "unknown")
 
-    def test_bundled_bridge_root_is_probed_before_the_source_checkout(self):
-        # A wheel-only install has no repository root, so `adobe/_bridges` is the
-        # only source that can resolve bridge templates for it.
-        with tempfile.TemporaryDirectory() as tmp:
-            bundled = pathlib.Path(tmp)
-            _make_bridge_tree(bundled, "uxp", "photoshop")
-            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-                cli, "_bundled_bridge_root", return_value=bundled
-            ), mock.patch.object(cli, "_find_repo_root", return_value=None):
-                locations = cli.bridge_probe_locations()
-                resolved, _ = cli.resolve_bridge_root()
-            self.assertEqual(resolved, bundled)
-            self.assertNotIn("not bundled", " ".join(locations))
-
-    def test_doctor_reports_bundled_bridge_templates(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            # Mirror the installed layout: the tree lives under `adobe/_bridges`,
-            # which is what the doctor output is asserted to name.
-            bundled = pathlib.Path(tmp) / "adobe" / "_bridges"
-            _make_bridge_tree(bundled, "uxp", "photoshop")
-            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-                cli, "_bundled_bridge_root", return_value=bundled
-            ), mock.patch.object(cli, "_find_repo_root", return_value=None), mock.patch.object(
-                cli, "resolve_broker_executable", return_value=("adobepy", [])
-            ):
-                buffer = io.StringIO()
-                with redirect_stdout(buffer):
-                    cli.doctor(json_output=True)
-                checks = {item["name"]: item for item in json.loads(buffer.getvalue())}
-            self.assertTrue(checks["bridge_templates"]["ok"])
-            self.assertIn("_bridges", checks["bridge_templates"]["detail"])
-
 
 class BrokerResolutionTests(unittest.TestCase):
     def test_environment_overrides_path(self):
