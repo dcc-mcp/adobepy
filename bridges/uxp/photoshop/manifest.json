@@ -30,7 +30,8 @@
         "http://127.0.0.1:47391",
         "http://localhost:47391"
       ]
-    }
+    },
+    "localFileSystem": "fullAccess"
   },
   "main": "index.html"
 }
