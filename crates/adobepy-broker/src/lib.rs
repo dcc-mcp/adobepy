@@ -6213,16 +6213,17 @@ mod tests {
             "background recovery must retain the fail-closed reservation"
         );
         // Recovery terminates (125 ms) and then rolls back (125 ms) on a
-        // blocking worker, so a 1 s ceiling sat within an order of magnitude
-        // of the work and could expire on a loaded runner. Wait on the state
-        // actually being reached, with a ceiling far clear of the 250 ms of
-        // injected delay so only a genuine hang fails.
+        // blocking worker. Poll with a real sleep rather than spinning on
+        // `yield_now`: on a two-worker runtime a yield-loop keeps a worker
+        // hot and starves the very recovery it is waiting for, so the wait
+        // can outlive a much larger ceiling. The ceiling stays far clear of
+        // the injected delay so only a genuine hang fails.
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if !state.bootstrap_grants.lock().await.contains_key(&key) {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -6795,8 +6796,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn staggered_follower_uses_its_own_entry_deadline_without_cancelling_owner() {
         let backend = FakeBootstrapBackend::ready();
+        // Both callers must share one deadline: a grant is only joinable when
+        // the incoming request compares equal to the owner's, so giving them
+        // different budgets would make the follower a conflicting bootstrap
+        // rather than a waiter.
+        //
+        // The delays are sized so the two roles stay on opposite sides of the
+        // shared 500 ms. The owner's attestation (300 ms) plus prepare (250 ms)
+        // has to finish inside it, or a loaded runner expires the owner at the
+        // verify stage. The follower has to still be waiting at handler entry
+        // when its own 500 ms expires, which is why the owner's work cannot
+        // simply be made very short.
         backend.first_attest_delay_ms.store(300, Ordering::SeqCst);
-        backend.prepare_delay_ms.store(400, Ordering::SeqCst);
+        backend.prepare_delay_ms.store(250, Ordering::SeqCst);
         let state = bootstrap_state(backend.clone());
         let request = bootstrap_request(500);
 
