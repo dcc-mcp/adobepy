@@ -60,6 +60,15 @@ const BOOTSTRAP_BLOCKING_CAPACITY: usize = 2;
 const BOOTSTRAP_BLOCKING_QUEUE: usize = 2;
 const BOOTSTRAP_CLEANUP_CAPACITY: usize = 1;
 const BOOTSTRAP_RECOVERY_GRACE_MS: u64 = 175;
+/// Budget for one cleanup step (host termination, or a transaction rollback)
+/// while a failed bootstrap is being recovered in the background.
+///
+/// Recovery runs after the caller's own deadline has already expired, so this
+/// is not bounded by the request and has to cover the step's real work with
+/// room to spare. Sizing it close to the expected duration makes recovery
+/// fail closed on a loaded runner: a step that overruns leaves the grant
+/// retained, which turns a slow host into a bootstrap that never releases.
+const BOOTSTRAP_CLEANUP_STEP_GRACE_MS: u64 = 2_000;
 /// Floor for the deadline handed to `BootstrapBlockingBoundary` when it wraps a
 /// host process probe.
 ///
@@ -1838,14 +1847,16 @@ impl BrokerState {
         let key = key.to_owned();
         tokio::spawn(async move {
             let (nonce, completion, transaction, launched) = recovery;
-            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+            let cleanup_deadline = tokio::time::Instant::now()
+                + Duration::from_millis(BOOTSTRAP_CLEANUP_STEP_GRACE_MS);
             let host_failed = if let Some(launched) = launched {
                 launched.terminate_and_reap(cleanup_deadline).await.is_err()
             } else {
                 false
             };
             let rollback_failed = if let Some(transaction) = transaction {
-                let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+                let cleanup_deadline = tokio::time::Instant::now()
+                    + Duration::from_millis(BOOTSTRAP_CLEANUP_STEP_GRACE_MS);
                 !matches!(
                     blocking
                         .execute_cleanup(cleanup_deadline, move || transaction.rollback())
@@ -2431,14 +2442,16 @@ impl BrokerState {
             }
             (grant.transaction.take(), grant.launched.take())
         };
-        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+        let cleanup_deadline =
+            tokio::time::Instant::now() + Duration::from_millis(BOOTSTRAP_CLEANUP_STEP_GRACE_MS);
         let host_failed = if let Some(launched) = launched {
             launched.terminate_and_reap(cleanup_deadline).await.is_err()
         } else {
             false
         };
         let rollback_failed = if let Some(transaction) = transaction {
-            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+            let cleanup_deadline = tokio::time::Instant::now()
+                + Duration::from_millis(BOOTSTRAP_CLEANUP_STEP_GRACE_MS);
             !matches!(
                 self.bootstrap_blocking
                     .execute_cleanup(cleanup_deadline, move || transaction.rollback())
@@ -6213,17 +6226,17 @@ mod tests {
             "background recovery must retain the fail-closed reservation"
         );
         // Recovery terminates (125 ms) and then rolls back (125 ms) on a
-        // blocking worker. Poll with a real sleep rather than spinning on
-        // `yield_now`: on a two-worker runtime a yield-loop keeps a worker
-        // hot and starves the very recovery it is waiting for, so the wait
-        // can outlive a much larger ceiling. The ceiling stays far clear of
-        // the injected delay so only a genuine hang fails.
+        // blocking worker, and only releases the grant once both finish. Wait
+        // for the grant to go away, but yield the runtime between checks: on a
+        // two-worker runtime a tight poll loop keeps a worker hot and starves
+        // the recovery it is waiting for, so no ceiling is large enough to
+        // make bare polling reliable. The ceiling is only a hang detector.
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if !state.bootstrap_grants.lock().await.contains_key(&key) {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
