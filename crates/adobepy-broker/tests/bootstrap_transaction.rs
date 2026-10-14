@@ -197,7 +197,14 @@ async fn helper_staging_is_generation_scoped_and_inert() {
         std::fs::read(&path).unwrap(),
         b"PRIVATE_STAGED_CONFIGURATION"
     );
-    assert!(path.starts_with(std::env::temp_dir().join("adobepy-bootstrap-staging")));
+    // The staging root is canonicalized server-side (see
+    // `canonical_temp_root`), so compare canonicalized prefixes: on Windows
+    // `temp_dir()` can carry an unresolved short-form component.
+    assert!(path.starts_with(
+        std::fs::canonicalize(std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("adobepy-bootstrap-staging")
+    ));
     std::fs::remove_file(&path).unwrap();
     std::fs::remove_dir(path.parent().unwrap()).unwrap();
     assert!(
