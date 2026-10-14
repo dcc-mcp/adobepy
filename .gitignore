@@ -12,3 +12,8 @@ __pycache__/
 htmlcov/
 .venv/
 *.egg-info/
+
+# Bridge templates staged into the wheel by `scripts/stage_wheel_bridges.py`.
+# Their `dist/` build outputs must be committable so a source build can package
+# them, so it is un-ignored here against the repo-wide `dist/` rule above.
+!python/adobe/_bridges/**/dist/
