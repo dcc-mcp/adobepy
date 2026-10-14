@@ -8,6 +8,11 @@ import unittest
 import zipfile
 import xml.etree.ElementTree as ET
 
+from scripts.check_wheel_bridges import (
+    REQUIRED_BRIDGE_FILES,
+    WheelBridgeError,
+    assert_bundled_bridges,
+)
 from scripts.check_wheel_compat import (
     REQUIRED_PACKAGE_FILES,
     WheelCompatibilityError,
@@ -19,6 +24,11 @@ from scripts.check_native_abi3_config import (
     NativeAbi3ConfigError,
     assert_native_abi3_contract,
     assert_pyo3_cargo_toml,
+)
+from scripts.stage_wheel_bridges import (
+    BridgeStagingError,
+    discover_hosts,
+    stage_bridges,
 )
 
 
@@ -221,6 +231,120 @@ if (response.result !== 5) {
 
     def test_native_abi3_contract(self):
         assert_native_abi3_contract(REPO_ROOT)
+
+    def test_packaging_declares_bundled_bridge_data(self):
+        # `adobe/_bridges` is generated, and its `dist/` output is excluded by the
+        # repo-wide `dist/` ignore rule, so packaging needs both an explicit
+        # package-data glob and a matching un-ignore entry.
+        pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('[tool.setuptools.package-data]', pyproject)
+        self.assertIn('"adobe" = ["_bridges/**/*"]', pyproject)
+        self.assertIn("_bridges", pyproject)
+        gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("!python/adobe/_bridges/**/dist/", gitignore)
+
+    def test_wheel_bridge_check_accepts_a_bundled_wheel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wheel = pathlib.Path(tmp) / "adobepy-0.11.0-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                for name in REQUIRED_BRIDGE_FILES:
+                    archive.writestr(name, "")
+                archive.writestr("adobe/_bridges/uxp/photoshop/src/main.ts", "")
+            self.assertGreaterEqual(assert_bundled_bridges(wheel), len(REQUIRED_BRIDGE_FILES))
+
+    def test_wheel_bridge_check_rejects_a_wheel_without_bridges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wheel = pathlib.Path(tmp) / "adobepy-0.11.0-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("adobe/photoshop/session.py", "")
+            with self.assertRaises(WheelBridgeError) as raised:
+                assert_bundled_bridges(wheel)
+            self.assertIn("stage_wheel_bridges.py", str(raised.exception))
+
+    def test_release_jobs_build_bridges_before_the_wheel(self):
+        # Every workflow that builds a wheel must run the npm bridge builds and
+        # the staging step first, or the published wheel ships without bridges.
+        for name in ("ci.yml", "release.yml", "release-please.yml"):
+            workflow = (REPO_ROOT / ".github" / "workflows" / name).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("stage_wheel_bridges.py", workflow, name)
+            self.assertIn("npm run uxp:build", workflow, name)
+            self.assertIn("npm run cep:build", workflow, name)
+            self.assertLess(
+                workflow.index("npm run uxp:build"),
+                workflow.index("stage_wheel_bridges.py"),
+                name,
+            )
+            if "check_wheel_bridges.py" in workflow:
+                self.assertLess(
+                    workflow.index("-m build"),
+                    workflow.rindex("check_wheel_bridges.py"),
+                    name,
+                )
+
+    def test_stage_bridges_copies_every_built_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            source = root / "bridges"
+            for kind, host in (
+                ("uxp", "photoshop"),
+                ("uxp", "indesign"),
+                ("cep", "after-effects"),
+            ):
+                target = source / kind / host / "dist"
+                target.mkdir(parents=True)
+                (target / "main.js").write_text("// bridge\n", encoding="utf-8")
+                (source / kind / host / "index.html").write_text("<html/>\n", encoding="utf-8")
+                (source / kind / host / "manifest.json").write_text("{}\n", encoding="utf-8")
+                if kind == "cep":
+                    (target / "dom.jsx").write_text("// dom\n", encoding="utf-8")
+            # `core` holds shared sources, not a host template, and must not be staged.
+            (source / "uxp" / "core" / "src").mkdir(parents=True)
+            stage_root = root / "staged"
+            staged = stage_bridges(source, stage_root)
+            self.assertEqual(
+                staged,
+                ["uxp/indesign", "uxp/photoshop", "cep/after-effects"],
+            )
+            self.assertEqual(discover_hosts(source, "uxp"), ["indesign", "photoshop"])
+            self.assertTrue((stage_root / "uxp" / "photoshop" / "dist" / "main.js").is_file())
+            self.assertTrue((stage_root / "cep" / "after-effects" / "dist" / "dom.jsx").is_file())
+            self.assertFalse((stage_root / "uxp" / "core").exists())
+
+    def test_stage_bridges_rejects_missing_build_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            source = root / "bridges" / "uxp" / "photoshop"
+            source.mkdir(parents=True)
+            (source / "index.html").write_text("<html/>\n", encoding="utf-8")
+            with self.assertRaises(BridgeStagingError) as raised:
+                stage_bridges(root / "bridges", root / "staged")
+            self.assertIn("npm run uxp:build", str(raised.exception))
+            self.assertIn("dist/main.js", str(raised.exception))
+
+    def test_stage_bridges_replaces_stale_hosts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            source = root / "bridges" / "uxp" / "photoshop"
+            (source / "dist").mkdir(parents=True)
+            (source / "dist" / "main.js").write_text("fresh\n", encoding="utf-8")
+            (source / "index.html").write_text("<html/>\n", encoding="utf-8")
+            (source / "manifest.json").write_text("{}\n", encoding="utf-8")
+            stage_root = root / "staged"
+            stage_root.mkdir(parents=True)
+            stale = stage_root / "uxp" / "retired-host"
+            stale.mkdir(parents=True)
+            (stale / "dist" / "main.js").parent.mkdir(parents=True)
+            (stale / "dist" / "main.js").write_text("stale\n", encoding="utf-8")
+            stage_bridges(root / "bridges", stage_root)
+            self.assertFalse((stage_root / "uxp" / "retired-host").exists())
+            self.assertEqual(
+                (stage_root / "uxp" / "photoshop" / "dist" / "main.js").read_text(
+                    encoding="utf-8"
+                ),
+                "fresh\n",
+            )
 
     def test_native_abi3_contract_rejects_wrong_pyo3_floor(self):
         with tempfile.TemporaryDirectory() as tmp:

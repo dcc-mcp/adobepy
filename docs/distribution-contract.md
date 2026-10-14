@@ -261,7 +261,7 @@ Python SDK version is bumped to match.
 | --- | --- | --- |
 | Install Python SDK only | Yes | No |
 | Run broker + CLI | No | Yes |
-| Install bridge templates | No | Yes (manual copy from archive) |
+| Install bridge templates | Yes (bundled in `adobe/_bridges`) | Yes (manual copy from archive) |
 | CI dependency (`adobepy>=0.1.0`) | Yes | No |
 | Manual Windows install | Recommend both | Yes |
 | macOS arm64 / Linux x86_64 SDK import | No | Yes (standalone archive) |

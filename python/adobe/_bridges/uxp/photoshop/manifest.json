@@ -1,0 +1,32 @@
+{
+  "manifestVersion": 5,
+  "id": "com.adobepy.bridge.photoshop",
+  "name": "Adobe Python Bridge for Photoshop",
+  "version": "0.1.0",
+  "host": {
+    "app": "PS",
+    "minVersion": "25.0.0",
+    "data": {
+      "apiVersion": 2,
+      "loadEvent": "startup"
+    }
+  },
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "adobepyBridgePanel",
+      "label": { "default": "Adobe Python Bridge" },
+      "minimumSize": { "width": 220, "height": 120 },
+      "maximumSize": { "width": 640, "height": 480 },
+      "preferredDockedSize": { "width": 320, "height": 180 },
+      "preferredFloatingSize": { "width": 360, "height": 220 }
+    }
+  ],
+  "requiredPermissions": {
+    "network": {
+      "domains": "all"
+    },
+    "localFileSystem": "fullAccess"
+  },
+  "main": "index.html"
+}
