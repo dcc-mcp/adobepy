@@ -1,0 +1,18 @@
+{
+  "manifestVersion": 5,
+  "id": "com.adobepy.bridge.premiere",
+  "name": "Adobe Python Bridge for Premiere",
+  "version": "0.1.0",
+  "host": { "app": "PR", "minVersion": "25.6.0" },
+  "requiredPermissions": {
+    "network": {
+      "domains": [
+        "ws://127.0.0.1:47391",
+        "ws://localhost:47391",
+        "http://127.0.0.1:47391",
+        "http://localhost:47391"
+      ]
+    }
+  },
+  "main": "index.html"
+}
