@@ -92,6 +92,71 @@ enum BlockingBoundaryError {
     Panicked,
 }
 
+/// Test-only observation of the order in which a forward settles the boundary
+/// relative to the moment its outcome becomes observable to the caller.
+///
+/// The invariant under test: a forward must settle the boundary (releasing its
+/// accounting and letting a pending recovery quiesce) *before* the outcome is
+/// handed to the oneshot channel that the awaiter reads. Without a hook like
+/// this, a regression in that ordering is only observable as a
+/// scheduling-dependent flake rather than a deterministic failure.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SettleOrderProbe {
+    /// Set once the outcome has been handed to the oneshot channel, i.e. the
+    /// moment the forward becomes observable to its awaiter.
+    result_sent: AtomicBool,
+    /// Latched when `settle_forward` finds the outcome already published.
+    settle_after_send: AtomicBool,
+    /// Snapshot of `poisoned` at the instant settle released the accounting.
+    poisoned_while_settling: AtomicBool,
+    /// Snapshot of `active_workers` at that same instant.
+    active_while_settling: AtomicUsize,
+    /// Latched on the first settle; guards which settle is judged.
+    settled: AtomicBool,
+}
+
+#[cfg(test)]
+impl SettleOrderProbe {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks the outcome as published. Must be called immediately before the
+    /// outcome is handed to the oneshot channel.
+    fn mark_result_sent(&self) {
+        self.result_sent.store(true, Ordering::SeqCst);
+    }
+
+    /// Records the boundary state at the moment `settle_forward` ran, together
+    /// with whether the outcome had already been published by then.
+    ///
+    /// Only the *first* settle is judged. A boundary may run several forwards,
+    /// and a later forward legitimately settles after an earlier one has
+    /// already published; what must never happen is the first settle arriving
+    /// after a publish, which is the regression under test.
+    fn observe_settle(&self, poisoned: bool, active_workers: usize) {
+        let first_settle = !self.settled.swap(true, Ordering::SeqCst);
+        if first_settle && self.result_sent.load(Ordering::SeqCst) {
+            self.settle_after_send.store(true, Ordering::SeqCst);
+        }
+        self.poisoned_while_settling
+            .store(poisoned, Ordering::SeqCst);
+        self.active_while_settling
+            .store(active_workers, Ordering::SeqCst);
+    }
+
+    /// True when `settle_forward` ran only after the result was published --
+    /// exactly the regression this probe exists to catch.
+    fn observed_settle_after_send(&self) -> bool {
+        self.settle_after_send.load(Ordering::SeqCst)
+    }
+
+    fn settled(&self) -> bool {
+        self.settled.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Clone)]
 struct BootstrapBlockingBoundary {
     admission: Arc<Semaphore>,
@@ -101,6 +166,9 @@ struct BootstrapBlockingBoundary {
     poisoned: Arc<AtomicBool>,
     quiesced: Arc<Notify>,
     state: Arc<StdMutex<BootstrapBlockingState>>,
+    /// Test-only hook recording the settle/publish ordering of a forward.
+    #[cfg(test)]
+    settle_probe: Option<Arc<SettleOrderProbe>>,
 }
 
 #[derive(Debug, Default)]
@@ -144,6 +212,21 @@ impl Default for BootstrapBlockingBoundary {
             poisoned: Arc::new(AtomicBool::new(false)),
             quiesced: Arc::new(Notify::new()),
             state: Arc::new(StdMutex::new(BootstrapBlockingState::default())),
+            #[cfg(test)]
+            settle_probe: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl BootstrapBlockingBoundary {
+    /// Installs a probe that records whether `settle_forward` runs before the
+    /// forward's outcome is published, so a test can assert the ordering
+    /// deterministically instead of relying on scheduling.
+    fn with_settle_probe(self, probe: Arc<SettleOrderProbe>) -> Self {
+        Self {
+            settle_probe: Some(probe),
+            ..self
         }
     }
 }
@@ -200,6 +283,13 @@ impl BootstrapBlockingBoundary {
         state.active_forward = state.active_forward.saturating_sub(1);
         self.active_workers.fetch_sub(1, Ordering::SeqCst);
         self.try_finish_recovery(&mut state);
+        #[cfg(test)]
+        if let Some(probe) = self.settle_probe.as_deref() {
+            probe.observe_settle(
+                self.poisoned.load(Ordering::SeqCst),
+                self.active_workers.load(Ordering::SeqCst),
+            );
+        }
     }
 
     fn finish_cleanup(&self, epoch: u64, succeeded: bool) {
@@ -327,6 +417,10 @@ impl BootstrapBlockingBoundary {
                 // the cleanup branch: a caller that sees a completed forward must
                 // already see the recovery it may have just completed.
                 boundary.settle_forward();
+                #[cfg(test)]
+                if let Some(probe) = boundary.settle_probe.as_deref() {
+                    probe.mark_result_sent();
+                }
                 if sender.send(outcome).is_err() {
                     // Nobody observed this mutating forward, so its effect is
                     // unverifiable; fail closed. This is a no-op once the epoch
@@ -5514,6 +5608,177 @@ mod tests {
         assert!(matches!(queued, Err(BlockingBoundaryError::Overloaded)));
         assert!(!queued_started.load(Ordering::SeqCst));
         assert!(!boundary.poisoned.load(Ordering::SeqCst));
+    }
+
+    /// Pins the ordering that the flaky
+    /// `panicking_mutating_worker_rejects_queued_forward_until_recovery_quiesces`
+    /// test could only catch by luck: a forward must settle the boundary before
+    /// its outcome is handed to the awaiter.
+    ///
+    /// The worker is parked inside its blocking operation by a barrier, so the
+    /// schedule is fully determined. It then fails, which poisons the boundary;
+    /// its own `settle_forward` is what completes the recovery and clears
+    /// `poisoned`. The awaiter resumes the instant the outcome is published, so
+    /// the state it sees is exactly the state a real caller sees on a completed
+    /// forward.
+    ///
+    /// Moving `settle_forward` to after `sender.send(outcome)` makes this fail
+    /// every time rather than intermittently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_settles_boundary_before_result_is_observable() {
+        let probe = Arc::new(SettleOrderProbe::new());
+        let boundary = BootstrapBlockingBoundary::default().with_settle_probe(probe.clone());
+        // Park the worker inside its operation so the schedule is fixed.
+        let (gate, mut entered) = FakePhaseGate::new();
+
+        let forward = tokio::spawn({
+            let boundary = boundary.clone();
+            let gate = gate.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || -> anyhow::Result<()> {
+                            gate.enter_and_wait();
+                            anyhow::bail!("deterministic mutating worker failure");
+                        },
+                    )
+                    .await
+            }
+        });
+        while !*entered.borrow() {
+            entered.changed().await.unwrap();
+        }
+        assert_eq!(boundary.active_workers.load(Ordering::SeqCst), 1);
+        assert!(
+            !boundary.poisoned.load(Ordering::SeqCst),
+            "the boundary must be clean before the worker fails"
+        );
+
+        gate.release().await;
+        let outcome = forward.await.expect("forward task must not panic");
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "the failing forward must surface its error, got {outcome:?}"
+        );
+
+        // The awaiter has now observed a completed forward. The settle snapshot
+        // must show the boundary already finalized at publish time.
+        assert!(
+            probe.settled(),
+            "settle_forward never ran; the ordering probe is not wired up"
+        );
+        assert!(
+            !probe.observed_settle_after_send(),
+            "settle_forward ran after the forward result was already published;              the boundary must be settled before a caller can observe the outcome"
+        );
+        assert_eq!(
+            probe.active_while_settling.load(Ordering::SeqCst),
+            0,
+            "settle_forward released the accounting only after the result was observable"
+        );
+        assert!(
+            !probe.poisoned_while_settling.load(Ordering::SeqCst),
+            "the boundary was still poisoned when the forward result became observable"
+        );
+        assert!(
+            !boundary.poisoned.load(Ordering::SeqCst),
+            "a settled forward must leave the boundary unpoisoned"
+        );
+    }
+
+    /// Same invariant as the test above, asserted from the awaiter's side.
+    ///
+    /// A second worker holds the remaining slot, so the recovery cannot quiesce
+    /// until the failing forward settles; that makes the awaiter's observation
+    /// a genuine happens-before boundary rather than a coincidence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observed_forward_completion_implies_finalized_boundary() {
+        let probe = Arc::new(SettleOrderProbe::new());
+        let boundary = BootstrapBlockingBoundary::default().with_settle_probe(probe.clone());
+        let (failing_gate, mut failing_entered) = FakePhaseGate::new();
+        let (holder_gate, mut holder_entered) = FakePhaseGate::new();
+
+        let observed_poisoned = Arc::new(AtomicBool::new(false));
+        let observed_active = Arc::new(AtomicUsize::new(usize::MAX));
+
+        let failing = tokio::spawn({
+            let boundary = boundary.clone();
+            let observed_poisoned = observed_poisoned.clone();
+            let observed_active = observed_active.clone();
+            let gate = failing_gate.clone();
+            async move {
+                let outcome = boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || -> anyhow::Result<()> {
+                            gate.enter_and_wait();
+                            anyhow::bail!("deterministic mutating worker failure");
+                        },
+                    )
+                    .await;
+                // Sampled the moment the awaiter resumes: the first instant the
+                // completed forward is observable to a caller.
+                observed_poisoned.store(boundary.poisoned.load(Ordering::SeqCst), Ordering::SeqCst);
+                observed_active.store(
+                    boundary.active_workers.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                outcome
+            }
+        });
+        let holder = tokio::spawn({
+            let boundary = boundary.clone();
+            let gate = holder_gate.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || {
+                            gate.enter_and_wait();
+                            Ok(())
+                        },
+                    )
+                    .await
+            }
+        });
+        while !*failing_entered.borrow() {
+            failing_entered.changed().await.unwrap();
+        }
+        while !*holder_entered.borrow() {
+            holder_entered.changed().await.unwrap();
+        }
+        assert_eq!(boundary.active_workers.load(Ordering::SeqCst), 2);
+
+        failing_gate.release().await;
+        let outcome = failing.await.expect("failing forward task must not panic");
+        // Released before the assertions below so that a failure here cannot
+        // leave the holder parked and hang the test.
+        holder_gate.release().await;
+        assert!(matches!(holder.await.unwrap(), Ok(Ok(()))));
+
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "the failing forward must surface its error, got {outcome:?}"
+        );
+
+        assert!(
+            probe.settled(),
+            "settle_forward never ran; the ordering probe is not wired up"
+        );
+        assert!(
+            !probe.observed_settle_after_send(),
+            "settle_forward ran after the forward result was already published;              the boundary must be settled before a caller can observe the outcome"
+        );
+        assert!(
+            !observed_poisoned.load(Ordering::SeqCst),
+            "observed a completed forward while the boundary was still poisoned; settle_forward must run before the result is published"
+        );
+        assert_eq!(
+            observed_active.load(Ordering::SeqCst),
+            1,
+            "observed a completed forward while it still held a worker slot"
+        );
     }
 
     fn identity_query(target: Option<&str>) -> RuntimeIdentityQuery {
