@@ -5615,12 +5615,10 @@ mod tests {
     /// test could only catch by luck: a forward must settle the boundary before
     /// its outcome is handed to the awaiter.
     ///
-    /// The worker is parked inside its blocking operation by a barrier, so the
-    /// schedule is fully determined. It then fails, which poisons the boundary;
-    /// its own `settle_forward` is what completes the recovery and clears
-    /// `poisoned`. The awaiter resumes the instant the outcome is published, so
-    /// the state it sees is exactly the state a real caller sees on a completed
-    /// forward.
+    /// The worker is parked inside its blocking operation by a barrier. Its
+    /// ordinary operation error does not poison the boundary. `settle_forward`
+    /// must release the forward's accounting before publishing that error, so
+    /// the awaiter observes a completed forward that no longer owns a slot.
     ///
     /// Moving `settle_forward` to after `sender.send(outcome)` makes this fail
     /// every time rather than intermittently.
@@ -5679,19 +5677,19 @@ mod tests {
         );
         assert!(
             !probe.poisoned_while_settling.load(Ordering::SeqCst),
-            "the boundary was still poisoned when the forward result became observable"
+            "an ordinary operation error must not poison the boundary at settlement"
         );
         assert!(
             !boundary.poisoned.load(Ordering::SeqCst),
-            "a settled forward must leave the boundary unpoisoned"
+            "a completed ordinary operation error must leave the boundary unpoisoned"
         );
     }
 
     /// Same invariant as the test above, asserted from the awaiter's side.
     ///
-    /// A second worker holds the remaining slot, so the recovery cannot quiesce
-    /// until the failing forward settles; that makes the awaiter's observation
-    /// a genuine happens-before boundary rather than a coincidence.
+    /// A second worker holds the remaining slot, so the awaiter's active-worker
+    /// count checks that only the completed forward's accounting was released
+    /// before publication. Its ordinary operation error leaves the boundary clean.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn observed_forward_completion_implies_finalized_boundary() {
         let probe = Arc::new(SettleOrderProbe::new());
@@ -5772,7 +5770,7 @@ mod tests {
         );
         assert!(
             !observed_poisoned.load(Ordering::SeqCst),
-            "observed a completed forward while the boundary was still poisoned; settle_forward must run before the result is published"
+            "an ordinary operation error must leave the boundary unpoisoned when observed"
         );
         assert_eq!(
             observed_active.load(Ordering::SeqCst),
