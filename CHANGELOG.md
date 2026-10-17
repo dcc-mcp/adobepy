@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.3](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.2...adobepy-v0.11.3) (2026-10-17)
+
+
+### Bug Fixes
+
+* handle ineligible release auto-merge ([#101](https://github.com/dcc-mcp/adobepy/issues/101)) ([08ba89a](https://github.com/dcc-mcp/adobepy/commit/08ba89a29a75d36afffc2f07ab99becb4b437ad3))
+
 ## [0.11.2](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.1...adobepy-v0.11.2) (2026-10-17)
 
 
