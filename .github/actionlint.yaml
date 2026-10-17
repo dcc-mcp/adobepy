@@ -11,10 +11,7 @@ self-hosted-runner:
     - adobe
     - photoshop
 
-# `release.yml` predates this gate and carries shellcheck findings at `info`
-# level. They are not introduced by this gate and fixing them is out of scope
-# here, so they are ignored rather than left to fail the job. Drop this list
-# and fix the findings in `release.yml` to close the gap properly.
-ignore:
-  - 'SC2012'
-  - 'SC2086'
+# `release.yml` carries shellcheck findings at info level (SC2012, SC2086) that
+# predate this gate. actionlint's `ignore` config does not suppress shellcheck
+# output, so ci.yml passes the equivalent -ignore flags on the command line
+# instead. Fixing the findings in `release.yml` is the proper close-out.
