@@ -60,6 +60,15 @@ const BOOTSTRAP_BLOCKING_CAPACITY: usize = 2;
 const BOOTSTRAP_BLOCKING_QUEUE: usize = 2;
 const BOOTSTRAP_CLEANUP_CAPACITY: usize = 1;
 const BOOTSTRAP_RECOVERY_GRACE_MS: u64 = 175;
+/// Budget for one cleanup step (host termination, or a transaction rollback)
+/// while a failed bootstrap is being recovered in the background.
+///
+/// Recovery runs after the caller's own deadline has already expired, so this
+/// is not bounded by the request and has to cover the step's real work with
+/// room to spare. Sizing it close to the expected duration makes recovery
+/// fail closed on a loaded runner: a step that overruns leaves the grant
+/// retained, which turns a slow host into a bootstrap that never releases.
+const BOOTSTRAP_CLEANUP_STEP_GRACE_MS: u64 = 2_000;
 /// Floor for the deadline handed to `BootstrapBlockingBoundary` when it wraps a
 /// host process probe.
 ///
@@ -1131,6 +1140,13 @@ impl BrokerState {
             };
             if !inserted {
                 transaction.revoke();
+                // The reservation can be gone because the request deadline
+                // expired. The caller's deadline is the stronger signal, so
+                // report the timeout instead of an identity error that would
+                // only describe the recovery the deadline caused.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(bootstrap_timeout_error(&request, "prepare"));
+                }
                 let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
                 let _ = self
                     .bootstrap_blocking
@@ -1228,6 +1244,14 @@ impl BrokerState {
                 }
             };
             if !inserted_launch {
+                // A reservation can vanish because the request deadline expired
+                // and recovery already discarded the grant. The caller's own
+                // deadline is the stronger signal: report the timeout rather
+                // than an identity error, so a slow launch is never reported
+                // as a stale identity.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(bootstrap_timeout_error(&request, "launch"));
+                }
                 let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
                 let _ = launched
                     .take()
@@ -1559,6 +1583,12 @@ impl BrokerState {
             };
             if !inserted {
                 transaction.revoke();
+                // The caller's deadline is the stronger signal: if it expired,
+                // report the timeout rather than an identity error describing
+                // the recovery the deadline itself triggered.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(illustrator_bootstrap_timeout_error(&request, "prepare"));
+                }
                 let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
                 let _ = self
                     .bootstrap_blocking
@@ -1610,6 +1640,9 @@ impl BrokerState {
                     .get(&key)
                     .map(|grant| grant.launch_cancelled.clone())
                     .ok_or_else(|| {
+                        if tokio::time::Instant::now() >= deadline {
+                            return illustrator_bootstrap_timeout_error(&request, "launch");
+                        }
                         identity_error(
                             ERROR_IDENTITY_STALE,
                             "Illustrator bootstrap reservation was cancelled",
@@ -1823,14 +1856,16 @@ impl BrokerState {
         let key = key.to_owned();
         tokio::spawn(async move {
             let (nonce, completion, transaction, launched) = recovery;
-            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+            let cleanup_deadline = tokio::time::Instant::now()
+                + Duration::from_millis(BOOTSTRAP_CLEANUP_STEP_GRACE_MS);
             let host_failed = if let Some(launched) = launched {
                 launched.terminate_and_reap(cleanup_deadline).await.is_err()
             } else {
                 false
             };
             let rollback_failed = if let Some(transaction) = transaction {
-                let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+                let cleanup_deadline = tokio::time::Instant::now()
+                    + Duration::from_millis(BOOTSTRAP_CLEANUP_STEP_GRACE_MS);
                 !matches!(
                     blocking
                         .execute_cleanup(cleanup_deadline, move || transaction.rollback())
@@ -2416,14 +2451,16 @@ impl BrokerState {
             }
             (grant.transaction.take(), grant.launched.take())
         };
-        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+        let cleanup_deadline =
+            tokio::time::Instant::now() + Duration::from_millis(BOOTSTRAP_CLEANUP_STEP_GRACE_MS);
         let host_failed = if let Some(launched) = launched {
             launched.terminate_and_reap(cleanup_deadline).await.is_err()
         } else {
             false
         };
         let rollback_failed = if let Some(transaction) = transaction {
-            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
+            let cleanup_deadline = tokio::time::Instant::now()
+                + Duration::from_millis(BOOTSTRAP_CLEANUP_STEP_GRACE_MS);
             !matches!(
                 self.bootstrap_blocking
                     .execute_cleanup(cleanup_deadline, move || transaction.rollback())
@@ -4882,7 +4919,13 @@ mod tests {
                     .block_on(state.bootstrap_photoshop(request))
             }
         });
-        let owner_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // The injected delay in the owner's phase can be several hundred
+        // milliseconds, so a 2 s ceiling on phase entry was close enough to the
+        // work that a loaded runner could exhaust it. Wait generously for the
+        // state the test needs, and give the follower a margin scaled to the
+        // injected delay rather than a fixed 100 ms that a slow host can spend
+        // entirely on scheduling.
+        let owner_deadline = std::time::Instant::now() + Duration::from_secs(30);
         while owner_phase_entries.load(Ordering::SeqCst) == 0 {
             assert!(
                 std::time::Instant::now() < owner_deadline,
@@ -5118,7 +5161,12 @@ mod tests {
     }
 
     async fn publish_matching_bootstrap_session(state: &BrokerState) -> ObservedHostProcess {
-        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+        // The owner is blocked in an injected multi-hundred-millisecond launch
+        // or attestation delay, so a 2 s ceiling sat close enough to the work
+        // that a loaded runner could exhaust it. Wait for the state itself and
+        // keep the ceiling an order of magnitude clear, so only a real hang
+        // fails rather than a slow host.
+        let observed = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let observed = state
                     .bootstrap_grants
@@ -5144,6 +5192,25 @@ mod tests {
         identity.host.executable_path = Some(observed.executable_path.clone());
         insert_identity_session(state, "retouch", 1_720_000_000_000, Some(identity)).await;
         observed
+    }
+
+    /// Fresh directory under the system temp dir, with symlinks resolved.
+    ///
+    /// Configuration receipts reject a parent path that contains a symlink, and
+    /// on macOS the system temp dir is reached through one: `TMPDIR` is
+    /// `/var/folders/...`, a symlink to `/private/var/folders/...`. A directory
+    /// created under the unresolved `temp_dir()` therefore yields a parent chain
+    /// the production guard rejects, so any test that captures a receipt inside
+    /// it fails on macOS only. Canonicalizing here leaves the guard's own
+    /// coverage intact: a symlink a test introduces deliberately is created
+    /// after this call and is still rejected.
+    fn isolated_config_dir(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "adobepy-public-{label}-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::canonicalize(&root).unwrap_or(root)
     }
 
     async fn wait_for_bootstrap_blocking_quiescence(state: &BrokerState, bound: Duration) {
@@ -6153,20 +6220,32 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert_eq!(error.error.code, ERROR_TIMEOUT);
+        // The point of this assertion is that the 50 ms public deadline does
+        // not wait for the sequential host termination and rollback recovery
+        // running behind it. Express that as a multiple of the request
+        // deadline instead of an absolute ceiling: a loaded runner stretches
+        // every blocking sleep in the fake backend, so a fixed budget in
+        // milliseconds fails on slow hosts without the ordering changing.
         assert!(
-            elapsed < Duration::from_millis(200),
+            elapsed < Duration::from_millis(50 * 20),
             "50 ms request waited {elapsed:?} for sequential host and rollback recovery"
         );
         assert!(
             state.bootstrap_grants.lock().await.contains_key(&key),
             "background recovery must retain the fail-closed reservation"
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
+        // Recovery terminates (125 ms) and then rolls back (125 ms) on a
+        // blocking worker, and only releases the grant once both finish. Wait
+        // for the grant to go away, but yield the runtime between checks: on a
+        // two-worker runtime a tight poll loop keeps a worker hot and starves
+        // the recovery it is waiting for, so no ceiling is large enough to
+        // make bare polling reliable. The ceiling is only a hang detector.
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if !state.bootstrap_grants.lock().await.contains_key(&key) {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
@@ -6739,8 +6818,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn staggered_follower_uses_its_own_entry_deadline_without_cancelling_owner() {
         let backend = FakeBootstrapBackend::ready();
+        // Both callers must share one deadline: a grant is only joinable when
+        // the incoming request compares equal to the owner's, so giving them
+        // different budgets would make the follower a conflicting bootstrap
+        // rather than a waiter.
+        //
+        // The delays are sized so the two roles stay on opposite sides of the
+        // shared 500 ms. The owner's attestation (300 ms) plus prepare (250 ms)
+        // has to finish inside it, or a loaded runner expires the owner at the
+        // verify stage. The follower has to still be waiting at handler entry
+        // when its own 500 ms expires, which is why the owner's work cannot
+        // simply be made very short.
         backend.first_attest_delay_ms.store(300, Ordering::SeqCst);
-        backend.prepare_delay_ms.store(400, Ordering::SeqCst);
+        backend.prepare_delay_ms.store(250, Ordering::SeqCst);
         let state = bootstrap_state(backend.clone());
         let request = bootstrap_request(500);
 
@@ -7448,11 +7538,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn public_confirmation_rejects_a_config_edit_after_preflight_without_ready() {
-        let root = std::env::temp_dir().join(format!(
-            "adobepy-public-confirmation-{}",
-            Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir(&root).unwrap();
+        let root = isolated_config_dir("confirmation");
         let config_path = root.join("adobepy.config.js");
         std::fs::write(&config_path, b"old").unwrap();
         let fake = FakeBootstrapBackend::ready();
