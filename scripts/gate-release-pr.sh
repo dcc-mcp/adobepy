@@ -170,10 +170,24 @@ for entry in "${entries[@]}"; do
 
     if [ "$(gh pr view "$number" --json autoMergeRequest --jq '.autoMergeRequest == null')" = "true" ]; then
       echo "  checks are green for $head_sha; enabling auto-merge"
-      if ! gh pr merge --auto --squash --match-head-commit "$head_sha" "$number"; then
-        echo "::error title=Auto-merge request failed::Could not enable auto-merge for #$number at $head_sha"
-        fail=1
-        continue
+      merge_status=0
+      merge_output=$(gh pr merge --auto --squash --match-head-commit "$head_sha" "$number" 2>&1) || merge_status=$?
+      [ -z "$merge_output" ] || printf '%s\n' "$merge_output" >&2
+      if [ "$merge_status" -ne 0 ]; then
+        # GitHub rejects auto-merge when the branch has no required rules.
+        # Retry only that exact refusal, retaining the adjudicated head.
+        if [ "$merge_status" -eq 1 ] && [ "$merge_output" = 'GraphQL: Pull request Branch does not have required protected branch rules (enablePullRequestAutoMerge)' ]; then
+          echo "  auto-merge is unavailable; merging verified $head_sha normally"
+          if ! gh pr merge --squash --match-head-commit "$head_sha" "$number"; then
+            echo "::error title=Merge request failed::Could not merge #$number at $head_sha after auto-merge was unavailable"
+            fail=1
+            continue
+          fi
+        else
+          echo "::error title=Auto-merge request failed::Could not enable auto-merge for #$number at $head_sha"
+          fail=1
+          continue
+        fi
       fi
     else
       echo "  auto-merge already enabled."

@@ -103,15 +103,26 @@ case "$sub" in
         # branch head no longer matches the SHA the caller verified. The gate
         # must hand the SHA it adjudicated ($head_sha), not the re-read one, so
         # record what was passed and let the scenario assert on it.
-        want=""; has=0
+        want=""; has=0; mode=normal
         while [ $# -gt 0 ]; do
-          if [ "$1" = "--match-head-commit" ]; then has=1; want="$2"; shift 2; else shift; fi
+          case "$1" in
+            --auto) mode=auto; shift ;;
+            --match-head-commit) has=1; want="$2"; shift 2 ;;
+            *) shift ;;
+          esac
         done
+        echo "MERGE_MODE $mode" >> "$GH_LOG"
         echo "MERGE_MATCH $want" >> "$GH_LOG"
         effective="$CURRENT_SHA"
         [ -n "${MERGE_TIME_SHA:-}" ] && effective="$MERGE_TIME_SHA"
+        [ -f "$AUTO_REFUSAL_MOVED" ] && effective=$(cat "$AUTO_REFUSAL_MOVED")
         if [ "$has" = "1" ] && [ "$want" != "$effective" ]; then
           echo "gh: HEAD mismatch: expected $want but head is $effective" >&2
+          exit 1
+        fi
+        if [ "$mode" = "auto" ] && [ -n "${AUTO_MERGE_ERROR:-}" ]; then
+          printf '%s\n' "$AUTO_MERGE_ERROR" >&2
+          [ -n "${MOVE_ON_AUTO_REFUSAL_SHA:-}" ] && printf '%s\n' "$MOVE_ON_AUTO_REFUSAL_SHA" > "$AUTO_REFUSAL_MOVED"
           exit 1
         fi
         : > "$MERGED_FLAG" ;;
@@ -154,7 +165,7 @@ run_case() {
   echo "$runs" > "$d/runs.json"
   echo "$checks" > "$d/checks.json"
 
-  GH_LOG="$d/gh.log" MERGED_FLAG="$d/merged" RERead_FLAG="$d/reread" RUNS_JSON="$d/runs.json" \
+  GH_LOG="$d/gh.log" MERGED_FLAG="$d/merged" RERead_FLAG="$d/reread" AUTO_REFUSAL_MOVED="$d/auto-refused-head" RUNS_JSON="$d/runs.json" \
   CHECKS_JSON="$d/checks.json" GH_TOKEN=x GH_REPO=dcc-mcp/adobepy \
   STALL_HOURS="${STALL_HOURS:-6}" MERGE_TIMEOUT_SECONDS=5 MERGE_POLL_SECONDS=0 \
   PR_ENTRY="89 release-please--branches--main $H1" CURRENT_SHA="$current" \
@@ -183,11 +194,14 @@ run_case() {
   # to whatever the re-read returned. Catches a merge that silently follows the
   # branch instead of the verified commit.
   if [ -n "${EXP_MATCH:-}" ]; then
-    if grep -q "MERGE_MATCH" "$d/gh.log" 2>/dev/null; then
-      grep -q "MERGE_MATCH $EXP_MATCH" "$d/gh.log" 2>/dev/null || ok=0
-    else
+    local matches; matches=$(grep '^MERGE_MATCH ' "$d/gh.log" 2>/dev/null || true)
+    if [ -z "$matches" ] || grep -Fvx "MERGE_MATCH $EXP_MATCH" <<<"$matches" >/dev/null; then
       ok=0
     fi
+  fi
+  if [ -n "${EXP_NORMAL_MERGES:-}" ]; then
+    local normal_merges; normal_merges=$(grep -c '^MERGE_MODE normal$' "$d/gh.log" || true)
+    [ "$normal_merges" = "$EXP_NORMAL_MERGES" ] || ok=0
   fi
 
   if [ "$ok" = "1" ]; then
@@ -290,6 +304,25 @@ FAIL_AUTOMERGE=1 run_case "15 auto-merge query fails (unguarded)" \
 STALL_HOURS=0 run_case "16 stalled release PR" \
   '[{"headSha":"'$H1'","status":"completed","conclusion":"cancelled"}]' \
   "$GREEN" "$H1" "" 1 "ci_request,error,stalled"
+
+# 17. Actual GitHub refusal on a branch without required protected rules:
+#     normal squash merge is allowed only after this specific auto refusal.
+NO_AUTO='GraphQL: Pull request Branch does not have required protected branch rules (enablePullRequestAutoMerge)'
+EXP_MATCH="$H1" EXP_NORMAL_MERGES=1 AUTO_MERGE_ERROR="$NO_AUTO" \
+  run_case "17 auto ineligible, normal exact-head merge" \
+  "$OKRUNS" "$GREEN" "$H1" "" 0 "merged,redispatch"
+
+# 18. Other merge/API errors must not be retried as normal merges.
+EXP_MATCH="$H1" EXP_NORMAL_MERGES=0 \
+  AUTO_MERGE_ERROR='GraphQL: Resource not accessible by integration (enablePullRequestAutoMerge)' \
+  run_case "18 unknown auto error fails closed" \
+  "$OKRUNS" "$GREEN" "$H1" "" 1 "error"
+
+# 19. The head moves after the exact refusal. The fallback must retain H1,
+#     letting --match-head-commit refuse H2 instead of merging unreviewed code.
+EXP_MATCH="$H1" EXP_NORMAL_MERGES=1 AUTO_MERGE_ERROR="$NO_AUTO" MOVE_ON_AUTO_REFUSAL_SHA="$H2" \
+  run_case "19 fallback refuses a moved head" \
+  "$OKRUNS" "$GREEN" "$H1" "" 1 "error"
 
 rm -rf "$STUB_ROOT"
 
