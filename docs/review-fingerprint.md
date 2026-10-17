@@ -1,71 +1,103 @@
 # Review Diff Fingerprint
 
-A review ACK is bound to the **content** of a pull request, not to its head
-SHA. Rebasing a PR onto a moved `main` changes the SHA while leaving the diff
-byte-identical, and in that case the ACK stands — re-running the full review
-and re-collecting CI evidence would produce no new information.
+A diff fingerprint records the content covered by a review ACK. It can support
+reusing that content review after a rebase only when the complete diff still
+matches and the reviewer confirms that the new base introduces no relevant
+integration changes. It never transfers CI evidence: every new head, including
+a rebase with the same fingerprint, needs fresh required checks on that exact
+head before merge.
 
-That only works if both sides can reproduce the fingerprint independently.
-This document fixes the recipe so no one has to guess it.
+## Canonical recipe: `pr-files-records-v1`
 
-## Canonical recipe: `compare-lines-final-lf`
+Capture the PR's exact base SHA, head SHA, and `changed_files` count. Fetch all
+pages of the [PR-files API](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files),
+then re-read those PR fields and refuse the receipt if any changed during the
+capture. The API returns at most 3,000 files; the fetched count must equal the
+captured `changed_files` count, with no duplicate filenames.
+
+Use this recipe only for complete text patches. Missing, binary, or truncated
+patches cannot be replaced with an empty string. Check patch completeness
+against the actual diff, including hunk lengths and addition/deletion counts;
+if it cannot be established, do not reuse an ACK through this recipe.
 
 ```text
-entries = filename + TAB + patch   # one entry per changed file, from the
-                                   # compare or PR-files API
-join entries with LF
-split the result into LINES
-LC_ALL=C sort the lines
-append exactly ONE trailing LF
-sha256 -> 64 hex chars
+record = {filename, previous_filename (or null), status, patch}
+sort complete records by the UTF-8 bytes of filename
+serialize the record array as compact JSON with sorted keys and unescaped Unicode
+encode as UTF-8, then append exactly one LF
+sha256 -> 64 lowercase hex characters
 ```
 
-Reference implementation:
+Keep each `patch` string intact, including its line order and whitespace. Only
+the file records are sorted. Sorting individual patch lines loses ordering and
+can give different code the same fingerprint.
+
+Reference implementation (Python 3, after the completeness checks above):
 
 ```bash
-gh api "repos/$OWNER/$REPO/compare/$BASE...$HEAD" \
-  -q '.files[] | .filename + "\t" + (.patch // "")' \
-  | LC_ALL=C sort \
-  | awk 'BEGIN{ORS=""} {print $0 "\n"}' \
-  | sha256sum
+gh api --paginate --slurp \
+  "repos/$OWNER/$REPO/pulls/$PR/files?per_page=100" > pr-files.json
+python - <<'PY'
+import hashlib
+import json
+from pathlib import Path
+
+pages = json.loads(Path("pr-files.json").read_text(encoding="utf-8-sig"))
+files = [entry for page in pages for entry in page]
+records = []
+seen = set()
+for entry in files:
+    filename = entry["filename"]
+    if filename in seen or not isinstance(entry.get("patch"), str):
+        raise SystemExit("Duplicate filename or missing text patch; no fingerprint")
+    seen.add(filename)
+    records.append({
+        "filename": filename,
+        "previous_filename": entry.get("previous_filename"),
+        "status": entry["status"],
+        "patch": entry["patch"],
+    })
+records.sort(key=lambda record: record["filename"].encode("utf-8"))
+payload = json.dumps(
+    records, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+).encode("utf-8") + b"\n"
+print(hashlib.sha256(payload).hexdigest())
+PY
 ```
 
-The `awk` step is what guarantees the single trailing LF regardless of whether
-the API's last line ended with one. Do not drop it.
+The JSON encoding preserves patch line order while escaping embedded newlines
+inside each record. Explicit UTF-8 encoding and a single final LF make the
+hashed bytes independent of the shell's output encoding and newline handling.
+The snippet hashes the supplied records; it does not replace the capture,
+file-count, or patch-completeness checks.
 
 ## Storing a fingerprint
 
-Always record the atomic triple:
+Always record the base and head that were reviewed alongside the fingerprint
+and its recipe:
 
 ```text
-(base_sha, fp@value, recipe)
+(base_sha, head_sha, fp@value, recipe)
 ```
 
-A bare value is not evidence — it says nothing about what was hashed or
-against which base. Never recompute a historical value to backdate-fix a
-mismatch; if the recorded value cannot be reproduced, treat the ACK as void
-and request a fresh review.
+A bare value is not evidence. Never recompute a historical value to backdate-fix
+a mismatch. Receipts using the old `compare-lines-final-lf` recipe cannot be
+silently migrated or treated as equivalent: it sorted patch lines and lost
+content ordering. Request a fresh review and record a new receipt instead.
+
+If the base or head moves, capture the new pair again. Even when a reviewer
+accepts an unchanged content fingerprint, required CI must complete successfully
+for the new exact head; a fingerprint or prior ACK cannot substitute for it.
 
 ## Recipes that do not work
 
-`git diff <base>...<head> | sha256sum` looks equivalent and is not. The
-`index` line embeds blob hashes whose width depends on `core.abbrev`, which
-differs across clones and platforms: the same diff on `ac91d22` hashes to
-`b26fa531…` at `abbrev=7` and `b047cc2c…` at `abbrev=40`. It also varies with
-`diff.algorithm`, `diff.renames`, and CRLF settings.
+`git diff <base>...<head> | sha256sum` depends on local diff formatting, including
+abbreviated blob IDs, diff algorithms, rename settings, and line endings.
 
-If a git-only fingerprint is ever needed, use patch-id, which is invariant to
-all of those:
+`git patch-id --stable` is useful for finding likely duplicate commits, but
+[it ignores whitespace](https://git-scm.com/docs/git-patch-id#Documentation/git-patch-id.txt---stable).
+It is not an exact content fingerprint and must not replace this recipe.
 
-```bash
-git diff <base>...<head> | git patch-id --stable
-```
-
-It still detects content and whitespace changes. It is a fallback, not the
-canonical recipe.
-
-## Why not a bare `sha256sum` of the patch text
-
-Patching the API response through shell pipelines introduces trailing-newline
-and locale-ordering drift between a Windows shell and a Linux runner. Sorting
-lines under `LC_ALL=C` and pinning the trailing newline removes both.
+Global line sorting is also unsuitable. For example, changing the order of
+`+authorize()` and `+execute()` in a patch changes the code while leaving the
+sorted lines identical. Sort whole file records and retain the patch order.
