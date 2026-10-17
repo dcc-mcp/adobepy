@@ -15,6 +15,11 @@ on:
 
 # Least privilege: only the release-please job writes. Every other job inherits
 # read-only and declares what it needs on the job itself.
+#
+# Review ACKs on this repository are bound to a diff fingerprint, not to a head
+# SHA; the recipe that makes one reproducible is fixed in
+# docs/review-fingerprint.md. Record it alongside the ACK so a rebase does not
+# invalidate a review.
 permissions:
   contents: read
 
@@ -39,9 +44,10 @@ jobs:
       # the check-runs call also succeeds on a token without this scope
       # (measured in probe A of run 36394388128,
       # https://github.com/dcc-mcp/adobepy/actions/runs/36394388128). It is
-      # kept because it becomes required the moment the repository turns
-      # private or GitHub tightens the default, and a missing scope then
-      # fails as "no verdict" rather than as an error.
+      # kept for least privilege; the failure mode it prevents is unmeasured
+      # on this public repository. What is measured is how this step reacts
+      # when the call is refused at all: `::error title=Check query failed`
+      # plus `fail=1` and `continue`, so the PR is never merged on that pass.
       checks: read
       # Needed to start the CI workflow on the release PR branch.
       actions: write
@@ -222,7 +228,21 @@ jobs:
               #    merge call. Handing the SHA to the API makes GitHub enforce
               #    the match at merge time, so a late move fails the merge
               #    instead of landing an unverified commit.
-              current_sha=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
+              #
+              #    That late move is a benign race, but it is *not* silent:
+              #    `gh pr merge` rejects it, this step reports
+              #    `::error title=Auto-merge request failed` and exits
+              #    non-zero, so the pass runs red. It self-clears on the next
+              #    pass, which re-adjudicates the new head. Read the red run
+              #    as "someone pushed mid-pass", not as a defect in the gate.
+              # Same degradation contract as every other `gh` call in this
+              # step: a bare assignment under `set -euo pipefail` would abort
+              # the whole gate on one transient API error, with no `::error`
+              # annotation and no chance to fall through to the stall check.
+              if ! current_sha=$(gh pr view "$number" --json headRefOid --jq .headRefOid); then
+                echo "::error title=Head re-read failed::could not re-read headRefOid for PR #$number"
+                fail=1; continue
+              fi
               if [ "$current_sha" != "$head_sha" ]; then
                 echo "  head moved under the verdict: judged $head_sha, now $current_sha; skipping this pass."
                 continue
