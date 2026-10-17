@@ -89,6 +89,23 @@ jobs:
       - run: npm ci
       - run: npm run security:check
       - run: npm run lint
+      # The release gate only runs on `main`, so nothing else exercises it.
+      # These scenarios drive scripts/gate-release-pr.sh with a stub `gh` and
+      # assert on the verdicts and exit codes it emits.
+      - name: Release gate scenarios
+        run: bash scripts/test-gate-release-pr.sh
+      - name: Lint workflows
+        # `release.yml` carries pre-existing shellcheck findings at info level
+        # (SC2012, SC2086). They are not introduced here, and actionlint's
+        # `ignore` config does not suppress shellcheck output, so the codes are
+        # filtered on the command line. Fixing them in `release.yml` is the
+        # proper close-out.
+        run: |
+          set -euo pipefail
+          version=1.7.12
+          url="https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          curl -sSfL "$url" | tar -xz -C /usr/local/bin actionlint
+          actionlint -ignore SC2012 -ignore SC2086
 
   package:
     name: Windows package smoke
