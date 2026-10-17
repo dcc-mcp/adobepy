@@ -96,9 +96,6 @@ jobs:
         run: bash scripts/test-gate-release-pr.sh
       - name: Lint workflows
         uses: rhysd/actionlint@v1.7.12
-        with:
-          # shellcheck is already covered by the repository's own lint step.
-          shellcheck: "false"
 
   package:
     name: Windows package smoke
