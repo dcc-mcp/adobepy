@@ -1,0 +1,12 @@
+# actionlint configuration.
+#
+# `live-host-smoke.yml` runs on a self-hosted Windows runner that is registered
+# with the custom labels below so the job lands on a machine with the Adobe
+# apps installed. actionlint only knows GitHub's own labels, so without this
+# list it reports them as unknown runner labels.
+self-hosted-runner:
+  labels:
+    - self-hosted
+    - windows
+    - adobe
+    - photoshop

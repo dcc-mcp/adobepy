@@ -89,6 +89,16 @@ jobs:
       - run: npm ci
       - run: npm run security:check
       - run: npm run lint
+      # The release gate only runs on `main`, so nothing else exercises it.
+      # These scenarios drive scripts/gate-release-pr.sh with a stub `gh` and
+      # assert on the verdicts and exit codes it emits.
+      - name: Release gate scenarios
+        run: bash scripts/test-gate-release-pr.sh
+      - name: Lint workflows
+        uses: rhysd/actionlint@v1.7.12
+        with:
+          # shellcheck is already covered by the repository's own lint step.
+          shellcheck: "false"
 
   package:
     name: Windows package smoke
