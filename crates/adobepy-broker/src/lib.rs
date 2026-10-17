@@ -188,10 +188,11 @@ impl BootstrapBlockingBoundary {
         Ok(epoch)
     }
 
-    fn finish_forward(&self, epoch: u64, failed_or_abandoned: bool) {
-        if failed_or_abandoned {
-            self.poison(epoch);
-        }
+    /// Releases this forward's share of the boundary accounting and lets a
+    /// pending recovery quiesce. Callers must run this *before* the forward's
+    /// result becomes observable, so that observing a completed forward implies
+    /// a finalized boundary rather than a still-poisoned one.
+    fn settle_forward(&self) {
         let Ok(mut state) = self.state.lock() else {
             self.poisoned.store(true, Ordering::SeqCst);
             return;
@@ -322,8 +323,16 @@ impl BootstrapBlockingBoundary {
                 if failed {
                     boundary.poison(epoch);
                 }
-                let abandoned = sender.send(outcome).is_err();
-                boundary.finish_forward(epoch, abandoned);
+                // Settle the boundary before the result is observable, mirroring
+                // the cleanup branch: a caller that sees a completed forward must
+                // already see the recovery it may have just completed.
+                boundary.settle_forward();
+                if sender.send(outcome).is_err() {
+                    // Nobody observed this mutating forward, so its effect is
+                    // unverifiable; fail closed. This is a no-op once the epoch
+                    // already advanced past a completed recovery.
+                    boundary.poison(epoch);
+                }
             }
         });
         match tokio::time::timeout_at(deadline, receiver).await {
