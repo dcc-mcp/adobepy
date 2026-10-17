@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.2](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.1...adobepy-v0.11.2) (2026-10-17)
+
+
+### Documentation
+
+* preserve patch order in review fingerprints ([#98](https://github.com/dcc-mcp/adobepy/issues/98)) ([022b437](https://github.com/dcc-mcp/adobepy/commit/022b437882797faad80d9b54b7396997c5724666))
+
 ## [0.11.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.0...adobepy-v0.11.1) (2026-10-17)
 
 
