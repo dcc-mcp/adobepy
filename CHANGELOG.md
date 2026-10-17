@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.0...adobepy-v0.11.1) (2026-10-17)
+
+
+### Bug Fixes
+
+* **broker:** settle the blocking boundary before a forward result is observable ([#94](https://github.com/dcc-mcp/adobepy/issues/94)) ([a35c498](https://github.com/dcc-mcp/adobepy/commit/a35c49864a2af1271903fedc575986f422400c0c))
+
 ## [0.11.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.10.1...adobepy-v0.11.0) (2026-09-28)
 
 
