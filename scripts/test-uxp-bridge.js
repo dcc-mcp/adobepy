@@ -12,7 +12,7 @@ function waitForMicrotasks() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-async function loadBundle(relativeBundlePath, modules, globals = {}) {
+async function loadBundle(relativeBundlePath, modules, globals = {}, generatedConfig) {
   const bundlePath = path.join(root, relativeBundlePath);
   assert.ok(fs.existsSync(bundlePath), `missing UXP bundle: ${bundlePath}`);
   const sent = [];
@@ -46,13 +46,16 @@ async function loadBundle(relativeBundlePath, modules, globals = {}) {
       if (Object.prototype.hasOwnProperty.call(modules, name)) return modules[name];
       throw new Error(`missing test module: ${name}`);
     },
-    __ADOBEPY_TOKEN: "test-token",
+    ...(generatedConfig === undefined ? { __ADOBEPY_TOKEN: "test-token" } : {}),
     crypto: {
       randomUUID: () => "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99"
     },
     ...globals
   };
   context.globalThis = context;
+  if (generatedConfig !== undefined) {
+    vm.runInNewContext(generatedConfig, context, { filename: "adobepy.config.js", timeout: 1_000 });
+  }
   vm.runInNewContext(fs.readFileSync(bundlePath, "utf8"), context, { filename: bundlePath });
   await waitForMicrotasks();
   assert.ok(socketInstance, "bundle did not open a WebSocket");
@@ -941,7 +944,33 @@ function testManifestPermissions() {
   }
 }
 
+// The Rust cross-layer regression supplies the production-generated config on
+// stdin. Only UXP APIs are mocked here: do not inject __ADOBEPY_HOST_IDENTITY or
+// fill identity fields from the bootstrap request.
+async function emitPhotoshopGeneratedConfigHello() {
+  const generatedConfig = fs.readFileSync(0, "utf8");
+  assert.ok(generatedConfig.length > 0 && generatedConfig.length <= 64 * 1024);
+  const env = await loadBundle("bridges/uxp/photoshop/dist/main.js", {
+    photoshop: { app: { version: "26.5.1" } },
+    uxp: {
+      host: { name: "Adobe Photoshop", version: "26.5.1" },
+      storage: {
+        localFileSystem: {
+          getPluginFolder: async () => ({ nativePath: "C:/UXP/External/com.adobepy.bridge.photoshop" })
+        }
+      }
+    }
+  }, {}, generatedConfig);
+  assert.strictEqual(env.sent.length, 1);
+  assert.strictEqual(env.sent[0].type, "hello");
+  process.stdout.write(JSON.stringify({ url: env.socket.url, hello: env.sent[0] }));
+}
+
 async function main() {
+  if (process.argv[2] === "--photoshop-generated-config-hello") {
+    await emitPhotoshopGeneratedConfigHello();
+    return;
+  }
   testManifestPermissions();
   await testPhotoshopBridge();
   await testInDesignBridge();

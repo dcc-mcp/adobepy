@@ -2963,9 +2963,11 @@ impl BrokerState {
             ));
         };
         let Some(profile_id) = identity.host.profile_id.as_ref() else {
+            // The authenticated request and one-time nonce do not independently
+            // observe the host profile. Never substitute request.host.profile_id.
             return Err(identity_error(
                 ERROR_IDENTITY_UNAVAILABLE,
-                "Photoshop bootstrap connection omitted its host profile identity",
+                "Independently observed Photoshop host profile identity is unavailable",
                 json!({"missingFields": ["identity.host.profileId"]}),
             ));
         };
@@ -7596,13 +7598,174 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.error.code, ERROR_IDENTITY_UNAVAILABLE);
-        assert!(error
-            .error
-            .data
-            .as_ref()
-            .is_some_and(|data| data.to_string().contains("identity.host.profileId")));
+        assert_eq!(
+            error.error.data,
+            Some(json!({"missingFields": ["identity.host.profileId"]}))
+        );
+        assert_eq!(
+            error.error.message,
+            "Independently observed Photoshop host profile identity is unavailable"
+        );
+        assert!(
+            !state.bootstrap_grants.lock().await[&session_key(HostKind::Photoshop, "retouch")]
+                .nonce_claimed
+        );
         assert_eq!(task.await.unwrap().unwrap_err().error.code, ERROR_TIMEOUT);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+    }
+
+    // Explicit npm gate: ordinary cargo tests must not require Node or built
+    // bridge assets. test:all runs this after building the real Photoshop bundle.
+    #[tokio::test]
+    #[ignore = "requires Node and built UXP bundle; run npm run test:photoshop-bootstrap-contract"]
+    async fn photoshop_generated_config_hello_fails_closed_without_observed_profile() {
+        use tokio::io::AsyncWriteExt;
+
+        let backend = FakeBootstrapBackend::ready();
+        let mut state = bootstrap_state(backend.clone());
+        state.token = "PRIVATE_TEST_TOKEN".into();
+        // Allow cold Node startup on Windows; the narrow Rust-only deadline
+        // tests cover scheduling precision without an external process.
+        let request = bootstrap_request(10_000);
+        let target = request.target.clone();
+        let key = session_key(HostKind::Photoshop, &target);
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let request_started = tokio::time::Instant::now();
+                let result = state.bootstrap_photoshop(request).await;
+                (result, request_started.elapsed())
+            }
+        });
+        let nonce = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let value = state
+                    .bootstrap_grants
+                    .lock()
+                    .await
+                    .get(&key)
+                    .and_then(|grant| grant.observed.as_ref().map(|_| grant.nonce.clone()));
+                if let Some(value) = value {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("bootstrap must observe its launched process within the test bound");
+
+        let url = "ws://127.0.0.1:47391/v1/bridge/photoshop/ws";
+        let config = photoshop_bootstrap::photoshop_bootstrap_config_for_test(
+            url,
+            &state.token,
+            &target,
+            &nonce,
+        )
+        .unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut child = tokio::process::Command::new("node")
+            .arg(root.join("scripts/test-uxp-bridge.js"))
+            .arg("--photoshop-generated-config-hello")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("Node is required; run npm run test:photoshop-bootstrap-contract");
+        let output = tokio::time::timeout(Duration::from_secs(5), async move {
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(config.as_bytes()).await.unwrap();
+            drop(stdin);
+            child.wait_with_output().await.unwrap()
+        })
+        .await
+        .expect("generated-config bridge harness must finish within the test bound");
+        assert!(
+            output.status.success(),
+            "bridge harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.len() <= 64 * 1024);
+        let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output["url"], url);
+        let BridgeInbound::Hello {
+            token,
+            target: hello_target,
+            capabilities,
+            identity,
+            bootstrap_nonce,
+        } = serde_json::from_value(output["hello"].clone()).unwrap()
+        else {
+            panic!("real Photoshop bundle must emit a hello");
+        };
+        assert_eq!(token, state.token);
+        assert_eq!(hello_target.as_deref(), Some(target.as_str()));
+        assert_eq!(bootstrap_nonce.as_deref(), Some(nonce.as_str()));
+        assert_eq!(capabilities.host, HostKind::Photoshop);
+        let claim = identity.as_ref().expect("UXP must supply plugin identity");
+        assert_eq!(claim.bridge, identity_claim().bridge);
+        assert_eq!(claim.host.host_version.as_deref(), Some("26.5.1"));
+        assert_eq!(claim.host.pid, None);
+        assert_eq!(claim.host.process_start_identity, None);
+        assert_eq!(claim.host.executable_path, None);
+        assert_eq!(claim.host.profile_id, None);
+
+        let error = state
+            .bind_photoshop_bootstrap_claim(
+                &target,
+                &capabilities,
+                identity,
+                bootstrap_nonce.as_deref(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_UNAVAILABLE);
+        assert_eq!(
+            error.error.data,
+            Some(json!({"missingFields": ["identity.host.profileId"]}))
+        );
+        let public = serde_json::to_string(&error).unwrap();
+        assert!(!public.contains(&nonce));
+        assert!(!public.contains("PRIVATE_TEST_TOKEN"));
+        assert!(!public.contains("profile-production"));
+        assert!(!public.contains("C:/"));
+        assert!(!state.bootstrap_grants.lock().await[&key].nonce_claimed);
+        assert!(state.sessions.read().await.is_empty());
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+
+        // Keep the outer bound as a hung-task guard, separate from the request
+        // deadline assertion. Allow one second for the two bounded 175-ms cleanup
+        // phases, 20-ms verification polling, and CI scheduling. Measure inside
+        // the task so initial scheduling and join collection do not count.
+        let (result, elapsed) = tokio::time::timeout_at(started + Duration::from_secs(13), task)
+            .await
+            .expect("bootstrap task must finish within the outer test bound")
+            .unwrap();
+        assert!(
+            elapsed <= Duration::from_secs(11),
+            "10-second bootstrap request took {elapsed:?}, exceeding its one-second cleanup/scheduling allowance"
+        );
+        let timeout = result.unwrap_err();
+        assert_eq!(timeout.error.code, ERROR_TIMEOUT);
+        assert_eq!(
+            timeout.error.data,
+            Some(json!({"stage": "verify", "timeoutMs": 10_000}))
+        );
+        assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.finalizes.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(!backend.launch_live.load(Ordering::SeqCst));
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
