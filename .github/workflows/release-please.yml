@@ -185,3 +185,115 @@ jobs:
           gh release upload $tag $assets --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  standalone-package:
+    name: Build standalone interpreter (${{ matrix.runtime-id }})
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            runtime-id: macos-arm64
+            artifact: adobepy-standalone-macos-arm64
+          - os: ubuntu-latest
+            runtime-id: linux-x64
+            artifact: adobepy-standalone-linux-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build adobepy wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade build wheel
+          python3 -m build --wheel --outdir dist
+      - name: Build standalone interpreter with PyOxidizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install pyoxidizer
+          wheel=$(ls dist/adobepy-*.whl 2>/dev/null | head -1)
+          if [ -z "$wheel" ]; then echo "adobepy wheel was not built"; exit 1; fi
+          wheel_abs="$(cd "$(dirname "$wheel")" && pwd)/$(basename "$wheel")"
+          pyoxidizer build --release --path pyadobe --var ADOBEPY_WHEEL "$wheel_abs"
+      # `macos-latest` is arm64, but the runner image can still report x86_64
+      # under Rosetta. Assert the resolved runtime id rather than deriving the
+      # asset name from `uname -m`, so a silent x86_64 fallback is never
+      # published as a macos-arm64 asset.
+      - name: Resolve runtime id
+        shell: bash
+        env:
+          EXPECTED_RUNTIME_ID: ${{ matrix.runtime-id }}
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          case "$EXPECTED_RUNTIME_ID" in
+            macos-arm64)
+              [ "$arch" = "arm64" ] || {
+                echo "::error title=Unexpected macOS architecture::'$EXPECTED_RUNTIME_ID' requires an arm64 runner, got '$arch'"; exit 1; }
+              resolved="macos-arm64" ;;
+            linux-x64)
+              [ "$arch" = "x86_64" ] || {
+                echo "::error title=Unexpected Linux architecture::'$EXPECTED_RUNTIME_ID' requires an x86_64 runner, got '$arch'"; exit 1; }
+              resolved="linux-x64" ;;
+            *)
+              echo "::error::unsupported runtime id '$EXPECTED_RUNTIME_ID'"; exit 1 ;;
+          esac
+          echo "RESOLVED_RUNTIME_ID=$resolved" >> "$GITHUB_ENV"
+      - name: Locate build output and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          adobepy_sha256() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | cut -d' ' -f1
+            else
+              shasum -a 256 "$1" | cut -d' ' -f1
+            fi
+          }
+          build_dir=$(ls -d build/*/release/install 2>/dev/null | head -1)
+          if [ -z "$build_dir" ]; then echo "PyOxidizer build output not found"; exit 1; fi
+          echo "STANDALONE_BUILD_DIR=$build_dir" >> "$GITHUB_ENV"
+          version=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
+          package_name="adobepy-standalone-$version-$RESOLVED_RUNTIME_ID"
+          dist_dir="${{ github.workspace }}/dist"
+          mkdir -p "$dist_dir"
+          (cd "$build_dir" && zip -r "$dist_dir/$package_name.zip" .)
+          hash=$(adobepy_sha256 "$dist_dir/$package_name.zip")
+          echo "$hash  $package_name.zip" > "$dist_dir/$package_name.zip.sha256"
+      # The zip is built from a directory tree, so the smoke test runs the
+      # unpacked interpreter. It is the same bytes that get zipped, and it keeps
+      # the macOS smoke from depending on `unzip` behaviour across runner images.
+      #
+      # `from adobe.photoshop import Photoshop` only imports the SDK; it opens no
+      # connection, so it passes with no Adobe host present. That is what makes
+      # the Linux leg meaningful at all — it proves the interpreter boots and the
+      # SDK is importable, not that a live host is reachable.
+      - name: Smoke test standalone interpreter
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$STANDALONE_BUILD_DIR/adobepy-python" -c "import sys; from adobe.photoshop import Photoshop; assert sys.version_info >= (3, 8); print('standalone smoke OK')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/adobepy-standalone-*.zip
+            dist/adobepy-standalone-*.zip.sha256
+      - name: Upload to GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=$(ls dist/adobepy-standalone-*.zip dist/adobepy-standalone-*.zip.sha256 2>/dev/null | tr '\n' ' ')
+          if [ -z "$assets" ]; then echo "No standalone release assets found in dist/"; exit 1; fi
+          gh release upload "${{ needs.release-please.outputs.tag_name }}" $assets --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

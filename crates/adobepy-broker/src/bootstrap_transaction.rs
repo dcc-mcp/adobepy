@@ -1044,7 +1044,7 @@ fn execute_helper_request(request: HelperRequest) -> anyhow::Result<HelperRespon
                 .context("bootstrap staging generation is invalid")?
                 .hyphenated()
                 .to_string();
-            let root = std::env::temp_dir()
+            let root = canonical_temp_root(std::env::temp_dir())
                 .join("adobepy-bootstrap-staging")
                 .join(&staging_id);
             fs::create_dir_all(&root)?;
@@ -1121,6 +1121,19 @@ fn stable_file_bytes(path: &Path, maximum_bytes: u64) -> anyhow::Result<Vec<u8>>
     Ok(bytes)
 }
 
+/// Resolve `path` to a symlink-free root for temporary fixtures.
+///
+/// On macOS the system temp dir is reached through a symlink: `TMPDIR` is
+/// `/var/folders/...`, which resolves to `/private/var/folders/...`. Any
+/// fixture created under the unresolved root therefore fails
+/// [`ensure_no_redirects`] unconditionally, which is why these tests passed on
+/// Linux and Windows but not on macOS. Falls back to the unresolved path when
+/// canonicalization fails, so an environmental problem surfaces as the original
+/// redirect error rather than being masked here.
+fn canonical_temp_root(path: PathBuf) -> PathBuf {
+    fs::canonicalize(&path).unwrap_or(path)
+}
+
 fn ensure_no_redirects(path: &Path) -> anyhow::Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -1158,7 +1171,7 @@ mod bounded_file_tests {
 
     #[test]
     fn helper_file_read_stops_at_max_plus_one_after_concurrent_growth() {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_root(std::env::temp_dir()).join(format!(
             "adobepy-helper-file-growth-{}",
             Uuid::new_v4().simple()
         ));
