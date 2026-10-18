@@ -1445,6 +1445,18 @@ fn bootstrap_config(
     ))
 }
 
+// Keep the cross-language regression on the same config generator used by
+// prepare(); this is not a second test implementation of its JavaScript.
+#[cfg(test)]
+pub(super) fn photoshop_bootstrap_config_for_test(
+    websocket_url: &str,
+    token: &str,
+    target: &str,
+    nonce: &str,
+) -> anyhow::Result<String> {
+    bootstrap_config(websocket_url, token, target, Some(nonce))
+}
+
 fn illustrator_bootstrap_config(
     websocket_url: &str,
     token: &str,

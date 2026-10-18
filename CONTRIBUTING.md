@@ -40,6 +40,15 @@ npm run test:all
 vx just package
 ```
 
+`npm run test:photoshop-bootstrap-contract` builds the Photoshop bundle and
+composes the production bootstrap config generator, mocked UXP hello, and real
+broker binder. It verifies that an unavailable independently observed host
+profile fails closed without consuming the nonce or publishing a receipt, and
+that the bootstrap still times out and rolls back. It does not prove a live
+Photoshop profile source or successful bootstrap. The test is included in
+`test:all` (and the release-parity CI job), but is explicitly ignored by ordinary
+`cargo test` / `test:quick`, which do not build bridge assets.
+
 Architecture-specific checks:
 
 ```powershell
