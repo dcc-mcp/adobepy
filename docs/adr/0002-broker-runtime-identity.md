@@ -156,9 +156,12 @@ version and produces a permanent `identity_mismatch`.
   identity-unavailable error; never fall back to `ps` or a synthesized value.
 - Linux missing `boot_id` or malformed `starttime`: error rather than emit a
   token that could collide across reboots.
-- `ADOBEPY_PRODUCT_VERSION` cannot be resolved at build time: `build.rs` emits a
-  build warning and falls back to the crate version; a receipt match will then
-  fail closed with `identity_mismatch`, which is the safe direction.
+- `ADOBEPY_PRODUCT_VERSION` cannot be resolved at build time: a **release** build
+  fails fast (`build.rs` refuses to emit a binary that would report the pinned
+  crate version, because that value is receipt-compared and would reintroduce
+  `identity_mismatch`); a non-release build only emits a build warning and falls
+  back to the crate version for local development. A shipped release artifact
+  therefore never carries a wrong runtime version.
 - Unauthenticated `/v1/broker-identity` request: `401`, no identity disclosed.
 - Scheme rotation: treated as a coordinated broker+adapter protocol change with
   tests on both sides; never a silent single-repo edit.

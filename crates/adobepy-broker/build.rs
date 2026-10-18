@@ -37,11 +37,24 @@ fn main() {
     let version = match resolved {
         Some(value) => value,
         None => {
+            // A release broker is shipped to end users, and its reported
+            // runtimeVersion is compared against an owned install receipt. A
+            // build that cannot resolve the product version would otherwise fall
+            // back to the pinned, non-release-managed crate version and thus
+            // reintroduce the very identity_mismatch this script prevents. Fail
+            // fast on release builds instead of silently emitting that value.
+            let profile = env::var("PROFILE").unwrap_or_default();
+            assert!(
+                profile != "release",
+                "ADOBEPY_PRODUCT_VERSION could not be resolved from \
+                 .github/release-please-manifest.json or pyproject.toml; refusing to build a \
+                 release broker that would report the crate version as its runtime identity"
+            );
             let fallback = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_owned());
             println!(
                 "cargo:warning=ADOBEPY_PRODUCT_VERSION could not be resolved from \
-                 .github/release-please-manifest.json or pyproject.toml; falling back to \
-                 the crate version {fallback}"
+                 .github/release-please-manifest.json or pyproject.toml; falling back to the \
+                 crate version {fallback} for this non-release build"
             );
             fallback
         }
@@ -89,9 +102,10 @@ fn product_version_from_pyproject(path: &Path) -> Option<String> {
     None
 }
 
-/// Require a bounded, single-line, numeric `major.minor.patch` product version so
-/// the reported value satisfies the runtime identity `is_bounded_text(_, 64)`
-/// constraint and stays comparable to an install receipt.
+/// Require a bounded, single-line, `major.minor.patch` product version with an
+/// optional `-prerelease` / `+build` suffix (the core `major.minor.patch` must be
+/// numeric). This keeps the reported value within the runtime identity
+/// `is_bounded_text(_, 64)` constraint and comparable to an install receipt.
 fn is_valid_product_version(value: &str) -> bool {
     if value.is_empty() || value.len() > 64 {
         return false;
