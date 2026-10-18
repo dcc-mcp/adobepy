@@ -7634,7 +7634,11 @@ mod tests {
         let started = tokio::time::Instant::now();
         let task = tokio::spawn({
             let state = state.clone();
-            async move { state.bootstrap_photoshop(request).await }
+            async move {
+                let request_started = tokio::time::Instant::now();
+                let result = state.bootstrap_photoshop(request).await;
+                (result, request_started.elapsed())
+            }
         });
         let nonce = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -7736,11 +7740,19 @@ mod tests {
         assert!(state.sessions.read().await.is_empty());
         assert!(state.bootstrap_receipts.lock().await.is_empty());
 
-        let timeout = tokio::time::timeout_at(started + Duration::from_secs(13), task)
+        // Keep the outer bound as a hung-task guard, separate from the request
+        // deadline assertion. Allow one second for the two bounded 175-ms cleanup
+        // phases, 20-ms verification polling, and CI scheduling. Measure inside
+        // the task so initial scheduling and join collection do not count.
+        let (result, elapsed) = tokio::time::timeout_at(started + Duration::from_secs(13), task)
             .await
-            .expect("rejected hello must not extend the bootstrap request deadline")
-            .unwrap()
-            .unwrap_err();
+            .expect("bootstrap task must finish within the outer test bound")
+            .unwrap();
+        assert!(
+            elapsed <= Duration::from_secs(11),
+            "10-second bootstrap request took {elapsed:?}, exceeding its one-second cleanup/scheduling allowance"
+        );
+        let timeout = result.unwrap_err();
         assert_eq!(timeout.error.code, ERROR_TIMEOUT);
         assert_eq!(
             timeout.error.data,
