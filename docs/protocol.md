@@ -126,6 +126,43 @@ unavailable error, and an omitted target with multiple matching sessions
 returns an ambiguous error. All identity fields are bounded and malformed
 claims are rejected before registration.
 
+## Broker Runtime Identity
+
+`POST /v1/runtime-identity` requires a live host/bridge session. When an adapter
+needs only the broker's own identity — before a session exists, or from a
+pre-session watchdog — it reads the session-free authenticated endpoint:
+
+```http
+GET /v1/broker-identity
+x-adobepy-token: <token>
+```
+
+Response (HTTP 200):
+
+```json
+{
+  "pid": 4100,
+  "processStartIdentity": "windows-filetime:133700000000000000",
+  "executablePath": "C:/adobepy/adobepy.exe",
+  "runtimeVersion": "0.6.2",
+  "instanceId": "76db1078-74c9-45c1-87e1-e8258649815e"
+}
+```
+
+Without a valid `x-adobepy-token` the endpoint returns `401` and discloses
+nothing; identity is never placed on the unauthenticated `/health` liveness
+probe. `BrokerClient.broker_identity()` and `broker_identity_async()` return a
+typed `BrokerRuntimeIdentity`.
+
+`runtimeVersion` is the release-managed product version (see ADR 0002), not the
+pinned Rust crate version, so it equals the `installer_version` an adapter
+records in its owned install receipt. `processStartIdentity` uses one canonical
+encoding per platform — Windows `windows-filetime:{ticks}`, macOS
+`macos:{seconds}:{microseconds:06}`, Linux `linux:{boot_id}:{start_ticks}` —
+byte-identical whether the broker describes itself or an observed host, so an
+adapter can reproduce the value from independent OS process observations. A
+change to any encoding is a coordinated broker+adapter protocol change.
+
 ## Bounded Photoshop bootstrap
 
 An adapter that has already authenticated an exact Photoshop executable and
@@ -249,7 +286,9 @@ shape without inspecting bridge internals.
 
 ## Authentication
 
-All broker HTTP client calls use `x-adobepy-token`. Bridge WebSocket sessions
+All broker HTTP client calls use `x-adobepy-token`, including the identity
+endpoints `/v1/broker-identity` and `/v1/runtime-identity`; `/health` is the only
+unauthenticated route and carries no identity. Bridge WebSocket sessions
 authenticate with the `token` field in the first `hello` message. A blank broker
 token disables auth only for local development tests.
 
@@ -265,6 +304,9 @@ dispatcher. `options.timeoutMs` overrides the broker default for a single call.
 Additive namespace, method, feature, and diagnostics fields are compatible.
 Changing existing field names, error codes, or response envelope shapes is a
 breaking change and requires a protocol version bump plus migration notes.
+Changing a `processStartIdentity` encoding (ADR 0002) is likewise a breaking
+change: brokers and adapters derive and compare the token independently, so they
+must adopt a new scheme together.
 
 New facade methods must be capability-gated and should keep both Adobe
 JavaScript-shaped names and Pythonic aliases when the upstream API is camelCase.

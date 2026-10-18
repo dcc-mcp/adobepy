@@ -20,7 +20,7 @@ from .photoshop_bootstrap import (
     PhotoshopBootstrapRequest,
     PhotoshopBootstrapResult,
 )
-from .runtime_identity import RuntimeIdentityAttestation
+from .runtime_identity import BrokerRuntimeIdentity, RuntimeIdentityAttestation
 
 DEFAULT_BROKER_URL = "http://127.0.0.1:47391"
 
@@ -87,6 +87,20 @@ class BrokerClient:
 
     async def capabilities_async(self) -> list[dict[str, Any]]:
         return await _to_thread(self.capabilities)
+
+    def broker_identity(self) -> BrokerRuntimeIdentity:
+        """Return the broker's own runtime identity (authenticated, session-free).
+
+        Unlike :meth:`runtime_identity`, this does not require a live host/bridge
+        session: broker self-identity is knowable as soon as the broker starts.
+        It is exposed only over the authenticated ``/v1/broker-identity``
+        endpoint, never on the token-less ``/health`` liveness probe.
+        """
+        data = self._get_json("/v1/broker-identity")
+        return BrokerRuntimeIdentity.from_mapping(data)
+
+    async def broker_identity_async(self) -> BrokerRuntimeIdentity:
+        return await _to_thread(self.broker_identity)
 
     def runtime_identity(
         self,

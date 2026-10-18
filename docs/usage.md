@@ -8,8 +8,9 @@ adobepy broker --token $env:ADOBEPY_TOKEN
 ```
 
 The broker listens on `127.0.0.1:47391` and exposes `/health`,
-`/v1/capabilities`, `/v1/rpc`, and bridge/client WebSocket routes. Authenticated
-routes use `x-adobepy-token`.
+`/v1/broker-identity`, `/v1/capabilities`, `/v1/rpc`, and bridge/client
+WebSocket routes. Authenticated routes use `x-adobepy-token`; `/health` is the
+only unauthenticated route and carries no identity.
 
 ## Python
 

@@ -1656,7 +1656,7 @@ fn observe_process(pid: u32) -> anyhow::Result<ObservedHostProcess> {
         let creation_ticks = (u64::from(creation.high) << 32) | u64::from(creation.low);
         Ok(ObservedHostProcess {
             pid,
-            process_start_identity: format!("windows:{creation_ticks}"),
+            process_start_identity: format!("windows-filetime:{creation_ticks}"),
             executable_path: String::from_utf16(&path[..usize::try_from(path_len)?])?,
         })
     })();

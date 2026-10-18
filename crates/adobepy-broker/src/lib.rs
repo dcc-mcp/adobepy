@@ -3245,6 +3245,7 @@ fn broker_router(state: BrokerState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/capabilities", get(list_capabilities))
+        .route("/v1/broker-identity", get(broker_identity))
         .route("/v1/runtime-identity", post(runtime_identity))
         .route("/v1/photoshop/bootstrap", post(photoshop_bootstrap))
         .route(
@@ -3296,6 +3297,24 @@ async fn runtime_identity(
         Ok(identity) => Json(identity).into_response(),
         Err(error) => Json(*error).into_response(),
     }
+}
+
+/// Return the broker's own runtime identity over an authenticated endpoint that
+/// does not depend on a live host/bridge session.
+///
+/// `/health` stays a token-less liveness probe and intentionally carries no
+/// identity. Listing broker process facts (pid, executable path, process-start
+/// identity, version, instance id) on an unauthenticated loopback endpoint would
+/// disclose them to any local process, so this data is exposed only to a caller
+/// holding `x-adobepy-token`. Because broker self-identity is knowable the
+/// instant the process starts, an adapter can verify "is this the broker I
+/// installed?" before or independently of any Photoshop session connecting,
+/// which the session-scoped `/v1/runtime-identity` attestation cannot provide.
+async fn broker_identity(State(state): State<BrokerState>, headers: HeaderMap) -> Response {
+    if !state.authorized(&headers) {
+        return unauthorized_response();
+    }
+    Json(state.broker_identity.as_ref().clone()).into_response()
 }
 
 async fn photoshop_bootstrap(
@@ -4279,7 +4298,10 @@ fn capture_broker_identity() -> anyhow::Result<BrokerRuntimeIdentity> {
         pid: std::process::id(),
         process_start_identity: current_process_start_identity()?,
         executable_path,
-        runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
+        // Report the release-managed adobepy product version, not the pinned
+        // Rust crate version, so an adapter can match this identity against its
+        // owned install receipt. See crates/adobepy-broker/build.rs.
+        runtime_version: env!("ADOBEPY_PRODUCT_VERSION").to_owned(),
         instance_id: Uuid::new_v4().hyphenated().to_string(),
     })
 }
@@ -4340,7 +4362,7 @@ fn current_process_start_identity() -> anyhow::Result<String> {
         return Err(std::io::Error::last_os_error().into());
     }
     let creation_ticks = (u64::from(creation.high) << 32) | u64::from(creation.low);
-    Ok(format!("windows:{creation_ticks}"))
+    Ok(format!("windows-filetime:{creation_ticks}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -5819,6 +5841,84 @@ mod tests {
         invalid.jsonrpc = "1.0".into();
         let error = state.dispatch_request(invalid).await.unwrap_err();
         assert_eq!(error.error.code, ERROR_INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn broker_identity_endpoint_is_authenticated_and_session_independent() {
+        // No host/bridge session is registered; broker self-identity must still
+        // resolve from the authenticated endpoint.
+        let app = broker_router(state());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/broker-identity")
+                    .header("x-adobepy-token", "t")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            payload["runtimeVersion"].as_str(),
+            Some(env!("ADOBEPY_PRODUCT_VERSION"))
+        );
+        assert!(payload["pid"].as_u64().is_some_and(|pid| pid > 0));
+        assert!(payload["processStartIdentity"].as_str().is_some());
+        assert!(payload["executablePath"].as_str().is_some());
+        assert!(payload["instanceId"].as_str().is_some());
+        // The token is never echoed back on any identity surface.
+        assert!(!String::from_utf8_lossy(&bytes).contains("token"));
+
+        // Unauthenticated callers are rejected: identity is never on /health and
+        // never on the broker identity endpoint without the bearer token.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/broker-identity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn broker_runtime_version_reports_the_product_release_version() {
+        let identity = capture_broker_identity().expect("capture broker identity");
+        assert_eq!(identity.runtime_version, env!("ADOBEPY_PRODUCT_VERSION"));
+        // The Rust crate version is pinned and release-independent; it must not be
+        // what an adapter compares against its owned install receipt.
+        assert_ne!(identity.runtime_version, env!("CARGO_PKG_VERSION"));
+        assert!(is_bounded_text(&identity.runtime_version, 64));
+    }
+
+    #[test]
+    fn broker_start_identity_uses_the_canonical_platform_prefix() {
+        let identity = capture_broker_identity().expect("capture broker identity");
+        let start = identity.process_start_identity;
+        #[cfg(windows)]
+        assert!(
+            start.starts_with("windows-filetime:"),
+            "unexpected start identity {start}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            start.starts_with("macos:"),
+            "unexpected start identity {start}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            start.starts_with("linux:"),
+            "unexpected start identity {start}"
+        );
+        assert!(is_bounded_start_identity(&start));
     }
 
     #[tokio::test]
