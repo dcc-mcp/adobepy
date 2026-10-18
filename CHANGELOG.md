@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.3...adobepy-v0.12.0) (2026-10-18)
+
+
+### Features
+
+* expose authenticated broker runtime identity ([3ed73b7](https://github.com/dcc-mcp/adobepy/commit/3ed73b7067c465a1b3dd329e74dbf4ed3c593364))
+
 ## [0.11.3](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.2...adobepy-v0.11.3) (2026-10-17)
 
 
