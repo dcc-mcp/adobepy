@@ -160,13 +160,51 @@ The adapter polls this endpoint with a 100 ms interval and a total timeout of
 
 Health proves only that an HTTP broker is listening. It does not prove that the
 broker is the selected process or that a particular Photoshop/UXP session is
-ready. Before reporting `directly_usable`, the adapter must call the
-authenticated runtime identity endpoint and compare the result with independent
-OS process observations and its owned install receipt. A missing
-`__ADOBEPY_HOST_IDENTITY` launch context therefore remains fail-closed even when
-`/health` and `/v1/capabilities` succeed.
+ready. Before reporting `directly_usable`, the adapter must fetch the broker's
+own identity from the authenticated `/v1/broker-identity` endpoint (see §3.1),
+then call the session-scoped `/v1/runtime-identity` endpoint, and compare both
+against independent OS process observations and its owned install receipt. A
+missing `__ADOBEPY_HOST_IDENTITY` launch context therefore remains fail-closed
+even when `/health` and `/v1/capabilities` succeed.
 
-### 3.1 After Effects CEP identity
+### 3.1 Broker identity endpoint
+
+The broker reports its own runtime identity over an endpoint that requires the
+broker token but does not require a live host/bridge session. It succeeds from
+the moment the broker starts listening, so an adapter can identify the broker
+before any Photoshop/UXP session exists and a pre-session watchdog can keep
+checking liveness separately.
+
+```http
+GET http://127.0.0.1:47391/v1/broker-identity
+x-adobepy-token: <token>
+```
+
+Expected response (HTTP 200):
+
+```json
+{
+  "pid": 4100,
+  "processStartIdentity": "windows-filetime:133700000000000000",
+  "executablePath": "C:/adobepy/adobepy.exe",
+  "runtimeVersion": "0.6.2",
+  "instanceId": "76db1078-74c9-45c1-87e1-e8258649815e"
+}
+```
+
+Without a valid `x-adobepy-token` the endpoint returns `401` and discloses no
+identity. Identity is never added to the token-less `/health` liveness probe:
+liveness and identity stay on separate surfaces. `runtimeVersion` is the
+release-managed product version, not the Rust crate version, so it matches the
+`installer_version` an adapter records in its owned install receipt.
+
+`processStartIdentity` follows the single canonical, cross-platform scheme fixed
+by ADR 0002 — Windows `windows-filetime:{ticks}`, macOS
+`macos:{seconds}:{microseconds:06}`, Linux `linux:{boot_id}:{start_ticks}` — and
+is encoded identically whether the broker describes itself or an observed host
+process, so an adapter can reproduce and compare the value byte for byte.
+
+### 3.2 After Effects CEP identity
 
 After Effects CEP identity is currently fail-closed. The broker does not return
 a complete runtime attestation from CEP self-reported globals: an

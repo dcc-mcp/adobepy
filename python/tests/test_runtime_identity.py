@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 import urllib.request
@@ -7,6 +8,7 @@ from unittest import mock
 
 from adobe.core import (
     BrokerClient,
+    BrokerRuntimeIdentity,
     HostSession,
     IdentityAmbiguousError,
     IdentityMismatchError,
@@ -103,6 +105,48 @@ class RuntimeIdentityTests(unittest.TestCase):
         identity = HostSession("photoshop", client).runtime_identity()
         self.assertEqual(identity.host.executable_path, "C:/Adobe/Photoshop.exe")
         client.runtime_identity.assert_called_once_with("photoshop", target="retouch", expected=None)
+
+    def test_broker_identity_reads_the_authenticated_session_free_endpoint(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            captured["headers"] = dict(request.header_items())
+            captured["method"] = request.get_method()
+            return FakeResponse(IDENTITY["broker"])
+
+        client = BrokerClient("http://broker.test", token="top-secret", timeout=7)
+        with mock.patch.object(urllib.request, "urlopen", fake_urlopen):
+            identity = client.broker_identity()
+
+        self.assertIsInstance(identity, BrokerRuntimeIdentity)
+        self.assertEqual(identity.pid, 4100)
+        self.assertEqual(identity.executable_path, "C:/adobepy/adobepy.exe")
+        self.assertEqual(identity.runtime_version, "0.1.0")
+        self.assertEqual(captured["url"], "http://broker.test/v1/broker-identity")
+        self.assertEqual(captured["method"], "GET")
+        self.assertEqual(captured["headers"]["X-adobepy-token"], "top-secret")
+
+    def test_broker_identity_async_reads_the_session_free_endpoint(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            captured["method"] = request.get_method()
+            return FakeResponse(IDENTITY["broker"])
+
+        async def run():
+            client = BrokerClient("http://broker.test", token="top-secret", timeout=7)
+            with mock.patch.object(urllib.request, "urlopen", fake_urlopen):
+                return await client.broker_identity_async()
+
+        identity = asyncio.run(run())
+
+        self.assertIsInstance(identity, BrokerRuntimeIdentity)
+        self.assertEqual(identity.pid, 4100)
+        self.assertEqual(identity.executable_path, "C:/adobepy/adobepy.exe")
+        self.assertEqual(captured["url"], "http://broker.test/v1/broker-identity")
+        self.assertEqual(captured["method"], "GET")
 
     def test_identity_failures_are_stable_typed_errors(self):
         cases = {
