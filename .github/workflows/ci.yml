@@ -194,7 +194,12 @@ jobs:
           if [ ! -f "$zip_path.sha256" ]; then echo "package checksum was not created"; exit 1; fi
           expanded="$(mktemp -d)"
           unzip -q "$zip_path" -d "$expanded"
-          package_root="$(find "$expanded" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          # The zip has one root dir. Use a portable glob instead of
+          # GNU-only `find -quit` (absent from BSD find on macOS).
+          package_root=""
+          for entry in "$expanded"/*/; do
+            if [ -d "$entry" ]; then package_root="${entry%/}"; break; fi
+          done
           if [ -z "$package_root" ]; then echo "package zip has no root directory"; exit 1; fi
           node scripts/check-release-versions.js --root "$package_root"
       - name: Install smoke test
@@ -245,7 +250,12 @@ jobs:
           if [ ! -f "$zip_path.sha256" ]; then echo "package checksum was not created"; exit 1; fi
           expanded="$(mktemp -d)"
           unzip -q "$zip_path" -d "$expanded"
-          package_root="$(find "$expanded" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          # The zip has one root dir. Use a portable glob instead of
+          # GNU-only `find -quit` (absent from BSD find on macOS).
+          package_root=""
+          for entry in "$expanded"/*/; do
+            if [ -d "$entry" ]; then package_root="${entry%/}"; break; fi
+          done
           if [ -z "$package_root" ]; then echo "package zip has no root directory"; exit 1; fi
           node scripts/check-release-versions.js --root "$package_root"
       - name: Install smoke test
