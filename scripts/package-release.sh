@@ -110,7 +110,7 @@ if [ "$SKIP_TESTS" = false ]; then
 fi
 
 step "Build release CLI"
-external cargo build --release -p adobepy-cli --bin adobepy
+external cargo build --release -p adobepy-cli --bin adobepy -p adobepy-broker --bin adobepy-bootstrap-helper
 
 step "Build bridge bundles"
 external npm run uxp:build
@@ -123,6 +123,7 @@ step "Stage distribution tree"
 mkdir -p "$STAGE_ROOT/bin"
 mkdir -p "$STAGE_ROOT/wheels"
 copy_file "target/release/adobepy" "$STAGE_ROOT/bin/adobepy"
+copy_file "target/release/adobepy-bootstrap-helper" "$STAGE_ROOT/bin/adobepy-bootstrap-helper"
 for dir in python bridges docs generators; do
     copy_tree "$ROOT/$dir" "$STAGE_ROOT/$dir"
 done
@@ -149,7 +150,11 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 BIN="$ROOT/bin"
 WHEEL="$(ls "$ROOT/wheels/"*.whl 2>/dev/null | sort | tail -1)"
 if [ -z "$WHEEL" ]; then echo "no Python wheel found"; exit 1; fi
-"$PYTHON" -m pip install --user --force-reinstall "$WHEEL"
+INSTALL_ARGS=(--no-deps --force-reinstall)
+if ! "$PYTHON" -I -c 'import sys; sys.exit(0 if sys.prefix != sys.base_prefix else 1)'; then
+    INSTALL_ARGS+=(--user)
+fi
+"$PYTHON" -I -m pip --isolated install --no-index "${INSTALL_ARGS[@]}" "$WHEEL"
 echo "Installed adobepy SDK."
 echo "CLI: $BIN/adobepy"
 SCRIPT
@@ -183,7 +188,7 @@ m = {
     'runtime': '$RUNTIME_ID',
     'builtAt': __import__('datetime').datetime.utcnow().isoformat() + 'Z',
     'commands': ['vx just package', './install.sh', './bin/adobepy doctor'],
-    'includes': ['bin/adobepy', 'wheels/*.whl', 'python/adobe', 'bridges/uxp', 'bridges/cep', 'docs', 'generators/ir'],
+    'includes': ['bin/adobepy', 'bin/adobepy-bootstrap-helper', 'wheels/*.whl', 'python/adobe', 'bridges/uxp', 'bridges/cep', 'docs', 'generators/ir'],
     'notes': ['Rust dependencies are linked into the release executable.', 'Bridge JavaScript dependencies are bundled into bridges/**/dist.', 'The Python SDK has no third-party runtime dependencies.']
 }
 with open('$STAGE_ROOT/package-manifest.json', 'w') as f:

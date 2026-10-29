@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ZIP_PATH=""
 PYTHON="python3"
 
@@ -23,6 +24,9 @@ if [ ! -f "$ZIP_PATH" ]; then
     exit 1
 fi
 
+PYTHON="$(command -v "$PYTHON")"
+"$PYTHON" "$SCRIPT_DIR/check_package_checksum.py" "$ZIP_PATH"
+
 echo "==> Smoke test: $ZIP_PATH"
 
 TEMP_DIR="$(mktemp -d)"
@@ -33,13 +37,33 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Extracting to $TEMP_DIR..."
-unzip -q "$ZIP_PATH" -d "$TEMP_DIR"
+mkdir "$TEMP_DIR/package"
+unzip -q "$ZIP_PATH" -d "$TEMP_DIR/package"
 
-EXTRACTED_ROOT="$(ls -d "$TEMP_DIR"/*/ 2>/dev/null | head -1)"
-if [ -z "$EXTRACTED_ROOT" ]; then
-    echo "error: no root directory found inside zip"
+shopt -s nullglob dotglob
+roots=("$TEMP_DIR/package/"*)
+if [ "${#roots[@]}" -ne 1 ] || [ ! -d "${roots[0]}" ]; then
+    echo "error: expected exactly one package root directory"
     exit 1
 fi
+EXTRACTED_ROOT="${roots[0]}"
+for binary in adobepy adobepy-bootstrap-helper; do
+    if [ ! -f "$EXTRACTED_ROOT/bin/$binary" ] || [ ! -x "$EXTRACTED_ROOT/bin/$binary" ]; then
+        echo "error: missing executable bin/$binary in package"
+        exit 1
+    fi
+done
+for directory in bridges python; do
+    if [ ! -d "$EXTRACTED_ROOT/$directory" ]; then
+        echo "error: missing $directory in package"
+        exit 1
+    fi
+done
+
+# A clean venv prevents a preinstalled SDK from hiding a broken wheel. Keep it
+# outside the extracted tree, and ignore checkout/user-site Python paths.
+"$PYTHON" -I -m venv "$TEMP_DIR/venv"
+PYTHON="$TEMP_DIR/venv/bin/python"
 echo "Extracted root: $EXTRACTED_ROOT"
 
 INSTALL_SCRIPT="$EXTRACTED_ROOT/install.sh"
@@ -54,7 +78,7 @@ echo "Running install.sh..."
 ( cd "$EXTRACTED_ROOT" && bash "$INSTALL_SCRIPT" "$PYTHON" )
 
 echo "Verifying SDK import..."
-"$PYTHON" -c "
+( cd "$TEMP_DIR" && "$PYTHON" -I -c "
 from adobe.photoshop import Photoshop
 from adobe.indesign import InDesign
 from adobe.premiere import Premiere
@@ -65,7 +89,7 @@ from adobe.dcc_mcp import adobe_success
 assert Photoshop.__name__ == 'Photoshop'
 assert adobe_success('ok')['success'] is True
 print('SDK import smoke passed')
-"
+" )
 
 DOCTOR_EXE="$EXTRACTED_ROOT/bin/adobepy"
 if [ ! -f "$DOCTOR_EXE" ]; then
@@ -74,26 +98,10 @@ if [ ! -f "$DOCTOR_EXE" ]; then
 fi
 
 echo "Running adobepy doctor --json..."
-DOCTOR_OUTPUT="$("$DOCTOR_EXE" doctor --json 2>&1 || true)"
-
-if ! echo "$DOCTOR_OUTPUT" | python3 -c "import sys,json; data=json.load(sys.stdin); unexpected=[d for d in data if not d.get('ok') and d.get('name') != 'broker_port']; sys.exit(len(unexpected))" 2>/dev/null; then
-    echo "adobepy doctor found unexpected failures:"
-    echo "$DOCTOR_OUTPUT" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for d in data:
-    status = ' ok ' if d.get('ok') else 'warn'
-    print(f'  [{status}] {d[\"name\"]}: {d.get(\"detail\", \"\")}')
-    " 2>/dev/null
+if ! DOCTOR_OUTPUT="$(cd "$EXTRACTED_ROOT" && "$DOCTOR_EXE" doctor --json --python "$PYTHON")"; then
+    echo "error: adobepy doctor exited unsuccessfully"
+    exit 1
 fi
-
-echo "Doctor results:"
-echo "$DOCTOR_OUTPUT" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for d in data:
-    status = ' ok ' if d.get('ok') else 'warn'
-    print(f'  [{status}] {d[\"name\"]}: {d.get(\"detail\", \"\")}')
-"
+printf '%s\n' "$DOCTOR_OUTPUT" | "$PYTHON" -I "$SCRIPT_DIR/check_package_doctor.py"
 
 echo "Install smoke test passed"

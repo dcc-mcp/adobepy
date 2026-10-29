@@ -89,6 +89,8 @@ jobs:
       - run: npm ci
       - run: npm run security:check
       - run: npm run lint
+      - name: Package smoke regression scenarios
+        run: python scripts/test_package_smoke.py
       # The release gate only runs on `main`, so nothing else exercises it.
       # These scenarios drive scripts/gate-release-pr.sh with a stub `gh` and
       # assert on the verdicts and exit codes it emits.
@@ -191,7 +193,7 @@ jobs:
             if [ -f "$candidate" ]; then zip_path="$candidate"; break; fi
           done
           if [ -z "$zip_path" ]; then echo "package zip was not created"; exit 1; fi
-          if [ ! -f "$zip_path.sha256" ]; then echo "package checksum was not created"; exit 1; fi
+          python3 scripts/check_package_checksum.py "$zip_path"
           expanded="$(mktemp -d)"
           unzip -q "$zip_path" -d "$expanded"
           # The zip has one root dir. Use a portable glob instead of
@@ -247,7 +249,7 @@ jobs:
             if [ -f "$candidate" ]; then zip_path="$candidate"; break; fi
           done
           if [ -z "$zip_path" ]; then echo "package zip was not created"; exit 1; fi
-          if [ ! -f "$zip_path.sha256" ]; then echo "package checksum was not created"; exit 1; fi
+          python3 scripts/check_package_checksum.py "$zip_path"
           expanded="$(mktemp -d)"
           unzip -q "$zip_path" -d "$expanded"
           # The zip has one root dir. Use a portable glob instead of
