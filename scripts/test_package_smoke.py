@@ -176,6 +176,35 @@ exit CODE
         return run(["bash", str(SCRIPTS / "smoke_install.sh"), "--zip", str(self.path),
                     "--python", sys.executable], cwd=str(self.checkout), env=environment)
 
+    def test_real_nonvenv_installer_uses_temporary_user_site(self):
+        # Exercise the documented default install.sh path, not just smoke's venv.
+        if sys.prefix != sys.base_prefix:
+            self.skipTest("requires a real non-virtual-environment interpreter")
+        self.package()
+        extracted = self.base / "unpacked"
+        with zipfile.ZipFile(self.path) as archive:
+            archive.extractall(extracted)
+        root = extracted / "adobepy-fixture"
+        (root / "pip.py").write_text("raise RuntimeError('caller pip.py was imported')\n")
+        home = self.base / "user-home"
+        home.mkdir()
+        environment = dict(os.environ, HOME=str(home), USERPROFILE=str(home),
+                           PYTHONPATH=str(self.checkout), PYTHONHOME="/nonexistent/python-home",
+                           PIP_NO_INDEX="1")
+        # Invoke without an interpreter argument, as documented. Resolve python3
+        # to this test's interpreter without adding fixture packages to sys.path.
+        bin_dir = self.base / "interpreter-bin"
+        bin_dir.mkdir()
+        (bin_dir / "python3").symlink_to(sys.executable)
+        environment["PATH"] = str(bin_dir) + os.pathsep + environment.get("PATH", "")
+        result = run(["bash", str(root / "install.sh")], cwd=str(root), env=environment)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        result = run([sys.executable, "-E", "-c",
+                      "import adobe, pathlib, site; "
+                      "pathlib.Path(adobe.__file__).relative_to(pathlib.Path(site.getusersitepackages()))"
+                      ], cwd=str(self.base), env=environment)
+        self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_complete_fixture_from_checkout(self):
         self.package()
         result = self.smoke()

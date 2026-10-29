@@ -146,15 +146,25 @@ cat > "$STAGE_ROOT/install.sh" << 'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 PYTHON="${1:-python3}"
+# Preserve interpreter identity before entering a neutral pip working directory.
+PYTHON="$("$PYTHON" -I -c 'import sys; print(sys.executable)')"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BIN="$ROOT/bin"
 WHEEL="$(ls "$ROOT/wheels/"*.whl 2>/dev/null | sort | tail -1)"
 if [ -z "$WHEEL" ]; then echo "no Python wheel found"; exit 1; fi
 INSTALL_ARGS=(--no-deps --force-reinstall)
+PYTHON_ARGS=(-I)
 if ! "$PYTHON" -I -c 'import sys; sys.exit(0 if sys.prefix != sys.base_prefix else 1)'; then
     INSTALL_ARGS+=(--user)
+    # -I disables the user site, which modern pip rejects with --user.
+    # -E still ignores PYTHONPATH/PYTHONHOME without hiding that destination.
+    PYTHON_ARGS=(-E)
 fi
-"$PYTHON" -I -m pip --isolated install --no-index "${INSTALL_ARGS[@]}" "$WHEEL"
+# -E preserves the user site but not CWD isolation. Do not import a caller's
+# pip.py in the non-venv path.
+PIP_CWD="$(mktemp -d)"
+trap 'rm -rf "$PIP_CWD"' EXIT
+( cd "$PIP_CWD" && "$PYTHON" "${PYTHON_ARGS[@]}" -m pip --isolated install --no-index "${INSTALL_ARGS[@]}" "$WHEEL" )
 echo "Installed adobepy SDK."
 echo "CLI: $BIN/adobepy"
 SCRIPT
