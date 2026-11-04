@@ -268,7 +268,10 @@ async function testAfterEffectsIdentityHello() {
     document: { getElementById() { return { textContent: "", addEventListener() {} }; } },
     __ADOBEPY_TOKEN: "PRIVATE_TEST_TOKEN",
     __ADOBEPY_TARGET: "retouch",
-    __ADOBEPY_BOOTSTRAP_NONCE: "b".repeat(64),
+    // AE CEP has no broker-owned bootstrap: the generated adobepy.config.js
+    // never injects __ADOBEPY_BOOTSTRAP_NONCE, so a real AE hello must not
+    // carry bootstrapNonce (see docs §3.2). Presenting one is rejected
+    // fail-closed by the broker instead of being an AE-specific field.
     __ADOBEPY_HOST_IDENTITY: {
       pid: 4200,
       processStartIdentity: "windows:133700000000000100",
@@ -290,7 +293,7 @@ async function testAfterEffectsIdentityHello() {
   assert.strictEqual(hello.capabilities.host, "after-effects");
   assert.strictEqual(hello.capabilities.bridgeKind, "cep");
   assert.strictEqual(hello.capabilities.hostVersion, "25.0.0");
-  assert.strictEqual(hello.bootstrapNonce, "b".repeat(64));
+  assert.ok(!("bootstrapNonce" in hello), "AE CEP must not emit a bootstrap nonce");
   assert.deepStrictEqual(JSON.parse(JSON.stringify(hello.identity)), {
     host: {
       pid: 4200,
