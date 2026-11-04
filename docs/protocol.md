@@ -84,11 +84,13 @@ InDesign, Premiere, After Effects, and Illustrator are asserted by
 `npm run capabilities:check` against the generated IR and API source registry.
 
 Identity claims are optional for backward-compatible bridge connectivity, but
-an incomplete claim can never produce an exact runtime attestation. The
-Photoshop UXP bridge obtains its host version and installed plug-in/module
-origin from the loaded host and UXP file-system APIs. It accepts PID,
+an incomplete claim can never produce an exact runtime attestation. All hosts
+share one typed, secret-free identity contract; no host-specific identity or
+launch-receipt field is introduced. The UXP and CEP bridges obtain their host
+version and installed plug-in/module origin from the loaded host and their
+file-system APIs (a fixed, bounded version probe on CEP). They accept PID,
 process-start identity, executable path, and profile ID only from the bounded
-adapter-owned `__ADOBEPY_HOST_IDENTITY` launch context. It does not guess these
+adapter-owned `__ADOBEPY_HOST_IDENTITY` launch context. They do not guess these
 values or use arbitrary execution or UI automation to discover them.
 
 ## Runtime Identity Attestation
@@ -104,10 +106,12 @@ content-type: application/json
 ```
 
 The response binds the broker PID/start identity/executable/version/instance,
-Photoshop PID/start identity/executable/version/profile, and UXP
+the host PID/start identity/executable/version/profile, and the bridge
 target/kind/version/connection epoch/instance/plugin root/module origin. The
-token is never part of the response. `BrokerClient.runtime_identity()` and
-`Photoshop.runtime_identity()` return a typed `RuntimeIdentityAttestation`.
+token is never part of the response. `BrokerClient.runtime_identity()` and each
+host facade's `runtime_identity()` — for example `Photoshop.runtime_identity()`
+or `AfterEffects().runtime_identity()` — return a typed
+`RuntimeIdentityAttestation`.
 
 Install verification should construct an expected attestation from independent
 OS process observations plus the owned install receipt and pass it back to the
@@ -125,6 +129,26 @@ root, or module origin returns a mismatch error. Missing host facts return an
 unavailable error, and an omitted target with multiple matching sessions
 returns an ambiguous error. All identity fields are bounded and malformed
 claims are rejected before registration.
+
+### After Effects CEP identity
+
+After Effects CEP uses the same attestation above — there is no
+`adapterOwnedLaunchReceipt` field or After Effects-only broker bypass. The
+bridge reports a bounded `app.version` probe, its CEP extension root and
+`dist/main.js` module origin, one runtime instance ID, and the adapter-owned
+launch context, and the broker requires `bridgeKind: "cep"`. An adapter owns the
+bounded host launch and its install/launch receipt: it observes the After
+Effects process from the OS and cross-checks the session with
+`AfterEffects().runtime_identity(expected=expected_identity)`. Failure reasons
+stay distinguishable — a missing session or incomplete claim returns
+`ERROR_IDENTITY_UNAVAILABLE` with `missingFields`, stale PID reuse returns
+`ERROR_IDENTITY_STALE`, an ambiguous target returns
+`ERROR_IDENTITY_AMBIGUOUS`, and a foreign target/profile/executable/module, a
+non-CEP bridge, or a version mismatch returns `ERROR_IDENTITY_MISMATCH`. A
+claim-less handshake connects but never attests identity. There is no
+After Effects-specific broker-side host-launch bootstrap; the broker never runs
+arbitrary JSX/ExtendScript, executes a generic command, or falls back to UI
+automation for identity.
 
 ## Broker Runtime Identity
 

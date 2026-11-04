@@ -3926,17 +3926,6 @@ fn validate_bridge_identity_claim(
             json!({"field": "target"}),
         ));
     }
-    if capabilities.host == HostKind::AfterEffects {
-        return Err(identity_error(
-            ERROR_IDENTITY_UNAVAILABLE,
-            "After Effects runtime identity requires an adapter-owned launch receipt",
-            json!({
-                "host": capabilities.host.as_str(),
-                "target": target,
-                "missingFields": ["adapterOwnedLaunchReceipt"]
-            }),
-        ));
-    }
     if !is_bounded_text(&capabilities.bridge_version, 64)
         || capabilities
             .host_version
@@ -4070,6 +4059,15 @@ fn complete_runtime_identity(
         return Err(identity_error(
             ERROR_IDENTITY_MISMATCH,
             "Photoshop runtime identity requires the UXP bridge",
+            json!({"field": "bridge.bridgeKind"}),
+        ));
+    }
+    if session.capabilities.host == HostKind::AfterEffects
+        && session.capabilities.bridge_kind != adobepy_protocol::BridgeKind::Cep
+    {
+        return Err(identity_error(
+            ERROR_IDENTITY_MISMATCH,
+            "After Effects runtime identity requires the CEP bridge",
             json!({"field": "bridge.bridgeKind"}),
         ));
     }
@@ -6177,19 +6175,168 @@ mod tests {
         assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
     }
 
+    async fn insert_after_effects_session(
+        state: &BrokerState,
+        target: &str,
+        capabilities: Capabilities,
+        connected_at_epoch_ms: u128,
+        identity: Option<BridgeIdentityClaim>,
+    ) {
+        let key = session_key(HostKind::AfterEffects, target);
+        state.sessions.write().await.insert(
+            key.clone(),
+            BridgeSessionInfo {
+                target: target.into(),
+                capabilities,
+                connected_at_epoch_ms,
+            },
+        );
+        if let Some(identity) = identity {
+            state.session_identities.write().await.insert(key, identity);
+        }
+    }
+
+    fn after_effects_identity_query(target: Option<&str>) -> RuntimeIdentityQuery {
+        RuntimeIdentityQuery {
+            host: HostKind::AfterEffects,
+            target: target.map(str::to_owned),
+            expected: None,
+        }
+    }
+
     #[test]
-    fn after_effects_identity_is_host_specific_and_entrypoint_bound() {
+    fn after_effects_connect_uses_the_shared_identity_contract() {
         let caps = after_effects_caps();
+        // Backward-compatible connectivity stays optional at connect time: a
+        // standalone handshake is no longer rejected by a fake AE-only field.
+        validate_bridge_identity_claim("default", &caps, None)
+            .expect("an AE CEP connect without a claim must not require an AE-only field");
         let valid = after_effects_identity_claim();
-        let error = validate_bridge_identity_claim("default", &caps, Some(&valid)).unwrap_err();
-        assert_eq!(error.error.code, ERROR_IDENTITY_UNAVAILABLE);
+        validate_bridge_identity_claim("default", &caps, Some(&valid))
+            .expect("a complete AE CEP claim validates under the shared typed identity contract");
+    }
+
+    #[tokio::test]
+    async fn after_effects_runtime_identity_is_attested_and_cross_checked() {
+        let state = state();
+        insert_after_effects_session(
+            &state,
+            "default",
+            after_effects_caps(),
+            1_720_000_000_000,
+            Some(after_effects_identity_claim()),
+        )
+        .await;
+
+        // The adapter-owned launch receipt is cross-checked by passing an
+        // `expected` attestation built from independent OS observations and the
+        // owned install receipt. AE uses the same typed endpoint as other hosts.
+        let actual = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .expect("a complete AE CEP claim produces a typed runtime attestation");
+        assert_eq!(actual.host.pid, 4200);
+        assert_eq!(actual.host.profile_id, "after-effects-production");
+        assert_eq!(actual.bridge.target, "default");
+        assert_eq!(actual.bridge.bridge_kind, BridgeKind::Cep);
+        let wire = serde_json::to_string(&actual).unwrap();
+        assert!(!wire.contains("token"));
+        assert!(!wire.contains("adapterOwnedLaunchReceipt"));
+
+        let mut exact_query = after_effects_identity_query(Some("default"));
+        exact_query.expected = Some(actual.clone());
+        assert_eq!(state.runtime_identity(exact_query).await.unwrap(), actual);
+
+        let mut stale = actual.clone();
+        stale.host.process_start_identity = "windows:133700000000000101".into();
+        let mut stale_query = after_effects_identity_query(Some("default"));
+        stale_query.expected = Some(stale);
+        let error = state.runtime_identity(stale_query).await.unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+
+        let mut foreign = actual.clone();
+        foreign.host.executable_path = "C:/Foreign/AfterFX.exe".into();
+        let mut foreign_query = after_effects_identity_query(Some("default"));
+        foreign_query.expected = Some(foreign);
+        let error = state.runtime_identity(foreign_query).await.unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
+    }
+
+    #[tokio::test]
+    async fn after_effects_runtime_identity_fails_closed_with_distinguishable_reasons() {
+        let state = state();
+        let missing = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.error.code, ERROR_IDENTITY_UNAVAILABLE);
         assert_eq!(
-            error
+            missing.error.data.unwrap()["missingFields"][0],
+            "bridge.session"
+        );
+
+        let mut incomplete = after_effects_identity_claim();
+        incomplete.host.pid = None;
+        insert_after_effects_session(
+            &state,
+            "default",
+            after_effects_caps(),
+            1_720_000_000_000,
+            Some(incomplete),
+        )
+        .await;
+        let incomplete_error = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .unwrap_err();
+        assert_eq!(incomplete_error.error.code, ERROR_IDENTITY_UNAVAILABLE);
+        let missing_fields = &incomplete_error.error.data.unwrap()["missingFields"];
+        assert_eq!(missing_fields[0], "host.pid");
+        assert!(!missing_fields
+            .to_string()
+            .contains("adapterOwnedLaunchReceipt"));
+
+        // A foreign bridge kind cannot claim an AE CEP identity.
+        let mut foreign_kind = after_effects_caps();
+        foreign_kind.bridge_kind = BridgeKind::Uxp;
+        insert_after_effects_session(
+            &state,
+            "default",
+            foreign_kind,
+            1_720_000_000_000,
+            Some(after_effects_identity_claim()),
+        )
+        .await;
+        let kind_error = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .unwrap_err();
+        assert_eq!(kind_error.error.code, ERROR_IDENTITY_MISMATCH);
+        assert_eq!(kind_error.error.data.unwrap()["field"], "bridge.bridgeKind");
+
+        // Module shadowing and host-version mismatch still fail closed under
+        // the shared claim validator.
+        let mut shadowed = after_effects_identity_claim();
+        shadowed.bridge.module_origin = Some("C:/Foreign/dist/main.js".into());
+        assert_eq!(
+            validate_bridge_identity_claim("default", &after_effects_caps(), Some(&shadowed))
+                .unwrap_err()
                 .error
-                .data
-                .as_ref()
-                .and_then(|data| data["missingFields"][0].as_str()),
-            Some("adapterOwnedLaunchReceipt")
+                .code,
+            ERROR_IDENTITY_MISMATCH
+        );
+        let mut version_mismatch = after_effects_identity_claim();
+        version_mismatch.host.host_version = Some("25.1.0".into());
+        assert_eq!(
+            validate_bridge_identity_claim(
+                "default",
+                &after_effects_caps(),
+                Some(&version_mismatch)
+            )
+            .unwrap_err()
+            .error
+            .code,
+            ERROR_IDENTITY_MISMATCH
         );
     }
 

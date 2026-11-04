@@ -105,6 +105,7 @@ async function main() {
   assert.ok(sent[0].capabilities.methods.dom.includes("snapshot"));
   assert.deepStrictEqual(sent[0].capabilities.methods.raw, ["evalExtendScript"]);
   await testIllustratorIdentityHello();
+  await testAfterEffectsIdentityHello();
   testIllustratorBackgroundLifecycle();
 
   const edgeCaseArgument = `quote ' " ${String.fromCharCode(0x2028)}`;
@@ -219,6 +220,93 @@ async function testIllustratorIdentityHello() {
     }
   });
   assert.ok(!JSON.stringify(hello.identity).includes("PRIVATE_TEST_TOKEN"));
+}
+
+async function testAfterEffectsIdentityHello() {
+  assert.ok(fs.existsSync(bundlePath), `missing CEP bundle: ${bundlePath}`);
+  const sent = [];
+  class FakeWebSocket {
+    constructor() {
+      this.readyState = 0;
+      setImmediate(() => {
+        this.readyState = 1;
+        this.onopen?.({});
+      });
+    }
+    send(payload) {
+      sent.push(JSON.parse(payload));
+    }
+  }
+  const fakeCep = {
+    getSystemPath(name) {
+      assert.strictEqual(name, "extension");
+      return "C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.after-effects";
+    },
+    evalScript(script, callback) {
+      if (script.startsWith("$.evalFile(")) {
+        callback("true");
+        return;
+      }
+      if (script.includes("typeof adobepyDispatch")) {
+        callback("ready");
+        return;
+      }
+      if (script.includes("app.version")) {
+        callback("25.0.0");
+        return;
+      }
+      assert.fail(`unexpected After Effects evalScript payload: ${script}`);
+    }
+  };
+  const context = {
+    console,
+    setTimeout,
+    clearTimeout,
+    setImmediate,
+    WebSocket: FakeWebSocket,
+    __adobe_cep__: fakeCep,
+    document: { getElementById() { return { textContent: "", addEventListener() {} }; } },
+    __ADOBEPY_TOKEN: "PRIVATE_TEST_TOKEN",
+    __ADOBEPY_TARGET: "retouch",
+    __ADOBEPY_BOOTSTRAP_NONCE: "b".repeat(64),
+    __ADOBEPY_HOST_IDENTITY: {
+      pid: 4200,
+      processStartIdentity: "windows:133700000000000100",
+      executablePath: "C:/Program Files/Adobe/Adobe After Effects 2026/Support Files/AfterFX.exe",
+      profileId: "after-effects-production"
+    },
+    crypto: { randomUUID: () => "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99" }
+  };
+  context.globalThis = context;
+  vm.runInNewContext(fs.readFileSync(bundlePath, "utf8"), context, {
+    filename: bundlePath
+  });
+  await waitForMicrotasks();
+  await waitForMicrotasks();
+
+  assert.strictEqual(sent.length, 1);
+  const hello = sent[0];
+  assert.strictEqual(hello.type, "hello");
+  assert.strictEqual(hello.capabilities.host, "after-effects");
+  assert.strictEqual(hello.capabilities.bridgeKind, "cep");
+  assert.strictEqual(hello.capabilities.hostVersion, "25.0.0");
+  assert.strictEqual(hello.bootstrapNonce, "b".repeat(64));
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(hello.identity)), {
+    host: {
+      pid: 4200,
+      processStartIdentity: "windows:133700000000000100",
+      executablePath: "C:/Program Files/Adobe/Adobe After Effects 2026/Support Files/AfterFX.exe",
+      hostVersion: "25.0.0",
+      profileId: "after-effects-production"
+    },
+    bridge: {
+      instanceId: "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99",
+      installedPluginRoot: "C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.after-effects",
+      moduleOrigin: "C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.after-effects/dist/main.js"
+    }
+  });
+  assert.ok(!JSON.stringify(hello.identity).includes("PRIVATE_TEST_TOKEN"));
+  assert.ok(!JSON.stringify(hello.identity).includes("adapterOwnedLaunchReceipt"));
 }
 
 function testIllustratorBackgroundLifecycle() {
