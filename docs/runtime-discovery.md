@@ -206,17 +206,47 @@ process, so an adapter can reproduce and compare the value byte for byte.
 
 ### 3.2 After Effects CEP identity
 
-After Effects CEP identity is currently fail-closed. The broker does not return
-a complete runtime attestation from CEP self-reported globals: an
-adapter-owned launch/install receipt, including OS-bound host identity and
-installed/loaded module evidence, is required first. The receipt plumbing is a
-follow-up scope; until it exists, the broker rejects After Effects identity
-claims with `ERROR_IDENTITY_UNAVAILABLE` and no After Effects identity-backed
-bootstrap or readiness claim is made.
+After Effects CEP is a first-class host under the same typed, secret-free
+runtime identity contract as Photoshop UXP and Illustrator CEP. There is no
+After Effects-only `adapterOwnedLaunchReceipt` field and no AE-specific broker
+bypass: the broker validates After Effects claims through the shared
+`validate_bridge_identity_claim` path and returns the same
+`RuntimeIdentityAttestation` from `POST /v1/runtime-identity`.
 
-No After Effects bootstrap endpoint is exposed until a host-specific launch,
-receipt, and nonce transaction exists. Adapters must not treat CEP identity or
-compile/package evidence as a bootstrap success signal.
+The bridge builds its claim from bounded, non-executing inputs only:
+
+- a fixed `app.version` probe with a 1 s timeout,
+- the CEP extension root and `dist/main.js` module origin from
+  `getSystemPath("extension")`,
+- one runtime instance UUID, and
+- PID, process-start identity, executable path, and profile ID taken only from
+  the bounded adapter-owned `__ADOBEPY_HOST_IDENTITY` launch context.
+
+The adapter owns the bounded launch and its install/launch receipt. It starts or
+selects the After Effects process, observes its PID/start/executable/profile
+independently from the OS, injects the launch context into the CEP extension,
+and cross-checks the connected session with
+`AfterEffects().runtime_identity(expected=expected_identity)` using the same
+`expected` comparison described in §3 and the Adobe Host Protocol. A connected
+session that cannot produce an exact attestation is never reported as verified.
+
+Failures stay fail-closed and distinguishable through the shared identity error
+codes: a missing session or an incomplete claim returns
+`ERROR_IDENTITY_UNAVAILABLE` (-32010) with a `missingFields` list naming the
+absent field (`bridge.session`, `host.pid`, and so on), a reused PID or changed
+connection epoch returns `ERROR_IDENTITY_STALE` (-32011), an omitted target with
+multiple matching sessions returns `ERROR_IDENTITY_AMBIGUOUS` (-32012), and a
+foreign executable/profile/target/module, a non-CEP bridge, or a host-version
+or module-shadowing mismatch returns `ERROR_IDENTITY_MISMATCH` (-32013). A
+standalone WebSocket handshake without a claim still connects for backward
+compatibility, but it cannot attest identity.
+
+No After Effects-specific broker-side host-launch bootstrap is exposed: unlike
+the bounded Photoshop and Illustrator bootstrap transactions, the After Effects
+launch, receipt, and nonce ownership stays with the adapter. The broker never
+runs arbitrary JSX/ExtendScript, executes a generic command, or falls back to
+UI automation for identity. Adapters must not treat CEP connectivity or
+compile/package evidence as a verified identity or bootstrap success signal.
 
 ---
 

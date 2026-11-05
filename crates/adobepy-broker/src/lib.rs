@@ -866,9 +866,28 @@ impl BrokerState {
         }
     }
 
-    async fn runtime_identity(
+    /// Builds a runtime identity attestation from one consistent connection
+    /// snapshot.
+    ///
+    /// Connect (`bridge_socket`) and disconnect (`disconnect_session`) replace
+    /// `sessions` and `session_identities` while holding the `bridge_senders`
+    /// **write** lock. Holding that same lock for reading here, across both map
+    /// reads, guarantees the session and its identity claim belong to the same
+    /// connection generation: a reconnect cannot interleave and produce a mixed
+    /// attestation (an old claim spliced onto a new epoch, or vice versa).
+    ///
+    /// `expected_connection`, when supplied, is checked (both the sender's
+    /// `connection_id` and the session's `connected_at_epoch_ms`) inside the
+    /// same guard, so the staleness checks and the returned attestation refer
+    /// to one snapshot. Everything runs in a single method that acquires
+    /// `bridge_senders.read()` exactly once; the previous two-method shape made
+    /// `runtime_identity_for_connection` hold a read guard across a call into
+    /// `runtime_identity`, which would re-enter the same write-preferring
+    /// `RwLock` and could deadlock with a queued writer.
+    async fn runtime_identity_snapshot(
         &self,
         query: RuntimeIdentityQuery,
+        expected_connection: Option<BridgeConnectionIdentity>,
     ) -> Result<RuntimeIdentityAttestation, Box<RpcErrorResponse>> {
         if query
             .target
@@ -884,10 +903,32 @@ impl BrokerState {
         if let Some(expected) = query.expected.as_ref() {
             validate_runtime_identity_shape(expected)?;
         }
-        let candidates = self
-            .sessions
-            .read()
-            .await
+
+        // One read guard is held for the entire snapshot. The connect/disconnect
+        // paths hold the matching write guard while swapping `sessions` and
+        // `session_identities`, so neither can interleave here.
+        let senders = self.bridge_senders.read().await;
+
+        if let Some(expected) = expected_connection.as_ref() {
+            let key = session_key(
+                query.host,
+                query.target.as_deref().unwrap_or(DEFAULT_TARGET),
+            );
+            if !senders
+                .get(&key)
+                .is_some_and(|sender| sender.connection_id == expected.connection_id)
+            {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "bridge connection identity is stale",
+                    json!({"field": "bridge.connectionId"}),
+                ));
+            }
+        }
+
+        let sessions = self.sessions.read().await;
+        let session_identities = self.session_identities.read().await;
+        let candidates = sessions
             .iter()
             .filter(|(_, session)| {
                 session.capabilities.host == query.host
@@ -913,7 +954,7 @@ impl BrokerState {
             ));
         }
         let (key, session) = candidates.into_iter().next().expect("one candidate");
-        let claim = self.session_identities.read().await.get(&key).cloned();
+        let claim = session_identities.get(&key).cloned();
         let actual = complete_runtime_identity(
             self.broker_identity.as_ref().clone(),
             &session,
@@ -922,7 +963,23 @@ impl BrokerState {
         if let Some(expected) = query.expected.as_ref() {
             validate_expected_identity(&actual, expected)?;
         }
+        if let Some(expected) = expected_connection.as_ref() {
+            if actual.bridge.connected_at_epoch_ms != expected.connected_at_epoch_ms {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "bridge connection identity is stale",
+                    json!({"field": "bridge.connectedAtEpochMs"}),
+                ));
+            }
+        }
         Ok(actual)
+    }
+
+    async fn runtime_identity(
+        &self,
+        query: RuntimeIdentityQuery,
+    ) -> Result<RuntimeIdentityAttestation, Box<RpcErrorResponse>> {
+        self.runtime_identity_snapshot(query, None).await
     }
 
     async fn active_connection_identity(&self, key: &str) -> Option<BridgeConnectionIdentity> {
@@ -941,30 +998,7 @@ impl BrokerState {
         query: RuntimeIdentityQuery,
         expected: BridgeConnectionIdentity,
     ) -> Result<RuntimeIdentityAttestation, Box<RpcErrorResponse>> {
-        let key = session_key(
-            query.host,
-            query.target.as_deref().unwrap_or(DEFAULT_TARGET),
-        );
-        let senders = self.bridge_senders.read().await;
-        if !senders
-            .get(&key)
-            .is_some_and(|sender| sender.connection_id == expected.connection_id)
-        {
-            return Err(identity_error(
-                ERROR_IDENTITY_STALE,
-                "bridge connection identity is stale",
-                json!({"field": "bridge.connectionId"}),
-            ));
-        }
-        let actual = self.runtime_identity(query).await?;
-        if actual.bridge.connected_at_epoch_ms != expected.connected_at_epoch_ms {
-            return Err(identity_error(
-                ERROR_IDENTITY_STALE,
-                "bridge connection identity is stale",
-                json!({"field": "bridge.connectedAtEpochMs"}),
-            ));
-        }
-        Ok(actual)
+        self.runtime_identity_snapshot(query, Some(expected)).await
     }
 
     async fn bootstrap_photoshop(&self, request: PhotoshopBootstrapRequest) -> BootstrapResult {
@@ -2872,6 +2906,43 @@ impl BrokerState {
         Ok(receipt.result)
     }
 
+    /// Resolves an inbound hello's identity claim using the host-specific
+    /// bootstrap binding. Only Photoshop and Illustrator have a broker-owned
+    /// bootstrap; every other host (including After Effects CEP) must never
+    /// present a `bootstrapNonce`. Doing so fails closed instead of being
+    /// treated as a host-specific bootstrap field, keeping AE on the shared
+    /// #64 typed identity contract with no AE-only broker bypass.
+    async fn bind_bridge_bootstrap_claim(
+        &self,
+        expected_host: HostKind,
+        target: &str,
+        capabilities: &adobepy_protocol::Capabilities,
+        identity: Option<BridgeIdentityClaim>,
+        bootstrap_nonce: Option<&str>,
+    ) -> Result<Option<BridgeIdentityClaim>, Box<RpcErrorResponse>> {
+        match expected_host {
+            HostKind::Photoshop => {
+                self.bind_photoshop_bootstrap_claim(target, capabilities, identity, bootstrap_nonce)
+                    .await
+            }
+            HostKind::Illustrator => {
+                self.bind_illustrator_bootstrap_claim(
+                    target,
+                    capabilities,
+                    identity,
+                    bootstrap_nonce,
+                )
+                .await
+            }
+            _ if bootstrap_nonce.is_some() => Err(identity_error(
+                ERROR_IDENTITY_MISMATCH,
+                "bootstrap nonce was presented by an unsupported host",
+                json!({"field": "host"}),
+            )),
+            _ => Ok(identity),
+        }
+    }
+
     async fn bind_photoshop_bootstrap_claim(
         &self,
         target: &str,
@@ -3484,34 +3555,15 @@ async fn bridge_socket(mut socket: WebSocket, state: BrokerState, expected_host:
         return;
     }
     let target = target.unwrap_or_else(|| DEFAULT_TARGET.to_owned());
-    let bound_identity = match expected_host {
-        HostKind::Photoshop => {
-            state
-                .bind_photoshop_bootstrap_claim(
-                    &target,
-                    &capabilities,
-                    identity,
-                    bootstrap_nonce.as_deref(),
-                )
-                .await
-        }
-        HostKind::Illustrator => {
-            state
-                .bind_illustrator_bootstrap_claim(
-                    &target,
-                    &capabilities,
-                    identity,
-                    bootstrap_nonce.as_deref(),
-                )
-                .await
-        }
-        _ if bootstrap_nonce.is_some() => Err(identity_error(
-            ERROR_IDENTITY_MISMATCH,
-            "bootstrap nonce was presented by an unsupported host",
-            json!({"field": "host"}),
-        )),
-        _ => Ok(identity),
-    };
+    let bound_identity = state
+        .bind_bridge_bootstrap_claim(
+            expected_host,
+            &target,
+            &capabilities,
+            identity,
+            bootstrap_nonce.as_deref(),
+        )
+        .await;
     let identity = match bound_identity {
         Ok(identity) => identity,
         Err(error) => {
@@ -3926,17 +3978,6 @@ fn validate_bridge_identity_claim(
             json!({"field": "target"}),
         ));
     }
-    if capabilities.host == HostKind::AfterEffects {
-        return Err(identity_error(
-            ERROR_IDENTITY_UNAVAILABLE,
-            "After Effects runtime identity requires an adapter-owned launch receipt",
-            json!({
-                "host": capabilities.host.as_str(),
-                "target": target,
-                "missingFields": ["adapterOwnedLaunchReceipt"]
-            }),
-        ));
-    }
     if !is_bounded_text(&capabilities.bridge_version, 64)
         || capabilities
             .host_version
@@ -4070,6 +4111,15 @@ fn complete_runtime_identity(
         return Err(identity_error(
             ERROR_IDENTITY_MISMATCH,
             "Photoshop runtime identity requires the UXP bridge",
+            json!({"field": "bridge.bridgeKind"}),
+        ));
+    }
+    if session.capabilities.host == HostKind::AfterEffects
+        && session.capabilities.bridge_kind != adobepy_protocol::BridgeKind::Cep
+    {
+        return Err(identity_error(
+            ERROR_IDENTITY_MISMATCH,
+            "After Effects runtime identity requires the CEP bridge",
             json!({"field": "bridge.bridgeKind"}),
         ));
     }
@@ -6177,20 +6227,295 @@ mod tests {
         assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
     }
 
-    #[test]
-    fn after_effects_identity_is_host_specific_and_entrypoint_bound() {
-        let caps = after_effects_caps();
-        let valid = after_effects_identity_claim();
-        let error = validate_bridge_identity_claim("default", &caps, Some(&valid)).unwrap_err();
-        assert_eq!(error.error.code, ERROR_IDENTITY_UNAVAILABLE);
-        assert_eq!(
-            error
-                .error
-                .data
-                .as_ref()
-                .and_then(|data| data["missingFields"][0].as_str()),
-            Some("adapterOwnedLaunchReceipt")
+    async fn insert_after_effects_session(
+        state: &BrokerState,
+        target: &str,
+        capabilities: Capabilities,
+        connected_at_epoch_ms: u128,
+        identity: Option<BridgeIdentityClaim>,
+    ) {
+        let key = session_key(HostKind::AfterEffects, target);
+        state.sessions.write().await.insert(
+            key.clone(),
+            BridgeSessionInfo {
+                target: target.into(),
+                capabilities,
+                connected_at_epoch_ms,
+            },
         );
+        if let Some(identity) = identity {
+            state.session_identities.write().await.insert(key, identity);
+        }
+    }
+
+    fn after_effects_identity_query(target: Option<&str>) -> RuntimeIdentityQuery {
+        RuntimeIdentityQuery {
+            host: HostKind::AfterEffects,
+            target: target.map(str::to_owned),
+            expected: None,
+        }
+    }
+
+    #[test]
+    fn after_effects_connect_uses_the_shared_identity_contract() {
+        let caps = after_effects_caps();
+        // Backward-compatible connectivity stays optional at connect time: a
+        // standalone handshake is no longer rejected by a fake AE-only field.
+        validate_bridge_identity_claim("default", &caps, None)
+            .expect("an AE CEP connect without a claim must not require an AE-only field");
+        let valid = after_effects_identity_claim();
+        validate_bridge_identity_claim("default", &caps, Some(&valid))
+            .expect("a complete AE CEP claim validates under the shared typed identity contract");
+    }
+
+    #[tokio::test]
+    async fn after_effects_runtime_identity_is_attested_and_cross_checked() {
+        let state = state();
+        insert_after_effects_session(
+            &state,
+            "default",
+            after_effects_caps(),
+            1_720_000_000_000,
+            Some(after_effects_identity_claim()),
+        )
+        .await;
+
+        // The adapter-owned launch receipt is cross-checked by passing an
+        // `expected` attestation built from independent OS observations and the
+        // owned install receipt. AE uses the same typed endpoint as other hosts.
+        let actual = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .expect("a complete AE CEP claim produces a typed runtime attestation");
+        assert_eq!(actual.host.pid, 4200);
+        assert_eq!(actual.host.profile_id, "after-effects-production");
+        assert_eq!(actual.bridge.target, "default");
+        assert_eq!(actual.bridge.bridge_kind, BridgeKind::Cep);
+        let wire = serde_json::to_string(&actual).unwrap();
+        assert!(!wire.contains("token"));
+        assert!(!wire.contains("adapterOwnedLaunchReceipt"));
+
+        let mut exact_query = after_effects_identity_query(Some("default"));
+        exact_query.expected = Some(actual.clone());
+        assert_eq!(state.runtime_identity(exact_query).await.unwrap(), actual);
+
+        let mut stale = actual.clone();
+        stale.host.process_start_identity = "windows:133700000000000101".into();
+        let mut stale_query = after_effects_identity_query(Some("default"));
+        stale_query.expected = Some(stale);
+        let error = state.runtime_identity(stale_query).await.unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+
+        let mut foreign = actual.clone();
+        foreign.host.executable_path = "C:/Foreign/AfterFX.exe".into();
+        let mut foreign_query = after_effects_identity_query(Some("default"));
+        foreign_query.expected = Some(foreign);
+        let error = state.runtime_identity(foreign_query).await.unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
+    }
+
+    #[tokio::test]
+    async fn after_effects_runtime_identity_fails_closed_with_distinguishable_reasons() {
+        let state = state();
+        let missing = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.error.code, ERROR_IDENTITY_UNAVAILABLE);
+        assert_eq!(
+            missing.error.data.unwrap()["missingFields"][0],
+            "bridge.session"
+        );
+
+        let mut incomplete = after_effects_identity_claim();
+        incomplete.host.pid = None;
+        insert_after_effects_session(
+            &state,
+            "default",
+            after_effects_caps(),
+            1_720_000_000_000,
+            Some(incomplete),
+        )
+        .await;
+        let incomplete_error = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .unwrap_err();
+        assert_eq!(incomplete_error.error.code, ERROR_IDENTITY_UNAVAILABLE);
+        let missing_fields = &incomplete_error.error.data.unwrap()["missingFields"];
+        assert_eq!(missing_fields[0], "host.pid");
+        assert!(!missing_fields
+            .to_string()
+            .contains("adapterOwnedLaunchReceipt"));
+
+        // A foreign bridge kind cannot claim an AE CEP identity.
+        let mut foreign_kind = after_effects_caps();
+        foreign_kind.bridge_kind = BridgeKind::Uxp;
+        insert_after_effects_session(
+            &state,
+            "default",
+            foreign_kind,
+            1_720_000_000_000,
+            Some(after_effects_identity_claim()),
+        )
+        .await;
+        let kind_error = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .unwrap_err();
+        assert_eq!(kind_error.error.code, ERROR_IDENTITY_MISMATCH);
+        assert_eq!(kind_error.error.data.unwrap()["field"], "bridge.bridgeKind");
+
+        // Module shadowing and host-version mismatch still fail closed under
+        // the shared claim validator.
+        let mut shadowed = after_effects_identity_claim();
+        shadowed.bridge.module_origin = Some("C:/Foreign/dist/main.js".into());
+        assert_eq!(
+            validate_bridge_identity_claim("default", &after_effects_caps(), Some(&shadowed))
+                .unwrap_err()
+                .error
+                .code,
+            ERROR_IDENTITY_MISMATCH
+        );
+        let mut version_mismatch = after_effects_identity_claim();
+        version_mismatch.host.host_version = Some("25.1.0".into());
+        assert_eq!(
+            validate_bridge_identity_claim(
+                "default",
+                &after_effects_caps(),
+                Some(&version_mismatch)
+            )
+            .unwrap_err()
+            .error
+            .code,
+            ERROR_IDENTITY_MISMATCH
+        );
+    }
+
+    #[tokio::test]
+    async fn after_effects_cep_bootstrap_nonce_is_rejected_fail_closed() {
+        let state = state();
+        // AE CEP has no broker-owned bootstrap: its generated config does not
+        // inject a nonce, and presenting one must be refused rather than being
+        // silently treated as an AE-specific bootstrap field.
+        let nonce = "f".repeat(64);
+        let error = state
+            .bind_bridge_bootstrap_claim(
+                HostKind::AfterEffects,
+                "default",
+                &after_effects_caps(),
+                Some(after_effects_identity_claim()),
+                Some(&nonce),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
+        assert_eq!(error.error.data.as_ref().unwrap()["field"], "host");
+        let public = serde_json::to_string(&error).unwrap();
+        assert!(!public.contains(&nonce));
+
+        // Without a nonce the shared typed identity contract accepts the AE
+        // hello unchanged, with no AE-only field required.
+        let bound = state
+            .bind_bridge_bootstrap_claim(
+                HostKind::AfterEffects,
+                "default",
+                &after_effects_caps(),
+                Some(after_effects_identity_claim()),
+                None,
+            )
+            .await
+            .expect("an AE CEP hello without a nonce uses the shared contract");
+        assert_eq!(bound.expect("claim is retained").host.pid, Some(4200));
+    }
+
+    async fn install_runtime_identity_generation(
+        state: &BrokerState,
+        key: &str,
+        pid: u32,
+        connected_at_epoch_ms: u128,
+        connection_id: u64,
+    ) {
+        // Mirror the connect path: hold the bridge_senders write lock across the
+        // swap of sessions and session_identities, so a concurrent reader can
+        // only ever observe one complete connection generation.
+        let mut senders = state.bridge_senders.write().await;
+        state.sessions.write().await.insert(
+            key.to_owned(),
+            BridgeSessionInfo {
+                target: "default".into(),
+                capabilities: after_effects_caps(),
+                connected_at_epoch_ms,
+            },
+        );
+        let mut claim = after_effects_identity_claim();
+        claim.host.pid = Some(pid);
+        state
+            .session_identities
+            .write()
+            .await
+            .insert(key.to_owned(), claim);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        senders.insert(
+            key.to_owned(),
+            BridgeSender {
+                connection_id,
+                sender: tx,
+            },
+        );
+    }
+
+    /// Regression for the two-read-lock race: a reconnect that swaps
+    /// `sessions` and `session_identities` under the `bridge_senders` write
+    /// lock must never be observed half-applied by a bare `runtime_identity()`.
+    /// `host.pid` comes from the identity claim and
+    /// `bridge.connectedAtEpochMs` comes from the session, so a torn read would
+    /// pair them across generations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_identity_uses_one_consistent_snapshot_across_reconnect() {
+        let state = state();
+        let key = session_key(HostKind::AfterEffects, "default");
+        install_runtime_identity_generation(&state, &key, 4200, 1111, 1).await;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reconnector = tokio::spawn({
+            let state = state.clone();
+            let key = key.clone();
+            let stop = stop.clone();
+            async move {
+                let mut generation_b = false;
+                while !stop.load(Ordering::SeqCst) {
+                    let (pid, epoch, connection_id) = if generation_b {
+                        (7300, 2222, 2)
+                    } else {
+                        (4200, 1111, 1)
+                    };
+                    install_runtime_identity_generation(&state, &key, pid, epoch, connection_id)
+                        .await;
+                    generation_b = !generation_b;
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        for _ in 0..2_000 {
+            let attestation = state
+                .runtime_identity(after_effects_identity_query(Some("default")))
+                .await
+                .expect("a fully-installed generation always attests");
+            let pair = (
+                attestation.host.pid,
+                attestation.bridge.connected_at_epoch_ms,
+            );
+            assert!(
+                pair == (4200, 1111) || pair == (7300, 2222),
+                "runtime identity mixed two connection generations: {pair:?}"
+            );
+        }
+        stop.store(true, Ordering::SeqCst);
+        reconnector
+            .await
+            .expect("reconnect loop must finish cleanly");
     }
 
     #[tokio::test]

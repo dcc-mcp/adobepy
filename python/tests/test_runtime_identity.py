@@ -46,6 +46,16 @@ IDENTITY = {
     },
 }
 
+AFTER_EFFECTS_IDENTITY = json.loads(json.dumps(IDENTITY))
+AFTER_EFFECTS_IDENTITY["host"].update(
+    executablePath="C:/Adobe/After Effects.exe", hostVersion="25.0.0"
+)
+AFTER_EFFECTS_IDENTITY["bridge"].update(
+    bridgeKind="cep",
+    installedPluginRoot="C:/CEP/extensions/com.adobepy.bridge.after-effects",
+    moduleOrigin="C:/CEP/extensions/com.adobepy.bridge.after-effects/dist/main.js",
+)
+
 
 class FakeResponse:
     def __init__(self, payload):
@@ -105,6 +115,36 @@ class RuntimeIdentityTests(unittest.TestCase):
         identity = HostSession("photoshop", client).runtime_identity()
         self.assertEqual(identity.host.executable_path, "C:/Adobe/Photoshop.exe")
         client.runtime_identity.assert_called_once_with("photoshop", target="retouch", expected=None)
+
+    def test_after_effects_session_uses_the_shared_identity_contract(self):
+        expected = RuntimeIdentityAttestation.from_broker(AFTER_EFFECTS_IDENTITY)
+        self.assertEqual(expected.host.executable_path, "C:/Adobe/After Effects.exe")
+        self.assertEqual(expected.bridge.bridge_kind, "cep")
+
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse(AFTER_EFFECTS_IDENTITY)
+
+        client = BrokerClient(
+            "http://broker.test", token="top-secret", target="retouch", timeout=7
+        )
+        with mock.patch.object(urllib.request, "urlopen", fake_urlopen):
+            identity = HostSession("after-effects", client).runtime_identity(
+                expected=expected
+            )
+
+        self.assertEqual(identity, expected)
+        self.assertEqual(captured["url"], "http://broker.test/v1/runtime-identity")
+        self.assertEqual(captured["payload"]["host"], "after-effects")
+        self.assertEqual(captured["payload"]["target"], "retouch")
+        self.assertEqual(captured["payload"]["expected"], AFTER_EFFECTS_IDENTITY)
+        self.assertNotIn("top-secret", json.dumps(captured["payload"]))
+        self.assertNotIn(
+            "adapterownedlaunchreceipt", json.dumps(captured["payload"]).lower()
+        )
 
     def test_broker_identity_reads_the_authenticated_session_free_endpoint(self):
         captured = {}
