@@ -15,6 +15,7 @@ every run rather than left to accumulate stale hosts.
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import shutil
 import sys
@@ -108,22 +109,90 @@ def stage_bridges(
     return staged
 
 
+def _canonical_bytes(data: bytes) -> bytes:
+    """Normalize physical CRLF line endings only, never string contents.
+
+    Git checks out tracked text files with CRLF on Windows (core.autocrlf),
+    while esbuild emits LF. Physical line endings carry no meaning for
+    JS/JSON/HTML/XML assets, so compare a canonical form. An escaped carriage
+    return inside a JS string literal is NOT a line ending: a blanket escaped
+    replacement would silently accept a semantic change from a two-character
+    separator to a one-character separator. Those differences must stay
+    visible, so they are deliberately left untouched here.
+    """
+
+    return data.replace(bytes([13, 10]), bytes([10]))
+
+
+def _canonical_sourcemap(data: bytes) -> object:
+    """Parse a sourcemap and canonicalize only embedded source line endings.
+
+    A sourcemap embeds the original source text in ``sourcesContent`` as JSON
+    strings. A source file checked out with CRLF encodes those physical line
+    breaks differently from an LF checkout. Decode the JSON and normalize the
+    physical line breaks in the decoded string values only. An escaped
+    carriage return in a JS string literal is four ordinary characters after
+    decoding, so it is unchanged and semantic drift stays visible.
+    """
+
+    payload = json.loads(_canonical_bytes(data).decode("utf-8"))
+    if isinstance(payload, dict) and isinstance(payload.get("sourcesContent"), list):
+        payload["sourcesContent"] = [
+            item.replace("\r\n", "\n").replace("\r", "\n")
+            if isinstance(item, str)
+            else item
+            for item in payload["sourcesContent"]
+        ]
+    return payload
+
+
+def _assets_match(relative: str, source_bytes: bytes, staged_bytes: bytes) -> bool:
+    """Compare generated assets without masking semantic content differences."""
+
+    if not relative.endswith(".map"):
+        return _canonical_bytes(source_bytes) == _canonical_bytes(staged_bytes)
+    try:
+        return _canonical_sourcemap(source_bytes) == _canonical_sourcemap(staged_bytes)
+    except (ValueError, UnicodeDecodeError):
+        # A malformed sourcemap is drift in itself; never accept it as equal.
+        return False
+
+
 def assert_staged_matches_source(
     bridge_root: pathlib.Path = BRIDGE_ROOT,
     stage_root: pathlib.Path = STAGE_ROOT,
 ) -> List[str]:
-    """Verify the staged tree is byte-for-byte identical to the built source.
+    """Verify the staged tree matches the built source.
 
     The staged files are tracked in git, so a clean checkout can build a wheel
     without running the npm bridge builds. That convenience becomes a hazard if
     the committed copy silently drifts from `bridges/`: the wheel would ship
-    stale templates and nothing would notice. Compare contents, not just
-    presence, so drift fails loudly.
+    stale templates and nothing would notice. Compare contents (canonicalized
+    for physical line endings only), not just presence, so semantic drift
+    still fails loudly.
     """
 
     compared: List[str] = []
     for kind in KINDS:
-        for host in discover_hosts(bridge_root, kind):
+        # A retired host disappears from `bridges/` entirely, so the per-file
+        # comparison below never visits its staged copy. Compare the complete
+        # host inventory first; otherwise a whole stale host can survive
+        # `--check` unnoticed.
+        source_hosts = discover_hosts(bridge_root, kind)
+        staged_kind_root = stage_root / kind
+        staged_hosts = (
+            {entry.name for entry in staged_kind_root.iterdir() if entry.is_dir()}
+            if staged_kind_root.is_dir()
+            else set()
+        )
+        retired = sorted(staged_hosts - set(source_hosts))
+        if retired:
+            raise BridgeStagingError(
+                "staged bridge tree contains hosts the source no longer builds: "
+                + ", ".join(f"{kind}/{host}" for host in retired)
+                + "; run `python scripts/stage_wheel_bridges.py`"
+            )
+        for host in source_hosts:
             source_host = bridge_root / kind / host
             staged_host = stage_root / kind / host
             source_files = sorted(
@@ -140,7 +209,7 @@ def assert_staged_matches_source(
                     )
                 source_bytes = (source_host / relative).read_bytes()
                 staged_bytes = staged_file.read_bytes()
-                if source_bytes != staged_bytes:
+                if not _assets_match(relative, source_bytes, staged_bytes):
                     raise BridgeStagingError(
                         f"staged bridge file is stale: {kind}/{host}/{relative} differs "
                         "from the built source; run `python scripts/stage_wheel_bridges.py` "

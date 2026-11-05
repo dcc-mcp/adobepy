@@ -113,19 +113,19 @@ jobs:
       # The wheel ships the bridge templates from python/adobe/_bridges, which is
       # generated from the npm build output. Building the bridges first is what
       # makes `python -m adobe install-bridge` work from a wheel-only install.
-      - name: Build and stage bridge templates
-        run: |
-          npm run uxp:build
-          npm run cep:build
-          python scripts/stage_wheel_bridges.py
-      - name: Check Python distribution
-        run: |
-          python -m build
-          python -m twine check dist/*
-          python scripts/check_native_abi3_config.py
-          python scripts/check_wheel_compat.py dist
-          python scripts/smoke_wheel_install.py dist
-          python scripts/check_wheel_bridges.py dist
+      # Each command is its own step. On windows-latest the default shell is
+      # pwsh, which only checks $LASTEXITCODE after the final command of a
+      # `run:` block; an earlier failing checker followed by a passing one used
+      # to be reported as a green step. Separate steps make every exit decisive.
+      - run: npm run uxp:build
+      - run: npm run cep:build
+      - run: python scripts/stage_wheel_bridges.py
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - run: python scripts/check_native_abi3_config.py
+      - run: python scripts/check_wheel_compat.py dist
+      - run: python scripts/smoke_wheel_install.py dist
+      - run: python scripts/check_wheel_bridges.py dist
       - name: Build package
         shell: pwsh
         run: ./scripts/package-release.ps1 -SkipTests

@@ -384,7 +384,7 @@ if (response.result !== 5) {
                 "fresh\n",
             )
 
-    def test_staged_tree_matches_the_built_source_byte_for_byte(self):
+    def test_staged_tree_matches_the_built_source(self):
         # The staged copies are tracked, so a clean checkout can build a wheel
         # without running the npm builds. That only stays safe while the committed
         # tree matches what `bridges/` actually builds.
