@@ -35,6 +35,7 @@ import sysconfig
 import tempfile
 import types
 import unittest
+import zipfile
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -43,9 +44,12 @@ if str(ROOT) not in sys.path:
 
 import scripts.live_photoshop_smoke as live  # noqa: E402
 import scripts.smoke_wheel_install as smoke  # noqa: E402
+from scripts.check_wheel_bridges import REQUIRED_BRIDGE_FILES  # noqa: E402
 
 CI_FILE = ROOT / ".github/workflows/ci.yml"
+RELEASE_FILE = ROOT / ".github/workflows/release.yml"
 PACKAGE_FILE = ROOT / "package.json"
+CHECK_WHEEL_BRIDGES = ROOT / "scripts" / "check_wheel_bridges.py"
 
 DISTRIBUTION_COMMANDS = (
     "npm run uxp:build",
@@ -58,6 +62,29 @@ DISTRIBUTION_COMMANDS = (
     "python scripts/smoke_wheel_install.py dist",
     "python scripts/check_wheel_bridges.py dist",
 )
+
+# The active Windows standalone wheel chain from release.yml. The R1 finding
+# was that all seven native commands shared one pwsh `run:` block, so a failing
+# command followed by the passing final checker was reported as a green step.
+RELEASE_STANDALONE_JOB = "windows-standalone-package"
+ACTIVE_WINDOWS_PWSH_JOBS = ("windows-package", "windows-standalone-package")
+DISABLED_STANDALONE_JOBS = ("macos-standalone-package", "linux-standalone-package")
+RELEASE_WHEEL_COMMANDS = (
+    "python -m pip install --upgrade build wheel",
+    "npm ci",
+    "npm run uxp:build",
+    "npm run cep:build",
+    "python scripts/stage_wheel_bridges.py",
+    "python -m build --wheel --outdir dist",
+    "python scripts/check_wheel_bridges.py dist",
+)
+
+# Lines that start a real native process in a pwsh step. PowerShell cmdlets and
+# `.ps1` calls are in-process and must not be counted here.
+_NATIVE_LINE = re.compile(r"^(?:python3?|npm|node|pyoxidizer|gh|pip)\s|^&\s+\$")
+# A job-level `if: false` (four-space indent), not the phrase inside comments
+# that explain how the disabled macOS/Linux jobs are re-enabled.
+_JOB_DISABLED = re.compile(r"(?m)^ {4}if:\s*false\s*$")
 
 
 def _inline_run_commands(text: str) -> set[str]:
@@ -133,6 +160,82 @@ def _pwsh_step(pwsh: str, outcomes: list[int], tmp: pathlib.Path) -> int:
     ).returncode
 
 
+def _job_block(text: str, job: str) -> str:
+    """Return the YAML body of one top-level workflow job."""
+
+    lines = text.splitlines()
+    header = f"  {job}:"
+    for start, line in enumerate(lines):
+        if line.rstrip() == header:
+            break
+    else:
+        return ""
+    end = len(lines)
+    for candidate in range(start + 1, len(lines)):
+        if re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[candidate]):
+            end = candidate
+            break
+    return "\n".join(lines[start:end])
+
+
+def _synthetic_wheel(tmp: pathlib.Path, name: str, entries) -> pathlib.Path:
+    """Build an isolated ZIP with wheel-like names only, not an installable wheel.
+
+    The coordinator counterexample used exactly this fixture: entry names are
+    all `check_wheel_bridges.py` inspects, so a passing run proves the checker
+    itself succeeded rather than being skipped or short-circuited.
+    """
+
+    wheel = tmp / name
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for entry in entries:
+            archive.writestr(entry, b"")
+    return wheel
+
+
+def _ps_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _real_native_pwsh_step(
+    pwsh: str,
+    body: list[str],
+    tmp: pathlib.Path,
+    name: str = "step.ps1",
+) -> subprocess.CompletedProcess[str]:
+    """Run a GitHub Actions pwsh step whose exits come from REAL native calls.
+
+    The generated wrapper prepends `$ErrorActionPreference = 'stop'` and appends
+    `if ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }`.
+    GitHub Actions pins `$PSNativeCommandUseErrorActionPreference` to `$false`,
+    so native failures do not throw and only the *last* native exit decides the
+    step. Pin it explicitly here so the counterexample is deterministic across
+    pwsh 7.3/7.4+ defaults. Unlike `_pwsh_step`, no `$LASTEXITCODE` value is
+    ever assigned: each exit is produced by an actual child process.
+    """
+
+    script = "\n".join(
+        [
+            "$ErrorActionPreference = 'stop'",
+            "Write-Output ('native_error_preference=' + $PSNativeCommandUseErrorActionPreference)",
+            # Match the GitHub Actions pwsh wrapper regardless of the local
+            # PowerShell version's default for this preference.
+            "$PSNativeCommandUseErrorActionPreference = $false",
+            "Write-Output ('pinned_native_error_preference=' + $PSNativeCommandUseErrorActionPreference)",
+            *body,
+            "if ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }",
+        ]
+    )
+    ps1 = tmp / name
+    ps1.write_text(script, encoding="utf-8")
+    return subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(ps1)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
 class CiFailPropagationTests(unittest.TestCase):
     def test_distribution_commands_are_single_command_steps(self) -> None:
         text = CI_FILE.read_text(encoding="utf-8")
@@ -163,6 +266,228 @@ class CiFailPropagationTests(unittest.TestCase):
 
         self.assertEqual(old_exit, 0, "the old multi-command layout should be false-green")
         self.assertNotEqual(new_exit, 0, "the split step must propagate the failure")
+
+
+class ReleasePathFailPropagationTests(unittest.TestCase):
+    """R1 follow-up: the active Windows pwsh chains in release.yml must fail fast.
+
+    The first PR #93 fix only split ci.yml's Windows package job. The active
+    `windows-standalone-package` job in release.yml still put seven native
+    commands in one pwsh `run:` block, so a real failing command followed by
+    the passing `check_wheel_bridges.py` was reported as a green step.
+    """
+
+    def test_release_standalone_wheel_commands_are_single_command_steps(self) -> None:
+        job = _job_block(
+            RELEASE_FILE.read_text(encoding="utf-8"), RELEASE_STANDALONE_JOB
+        )
+        self.assertTrue(job, "the active Windows standalone job is missing")
+        self.assertIsNone(
+            _JOB_DISABLED.search(job), "the R1 target job must stay reachable"
+        )
+        self.assertIn("shell: pwsh", job)
+
+        inline = _inline_run_commands(job)
+        for command in RELEASE_WHEEL_COMMANDS:
+            self.assertIn(
+                command, inline, f"{command!r} is not an inline single-command step"
+            )
+        for block in _multiline_run_blocks(job):
+            for command in RELEASE_WHEEL_COMMANDS:
+                self.assertNotIn(
+                    command,
+                    block,
+                    f"{command!r} still shares a multi-command pwsh run block",
+                )
+
+    def test_release_pyoxidizer_step_checks_each_native_exit(self) -> None:
+        job = _job_block(
+            RELEASE_FILE.read_text(encoding="utf-8"), RELEASE_STANDALONE_JOB
+        )
+        blocks = [
+            block
+            for block in _multiline_run_blocks(job)
+            if any(line.startswith("pyoxidizer build") for line in block)
+        ]
+        self.assertEqual(len(blocks), 1, "expected exactly one PyOxidizer step")
+        block = blocks[0]
+        native_indices = [
+            index
+            for index, line in enumerate(block)
+            if line.startswith("python -m pip install pyoxidizer")
+            or line.startswith("pyoxidizer build")
+        ]
+        self.assertEqual(len(native_indices), 2)
+        for index in native_indices:
+            self.assertIn(
+                "$LASTEXITCODE",
+                block[index + 1],
+                "every native exit in the PyOxidizer step must be checked immediately",
+            )
+
+    def test_no_active_windows_pwsh_block_shares_unguarded_native_exits(self) -> None:
+        text = RELEASE_FILE.read_text(encoding="utf-8")
+        for job_name in ACTIVE_WINDOWS_PWSH_JOBS:
+            job = _job_block(text, job_name)
+            self.assertTrue(job, job_name)
+            self.assertIsNone(
+                _JOB_DISABLED.search(job), f"{job_name} must remain reachable"
+            )
+            for block in _multiline_run_blocks(job):
+                native_indices = [
+                    index
+                    for index, line in enumerate(block)
+                    if _NATIVE_LINE.match(line)
+                ]
+                if len(native_indices) < 2:
+                    # A single native command is the last command of the step,
+                    # or is followed by its own guard; either is decisive.
+                    continue
+                for index in native_indices:
+                    self.assertIn(
+                        "$LASTEXITCODE",
+                        block[index + 1],
+                        f"{job_name}: native exits are shared without a guard",
+                    )
+
+    def test_disabled_standalone_jobs_keep_their_if_false_gate(self) -> None:
+        text = RELEASE_FILE.read_text(encoding="utf-8")
+        for job_name in DISABLED_STANDALONE_JOBS:
+            job = _job_block(text, job_name)
+            self.assertTrue(job, job_name)
+            self.assertIsNotNone(_JOB_DISABLED.search(job), job_name)
+            self.assertIn(
+                "shell: bash", job, f"{job_name} must keep its bash fail-fast shell"
+            )
+
+    @unittest.skipUnless(_find_pwsh(), "pwsh is not available")
+    def test_real_native_fail_then_succeed_is_false_green_only_when_unguarded(
+        self,
+    ) -> None:
+        """Reproduce R1 with real child processes, not assigned exit codes.
+
+        A real native command exits 7, then the real `check_wheel_bridges.py`
+        succeeds against an isolated synthetic wheel. The unguarded wrapper
+        exits 0; the guarded and split variants propagate the failure. This
+        proves only that the *step* was false-green -- downstream missing-wheel,
+        PyOxidizer and smoke gates are separate and are not exercised here.
+        """
+
+        pwsh = _find_pwsh()
+        with tempfile.TemporaryDirectory(prefix="adobepy-release-pwsh-") as tmp_dir:
+            tmp = pathlib.Path(tmp_dir)
+            good = _synthetic_wheel(
+                tmp, "synthetic-checker-fixture.whl", REQUIRED_BRIDGE_FILES
+            )
+            py = _ps_quote(sys.executable)
+            checker = _ps_quote(CHECK_WHEEL_BRIDGES)
+            failing = f"& {py} -c 'import sys; sys.exit(7)'"
+            passing = f"& {py} -I -B {checker} {_ps_quote(good)}"
+            report = "Write-Output ('first_native_exit=' + $LASTEXITCODE)"
+
+            unguarded = _real_native_pwsh_step(
+                pwsh,
+                [
+                    failing,
+                    report,
+                    passing,
+                    "Write-Output ('last_checker_exit=' + $LASTEXITCODE)",
+                ],
+                tmp,
+                "unguarded.ps1",
+            )
+            guarded = _real_native_pwsh_step(
+                pwsh,
+                [
+                    failing,
+                    report,
+                    "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+                    passing,
+                ],
+                tmp,
+                "guarded.ps1",
+            )
+            throw_guarded = _real_native_pwsh_step(
+                pwsh,
+                [
+                    failing,
+                    report,
+                    "if ($LASTEXITCODE -ne 0) { throw 'native command failed' }",
+                    passing,
+                ],
+                tmp,
+                "throw-guarded.ps1",
+            )
+            split = _real_native_pwsh_step(
+                pwsh, [failing, report], tmp, "split.ps1"
+            )
+            all_green = _real_native_pwsh_step(
+                pwsh,
+                [f"& {py} -c 'import sys; sys.exit(0)'", passing],
+                tmp,
+                "all-green.ps1",
+            )
+
+        self.assertEqual(
+            unguarded.returncode,
+            0,
+            "unguarded fail-first/succeed-last must reproduce the false-green: "
+            + unguarded.stdout
+            + unguarded.stderr,
+        )
+        self.assertIn("pinned_native_error_preference=False", unguarded.stdout)
+        self.assertIn("bundled bridges:", unguarded.stdout)
+        self.assertEqual(guarded.returncode, 7, guarded.stdout + guarded.stderr)
+        self.assertNotEqual(
+            throw_guarded.returncode, 0, throw_guarded.stdout + throw_guarded.stderr
+        )
+        self.assertEqual(split.returncode, 7, split.stdout + split.stderr)
+        self.assertEqual(
+            all_green.returncode, 0, all_green.stdout + all_green.stderr
+        )
+
+    @unittest.skipUnless(_find_pwsh(), "pwsh is not available")
+    def test_real_checker_rejects_missing_bridge_entries(self) -> None:
+        """The final checker genuinely fails a wheel missing bridge entries.
+
+        This control keeps the false-green counterexample honest: the passing
+        final command above is a real checker that exits 0 on a complete wheel
+        and 1 on one missing the required entries. It is a synthetic ZIP with
+        entry names only, not a real installable wheel, and no release, upload
+        or downstream gate is claimed to have succeeded.
+        """
+
+        pwsh = _find_pwsh()
+        with tempfile.TemporaryDirectory(prefix="adobepy-release-checker-") as tmp_dir:
+            tmp = pathlib.Path(tmp_dir)
+            complete = _synthetic_wheel(tmp, "complete.whl", REQUIRED_BRIDGE_FILES)
+            missing = _synthetic_wheel(
+                tmp, "missing-entries.whl", ("adobe/photoshop/session.py",)
+            )
+            py = _ps_quote(sys.executable)
+            checker = _ps_quote(CHECK_WHEEL_BRIDGES)
+
+            accepted = _real_native_pwsh_step(
+                pwsh,
+                [f"& {py} -I -B {checker} {_ps_quote(complete)}"],
+                tmp,
+                "accepted.ps1",
+            )
+            rejected = _real_native_pwsh_step(
+                pwsh,
+                [f"& {py} -I -B {checker} {_ps_quote(missing)}"],
+                tmp,
+                "rejected.ps1",
+            )
+
+        self.assertEqual(
+            accepted.returncode, 0, accepted.stdout + accepted.stderr
+        )
+        self.assertIn("bundled bridges:", accepted.stdout)
+        self.assertEqual(
+            rejected.returncode, 1, rejected.stdout + rejected.stderr
+        )
+        self.assertIn("does not bundle bridge templates", rejected.stderr)
 
 
 class PackageOrderTests(unittest.TestCase):
