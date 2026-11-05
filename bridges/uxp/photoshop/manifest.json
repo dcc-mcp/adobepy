@@ -24,7 +24,12 @@
   ],
   "requiredPermissions": {
     "network": {
-      "domains": "all"
+      "domains": [
+        "ws://127.0.0.1:47391",
+        "ws://localhost:47391",
+        "http://127.0.0.1:47391",
+        "http://localhost:47391"
+      ]
     },
     "localFileSystem": "fullAccess"
   },

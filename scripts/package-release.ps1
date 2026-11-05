@@ -241,6 +241,10 @@ Invoke-Step "Build bridge bundles" {
     Invoke-External "npm" @("run", "cep:build")
 }
 
+Invoke-Step "Stage bridge templates into the wheel package tree" {
+    Invoke-External "python" @("scripts\stage_wheel_bridges.py")
+}
+
 Invoke-Step "Clean transient Python build artifacts" { Remove-TransientBuildArtifacts $Root }
 
 Invoke-Step "Stage distribution tree" {

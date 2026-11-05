@@ -1,0 +1,18 @@
+{
+  "manifestVersion": 5,
+  "id": "com.adobepy.bridge.indesign",
+  "name": "Adobe Python Bridge for InDesign",
+  "version": "0.1.0",
+  "host": { "app": "ID", "minVersion": "19.0.0" },
+  "requiredPermissions": {
+    "network": {
+      "domains": [
+        "ws://127.0.0.1:47391",
+        "ws://localhost:47391",
+        "http://127.0.0.1:47391",
+        "http://localhost:47391"
+      ]
+    }
+  },
+  "main": "index.html"
+}
