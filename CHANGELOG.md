@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.12.0...adobepy-v0.13.0) (2026-11-05)
+
+
+### Features
+
+* **broker:** attest After Effects CEP runtime identity through the shared contract ([#107](https://github.com/dcc-mcp/adobepy/issues/107)) ([681ea37](https://github.com/dcc-mcp/adobepy/commit/681ea3783a263d6cee2afbc72f5bb2d86438ab8e))
+
 ## [0.12.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.3...adobepy-v0.12.0) (2026-10-18)
 
 
