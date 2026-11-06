@@ -7,6 +7,13 @@ name: Release
 # published from the UI can no longer publish to PyPI here, and keeping the
 # trigger would run four packaging jobs only to attach assets to a release
 # without publishing it. Publish with `workflow_dispatch` instead.
+#
+# The standalone jobs below are the manual counterparts of the
+# `standalone-package` matrix in release-please.yml. Only one of the two
+# workflows may upload a given asset name: release-please.yml owns the
+# automated path, and these jobs only run on a manual dispatch carrying an
+# explicit `release_tag`. Keeping both able to fire on the same event would
+# have the two racing to `gh release upload` the same filenames.
 on:
   workflow_dispatch:
     inputs:
@@ -152,6 +159,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.release_tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -167,7 +178,7 @@ jobs:
           python -m pip install pyoxidizer
           $wheel = (Get-ChildItem dist -Filter "adobepy-*.whl" | Select-Object -First 1).FullName
           if (-not $wheel) { throw "adobepy wheel was not built" }
-          pyoxidizer build --path pyadobe --var ADOBEPY_WHEEL "$wheel"
+          pyoxidizer build --release --path pyadobe --var ADOBEPY_WHEEL "$wheel"
       - name: Locate build output and package
         shell: pwsh
         run: |
@@ -205,7 +216,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.resolve-target.outputs.tag }}
 
+  # macOS/Linux standalone assets are published by the `standalone-package`
+  # matrix in release-please.yml, which runs on every release. These two jobs
+  # below are the manual rebuild path and would `gh release upload` the same
+  # asset names, so they are disabled rather than left to race the automated
+  # path. Re-enable by restoring `if: false` -> removing it, and dropping the
+  # corresponding matrix entry in release-please.yml.
   macos-standalone-package:
+    if: false
     needs:
       - resolve-target
     name: Build macOS standalone interpreter (PyOxidizer)
@@ -232,10 +250,18 @@ jobs:
           wheel=$(ls dist/adobepy-*.whl 2>/dev/null | head -1)
           if [ -z "$wheel" ]; then echo "adobepy wheel was not built"; exit 1; fi
           wheel_abs="$(cd "$(dirname "$wheel")" && pwd)/$(basename "$wheel")"
-          pyoxidizer build --path pyadobe --var ADOBEPY_WHEEL "$wheel_abs"
+          pyoxidizer build --release --path pyadobe --var ADOBEPY_WHEEL "$wheel_abs"
       - name: Locate build output and package
         shell: bash
         run: |
+          set -euo pipefail
+          adobepy_sha256() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | cut -d' ' -f1
+            else
+              shasum -a 256 "$1" | cut -d' ' -f1
+            fi
+          }
           build_dir=$(ls -d build/*/release/install 2>/dev/null | head -1)
           if [ -z "$build_dir" ]; then echo "PyOxidizer build output not found"; exit 1; fi
           echo "STANDALONE_BUILD_DIR=$build_dir" >> $GITHUB_ENV
@@ -246,7 +272,7 @@ jobs:
           dist_dir="${{ github.workspace }}/dist"
           mkdir -p "$dist_dir"
           (cd "$build_dir" && zip -r "$dist_dir/$package_name.zip" .)
-          hash=$(sha256sum "$dist_dir/$package_name.zip" | cut -d' ' -f1)
+          hash=$(adobepy_sha256 "$dist_dir/$package_name.zip")
           echo "$hash  $package_name.zip" > "$dist_dir/$package_name.zip.sha256"
       - name: Smoke test standalone interpreter
         shell: bash
@@ -270,6 +296,7 @@ jobs:
           TAG: ${{ needs.resolve-target.outputs.tag }}
 
   linux-standalone-package:
+    if: false
     needs:
       - resolve-target
     name: Build Linux standalone interpreter (PyOxidizer)
@@ -296,10 +323,18 @@ jobs:
           wheel=$(ls dist/adobepy-*.whl 2>/dev/null | head -1)
           if [ -z "$wheel" ]; then echo "adobepy wheel was not built"; exit 1; fi
           wheel_abs="$(cd "$(dirname "$wheel")" && pwd)/$(basename "$wheel")"
-          pyoxidizer build --path pyadobe --var ADOBEPY_WHEEL "$wheel_abs"
+          pyoxidizer build --release --path pyadobe --var ADOBEPY_WHEEL "$wheel_abs"
       - name: Locate build output and package
         shell: bash
         run: |
+          set -euo pipefail
+          adobepy_sha256() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | cut -d' ' -f1
+            else
+              shasum -a 256 "$1" | cut -d' ' -f1
+            fi
+          }
           build_dir=$(ls -d build/*/release/install 2>/dev/null | head -1)
           if [ -z "$build_dir" ]; then echo "PyOxidizer build output not found"; exit 1; fi
           echo "STANDALONE_BUILD_DIR=$build_dir" >> $GITHUB_ENV
@@ -310,7 +345,7 @@ jobs:
           dist_dir="${{ github.workspace }}/dist"
           mkdir -p "$dist_dir"
           (cd "$build_dir" && zip -r "$dist_dir/$package_name.zip" .)
-          hash=$(sha256sum "$dist_dir/$package_name.zip" | cut -d' ' -f1)
+          hash=$(adobepy_sha256 "$dist_dir/$package_name.zip")
           echo "$hash  $package_name.zip" > "$dist_dir/$package_name.zip.sha256"
       - name: Smoke test standalone interpreter
         shell: bash

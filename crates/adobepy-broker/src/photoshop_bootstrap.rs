@@ -2368,16 +2368,27 @@ mod tests {
             move |parent_pid| {
                 let marker =
                     std::env::temp_dir().join(format!("adobepy-owned-host-{parent_pid}.ready"));
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while !marker.exists() && Instant::now() < deadline {
+                // The fixture creates the marker before its small PID payload is
+                // fully written. Poll for a complete, parseable PID instead of
+                // unwrapping a partial read: a panic in this supervisor hook is
+                // caught by `catch_unwind`, which drops the Windows Job object
+                // and lets the descendant escape, failing this test for the
+                // wrong reason on a loaded runner. The ceiling is only a hang
+                // detector and stays below the fixture's own 10 s lifetime.
+                let deadline = Instant::now() + Duration::from_secs(8);
+                let pid = loop {
+                    if let Some(pid) = fs::read_to_string(&marker)
+                        .ok()
+                        .and_then(|contents| contents.trim().parse::<u32>().ok())
+                    {
+                        break Some(pid);
+                    }
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
                     std::thread::sleep(Duration::from_millis(10));
-                }
-                let pid = fs::read_to_string(&marker)
-                    .unwrap()
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap();
-                *hook_nested_pid.lock().unwrap() = Some(pid);
+                };
+                *hook_nested_pid.lock().unwrap() = pid;
                 *hook_nested_marker.lock().unwrap() = Some(marker);
                 hook_cancelled.store(true, Ordering::SeqCst);
             },
@@ -2388,12 +2399,32 @@ mod tests {
             tokio::task::spawn_blocking(move || launch_backend.launch_owned(&target, cancelled))
                 .await
                 .unwrap();
-        let descendant_pid = nested_pid.lock().unwrap().unwrap();
+        let descendant_pid = nested_pid
+            .lock()
+            .unwrap()
+            .expect("the nested host fixture never published its descendant PID");
+        // `quiesce` completes once broker reaping is idle, but a Windows Job
+        // close terminates its members asynchronously. Keep a generous hang
+        // detector here rather than a machine-speed ceiling.
         let quiesced = backend
             .host_owner
-            .quiesce(tokio::time::Instant::now() + Duration::from_millis(500))
+            .quiesce(tokio::time::Instant::now() + Duration::from_secs(30))
             .await;
-        let descendant_was_alive = observe_process(descendant_pid).is_ok();
+        // Sample the state the assertion actually cares about instead of a
+        // single `observe_process` sample that can catch the descendant in its
+        // terminating window. The ceiling is well below the fixture's own 10 s
+        // lifetime, so a genuine escape cannot be masked by the fixture's later
+        // kill of the descendant.
+        let reap_deadline = Instant::now() + Duration::from_secs(5);
+        let descendant_was_alive = loop {
+            if observe_process(descendant_pid).is_err() {
+                break false;
+            }
+            if Instant::now() >= reap_deadline {
+                break true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         if descendant_was_alive {
             terminate_test_process(descendant_pid);
         }
