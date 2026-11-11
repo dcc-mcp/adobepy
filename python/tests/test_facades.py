@@ -6,6 +6,7 @@ from adobe.indesign import InDesign
 from adobe.illustrator import Illustrator
 from adobe.photoshop import Photoshop, PhotoshopSession, connect as connect_photoshop
 from adobe.premiere import Premiere
+from adobe.premiere.session import ClipProxy
 from adobe.raw import RawSession
 
 
@@ -1076,6 +1077,17 @@ class CapturingClient:
 
 
 class FacadeTests(unittest.TestCase):
+    def test_premiere_clip_id_source(self):
+        for source in ("derived", "native", None):
+            with self.subTest(source=source):
+                payload = {"id": "sequence-1/video/0/0"}
+                if source is not None:
+                    payload["idSource"] = source
+                clip = ClipProxy(payload)
+                self.assertEqual(clip.id_source, source)
+                self.assertEqual(clip.idSource, source)
+                self.assertEqual(clip.id, payload["id"])
+
     def test_photoshop_contract(self):
         client = CapturingClient()
         app = Photoshop(client=client)

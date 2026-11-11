@@ -276,6 +276,35 @@ UXP templates cover Photoshop, InDesign, and Premiere. CEP templates cover After
 Effects and Illustrator. Host-specific loading, signing, and marketplace flows
 remain Adobe workflows.
 
+### Find the bridge panel
+
+| Host | Requirement | Native entry after loading the bridge |
+| --- | --- | --- |
+| After Effects | CEP range in `CSXS/manifest.xml` | **Window > Extensions > DCC-MCP / AdobePy Bridge** |
+| Premiere Pro | **25.6+**, manifest v5 | **Window > UXP Plugins**, then the **DCC-MCP / AdobePy Bridge** panel |
+
+These are panels in Adobe's existing menus, not a new top-level DCC-MCP menu.
+Python and DCC-MCP clients use the same bridge. Opening a panel does not verify
+its broker connection or trusted runtime identity.
+
+The visible label belongs to the installed manifest. Older AE templates,
+including adobepy 0.12.0, use **adobepy Bridge**. Editing a source template does
+not update an installed extension or a running host. An adapter pinned to an
+older audited SDK/CLI keeps that template until a matched upgrade; do not edit
+a receipted extension in place.
+
+For a missing entry, distinguish an unloaded/uninstalled bridge, an unsupported
+host version, a cached older payload, and a reported load failure. Premiere
+23.x cannot load this 25.6+ bridge. A directory on disk alone does not prove
+loading, and a UI tool error does not prove a plugin load failure. Use the
+approved loading workflow and separate connection/identity verification.
+
+Adobe documents [Premiere's menu](https://developer.adobe.com/premiere-pro/uxp/plugins/distribution/install/),
+[UXP entrypoints](https://developer.adobe.com/premiere-pro/uxp/plugins/concepts/entrypoints/),
+and [CEP panels](https://github.com/Adobe-CEP/CEP-Resources/blob/master/UXP-Migration-Guide/README.md#plugin-types).
+See [host identity and custom locations](host-identity.md) for the separate
+signature, path, version and runtime checks.
+
 The UXP manifests allow the default local broker WebSocket endpoints on
 `127.0.0.1:47391` and `localhost:47391`. If you run the broker on a different
 port or host, update the bridge manifest's `requiredPermissions.network.domains`

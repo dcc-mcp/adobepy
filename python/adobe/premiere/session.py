@@ -1287,6 +1287,15 @@ class ClipProxy:
         return self._payload.get("id")
 
     @property
+    def id_source(self) -> str | None:
+        """ID provenance; derived locators may change after timeline edits."""
+        return self._payload.get("idSource")
+
+    @property
+    def idSource(self) -> str | None:
+        return self.id_source
+
+    @property
     def name(self) -> str | None:
         return self._payload.get("name")
 

@@ -162,6 +162,25 @@ the manifest, creates the archive, and writes the SHA256 file.
   metadata. A live Premiere host is still required to prove actual media output,
   AME queue behavior, installed preset discovery, render events, and filesystem
   permissions.
+- Premiere query tests: `test:uxp-bridge` also uses the public UXP 25.6 API
+  shape, including static Project methods, asynchronous FolderItem and track
+  reads, cast-only media interfaces, Guid strings, and lossless TickTime ticks.
+  Empty collections are tested separately from missing APIs and read failures.
+  Enumeration is bounded to 10,000 entries and exceeding the limit is an error.
+  Media-path search matches paths only; when a root/bin fallback cannot honor
+  `ignoreSubclips`, it rejects that option instead of silently ignoring it.
+  Clip IDs with `idSource: "derived"` are query locators that may change after
+  timeline edits; the Python facade exposes this as `id_source` / `idSource`.
+  These fixtures do not prove that Premiere loads the manifest, accepts the
+  localhost permission, or executes queries in a real host. Validate those
+  stages with a disposable project on Premiere 25.6+ before release; do not
+  infer write, save, or export acceptance from read-only results.
+- Bridge entrypoint staging: the CLI contract stages real AE and Premiere
+  manifests/HTML with inert bundle fixtures, so it also runs before a build.
+  It checks panel labels, stable IDs, Premiere's 25.6 minimum and visible HTML.
+  Real bundles run through the separate bridge gate. These tests do not prove
+  Adobe displays the entry; menu visibility still needs compatible-host
+  verification after approved installation.
 - After Effects render queue tests: mock coverage verifies queue serialization,
   selected-composition queueing, output-module template/settings/path
   pass-through, and host-script error mapping. A live After Effects host is still

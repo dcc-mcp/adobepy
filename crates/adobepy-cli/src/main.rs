@@ -271,7 +271,12 @@ fn bridge_config_js(
 
 fn bridge_websocket_url(host: HostKind, broker_url: Option<&str>) -> String {
     let Some(url) = broker_url.map(str::trim).filter(|value| !value.is_empty()) else {
-        return format!("ws://127.0.0.1:47391/v1/bridge/{}/ws", host.as_str());
+        let hostname = if host == HostKind::Premiere {
+            "localhost"
+        } else {
+            "127.0.0.1"
+        };
+        return format!("ws://{hostname}:47391/v1/bridge/{}/ws", host.as_str());
     };
     let converted = if let Some(rest) = url.strip_prefix("http://") {
         format!("ws://{rest}")
@@ -467,6 +472,24 @@ mod tests {
 
     #[test]
     fn websocket_url_and_config() {
+        for broker_url in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                bridge_websocket_url(HostKind::Premiere, broker_url),
+                "ws://localhost:47391/v1/bridge/premiere/ws"
+            );
+        }
+        assert_eq!(
+            bridge_websocket_url(HostKind::Premiere, Some("http://127.0.0.1:47391")),
+            "ws://127.0.0.1:47391/v1/bridge/premiere/ws"
+        );
+        let explicit_url = "wss://broker.example.com/v1/bridge/premiere/ws";
+        assert_eq!(
+            bridge_websocket_url(HostKind::Premiere, Some(explicit_url)),
+            explicit_url
+        );
+        assert!(bridge_config_js(HostKind::Premiere, None, "tok", "default")
+            .unwrap()
+            .contains("ws://localhost:47391/v1/bridge/premiere/ws"));
         assert_eq!(
             bridge_websocket_url(HostKind::Photoshop, None),
             "ws://127.0.0.1:47391/v1/bridge/photoshop/ws"

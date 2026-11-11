@@ -45,8 +45,8 @@ export function asNumber(value: unknown): number | undefined {
 }
 
 export function property<T = unknown>(value: unknown, name: string): T | undefined {
-  if (!isObject(value)) return undefined;
-  return value[name] as T | undefined;
+  if (!isObject(value) && typeof value !== "function") return undefined;
+  return (value as HostObject)[name] as T | undefined;
 }
 
 export async function maybePromise<T>(value: T | Promise<T>): Promise<T> {

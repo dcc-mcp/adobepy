@@ -2,9 +2,10 @@ import { methodNotFound, unavailable } from "../../core/src/errors";
 import { DomRuntime } from "../../core/src/dom";
 import type { HostAdapter } from "../../core/src/host-adapter";
 import type { RpcRequest } from "../../core/src/protocol";
-import { asArray, asNumber, asString, evalJavaScript, isObject, maybePromise, optionalRequire, property } from "../../core/src/runtime";
+import { asNumber, asString, evalJavaScript, isObject, maybePromise, optionalRequire, property } from "../../core/src/runtime";
 
 type Callable = (...args: unknown[]) => unknown;
+const COLLECTION_LIMIT = 10000;
 
 const domRuntime = new DomRuntime({
   roots(name) {
@@ -51,10 +52,10 @@ export const premiereAdapter: HostAdapter = {
     if (request.namespace === "project" && request.method === "createSequence") return createSequence(request);
     if (request.namespace === "project" && request.method === "importFiles") return importFiles(request);
     if (request.namespace === "sequence" && request.method === "getVideoTracks") {
-      return serializeTracks(sequenceTracks(await requireSequence(request.args?.[0]), "video"), "video");
+      return serializeTracks(await sequenceTracks(await requireSequence(request.args?.[0]), "video"), "video");
     }
     if (request.namespace === "sequence" && request.method === "getAudioTracks") {
-      return serializeTracks(sequenceTracks(await requireSequence(request.args?.[0]), "audio"), "audio");
+      return serializeTracks(await sequenceTracks(await requireSequence(request.args?.[0]), "audio"), "audio");
     }
     if (request.namespace === "sequence" && request.method === "insertProjectItem") return editProjectItem(request, false);
     if (request.namespace === "sequence" && request.method === "overwriteProjectItem") return editProjectItem(request, true);
@@ -104,9 +105,9 @@ async function activeProject() {
 async function projectSequences(project: unknown): Promise<unknown[]> {
   if (!project) return [];
   const getSequences = property<Callable>(project, "getSequences");
-  if (getSequences) return collectionItems(await maybePromise(getSequences.call(project)));
+  if (getSequences) return collectionItems(await maybePromise(getSequences.call(project)), true);
   const sequences = property(project, "sequences") ?? property(project, "sequenceCollection");
-  return collectionItems(sequences);
+  return collectionItems(sequences, true);
 }
 
 async function saveProject() {
@@ -161,7 +162,7 @@ async function editProjectItem(request: RpcRequest, overwrite: boolean) {
     const add = property<Callable>(compound, "addAction") ?? property<Callable>(compound, "add");
     if (add) add.call(compound, action);
   }, asString(request.options?.commandName) ?? (overwrite ? "Overwrite project item" : "Insert project item")));
-  return { edited: true, mode: overwrite ? "overwrite" : "insert", sequence: serializeSequence(sequence), projectItem: serializeProjectItem(item) };
+  return { edited: true, mode: overwrite ? "overwrite" : "insert", sequence: await serializeSequence(sequence), projectItem: await serializeProjectItem(item) };
 }
 
 function premiereTickTime(value: unknown) {
@@ -208,14 +209,14 @@ function sequenceMatches(sequence: unknown, idOrName: unknown): boolean {
     property(sequence, "sequenceID"),
     property(sequence, "name")
   ];
-  return values.some((value) => value !== undefined && String(value) === String(idOrName));
+  return values.some((value) => value !== undefined && String(serializeId(value)) === String(idOrName));
 }
 
 function serializeProject(project: unknown) {
   if (!isObject(project)) return null;
   return {
-    id: property(project, "guid") ?? property(project, "id"),
-    guid: property(project, "guid"),
+    id: serializeId(property(project, "guid") ?? property(project, "id")),
+    guid: serializeId(property(project, "guid")),
     name: asString(property(project, "name")),
     path: asString(property(project, "path")),
     itemCount: asNumber(property(project, "itemCount")) ?? asNumber(property(project, "numItems"))
@@ -232,7 +233,7 @@ async function rootProjectItem(project?: unknown) {
 async function requireProjectItem(idOrName: unknown) {
   const project = await activeProject();
   const root = await rootProjectItem(project);
-  const item = findProjectItem(root, idOrName);
+  const item = await findProjectItem(root, idOrName);
   if (!item) unavailable("Premiere project item");
   return item;
 }
@@ -252,12 +253,12 @@ async function importFiles(request: RpcRequest) {
   const result = await maybePromise(importProjectFiles.call(project, filePaths, suppressUI, targetBin, asNumberedStills));
   const resultItems = collectionItems(result);
   if (resultItems.length > 0) return serializeProjectItems(resultItems);
-  return serializeProjectItems(findImportedProjectItems(filePaths, targetBin ?? (await rootProjectItem(project))));
+  return serializeProjectItems(await findImportedProjectItems(filePaths, targetBin ?? (await rootProjectItem(project))));
 }
 
 async function projectItemChildren(request: RpcRequest) {
   const item = request.args?.[0] === undefined || request.args?.[0] === null ? await rootProjectItem() : await requireProjectItem(request.args?.[0]);
-  return serializeProjectItems(projectItemChildObjects(item));
+  return serializeProjectItems(await projectItemChildObjects(item));
 }
 
 async function selectedProjectItems() {
@@ -265,9 +266,12 @@ async function selectedProjectItems() {
   const project = await activeProject();
   const projectUtils = property(premiere, "ProjectUtils") ?? property(premiere, "projectUtils");
   const getSelection = property<Callable>(projectUtils, "getSelection");
-  if (getSelection) return serializeProjectItems(collectionItems(await maybePromise(getSelection.call(projectUtils, project))));
+  if (getSelection) {
+    const selection = await maybePromise(getSelection.call(projectUtils, project));
+    return serializeProjectItems(collectionItems(await readValue(selection, "getItems") ?? selection, true));
+  }
   const selection = property(project, "selection") ?? property(premiere, "selection");
-  return serializeProjectItems(collectionItems(selection));
+  return serializeProjectItems(collectionItems(selection, true));
 }
 
 async function projectItemsByMediaPath(request: RpcRequest) {
@@ -277,7 +281,8 @@ async function projectItemsByMediaPath(request: RpcRequest) {
   if (!matchString) unavailable("Premiere media path match");
   const directFind = property<Callable>(root, "findItemsMatchingMediaPath");
   if (directFind) return serializeProjectItems(collectionItems(await maybePromise(directFind.call(root, matchString, ignoreSubclips))));
-  return serializeProjectItems(findProjectItemsMatchingMediaPath(root, matchString));
+  if (ignoreSubclips) unavailable("Premiere media path search excluding subclips");
+  return serializeProjectItems(await findProjectItemsMatchingMediaPath(root, matchString));
 }
 
 async function createBin(request: RpcRequest) {
@@ -292,7 +297,7 @@ async function createBin(request: RpcRequest) {
   const createDirect = property<Callable>(parent, "createBin");
   if (createDirect) {
     const created = await maybePromise(createDirect.call(parent, name, makeUnique));
-    return serializeProjectItem(isObject(created) ? created : findProjectItem(parent, name));
+    return serializeProjectItem(isObject(created) ? created : await findProjectItem(parent, name));
   }
   const createAction = property<Callable>(parent, "createBinAction");
   const executeTransaction = property<Callable>(project, "executeTransaction");
@@ -308,47 +313,67 @@ async function createBin(request: RpcRequest) {
         asString(request.options?.commandName) ?? "Create bin"
       )
     );
-    return serializeProjectItem(findProjectItem(parent, name));
+    return serializeProjectItem(await findProjectItem(parent, name));
   }
   unavailable("Premiere bin.create");
 }
 
-function serializeSequences(sequences: unknown[]) {
-  return sequences.map(serializeSequence).filter((sequence) => sequence !== null);
+async function serializeSequences(sequences: unknown[]) {
+  return (await Promise.all(sequences.map(serializeSequence))).filter((sequence) => sequence !== null);
 }
 
-function serializeSequence(sequence: unknown) {
+async function serializeSequence(sequence: unknown) {
   if (!isObject(sequence)) return null;
+  const id = sequenceId(sequence);
   return {
-    id: property(sequence, "id") ?? property(sequence, "guid") ?? property(sequence, "sequenceId") ?? property(sequence, "sequenceID"),
-    guid: property(sequence, "guid"),
-    sequenceId: property(sequence, "sequenceId") ?? property(sequence, "sequenceID"),
+    id,
+    guid: serializeId(property(sequence, "guid")),
+    sequenceId: serializeId(property(sequence, "sequenceId") ?? property(sequence, "sequenceID")) ?? id,
     name: asString(property(sequence, "name")),
-    duration: serializeTime(property(sequence, "duration") ?? property(sequence, "end")),
-    timebase: property(sequence, "timebase") ?? property(sequence, "videoDisplayFormat"),
+    duration: serializeTime(await readValue(sequence, "getEndTime", "duration", "end")),
+    timebase: await readValue(sequence, "getTimebase", "timebase", "videoDisplayFormat"),
     typename: asString(property(sequence, "typename")) ?? asString(property(sequence, "typeName"))
   };
 }
 
-function sequenceTracks(sequence: unknown, mediaType: "video" | "audio"): unknown[] {
+function sequenceId(sequence: unknown) {
+  return serializeId(property(sequence, "id") ?? property(sequence, "guid") ?? property(sequence, "sequenceId") ?? property(sequence, "sequenceID"));
+}
+
+async function sequenceTracks(sequence: unknown, mediaType: "video" | "audio"): Promise<unknown[]> {
+  const prefix = mediaType === "video" ? "Video" : "Audio";
+  const getCount = property<Callable>(sequence, `get${prefix}TrackCount`);
+  const getTrack = property<Callable>(sequence, `get${prefix}Track`);
+  if (getCount || getTrack) {
+    if (!getCount || !getTrack) unavailable(`Premiere ${mediaType} track enumeration`);
+    const count = await maybePromise(getCount.call(sequence));
+    validateCollectionCount(count);
+    const tracks: unknown[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const track = await maybePromise(getTrack.call(sequence, index));
+      if (!isObject(track)) unavailable(`Premiere ${mediaType} track at index ${index}`);
+      tracks.push(track);
+    }
+    return tracks;
+  }
   const propertyName = mediaType === "video" ? "videoTracks" : "audioTracks";
-  return collectionItems(property(sequence, propertyName));
+  return collectionItems(property(sequence, propertyName), true);
 }
 
-function serializeTracks(tracks: unknown[], mediaType: "video" | "audio") {
-  return tracks.map((track, index) => serializeTrack(track, index, mediaType)).filter((track) => track !== null);
+async function serializeTracks(tracks: unknown[], mediaType: "video" | "audio") {
+  return Promise.all(tracks.map((track, index) => serializeTrack(track, index, mediaType)));
 }
 
-function serializeTrack(track: unknown, index: number, mediaType: "video" | "audio") {
-  if (!isObject(track)) return null;
+async function serializeTrack(track: unknown, index: number, mediaType: "video" | "audio") {
+  if (!isObject(track)) unavailable("Premiere track object");
   return {
-    id: property(track, "id") ?? property(track, "trackID") ?? property(track, "trackId") ?? index,
+    id: serializeId(property(track, "id") ?? property(track, "trackID") ?? property(track, "trackId")) ?? index,
     name: asString(property(track, "name")),
-    index: asNumber(property(track, "index")) ?? index,
+    index: asNumber(await readValue(track, "getIndex", "index")) ?? index,
     mediaType,
-    isLocked: booleanValue(property(track, "isLocked") ?? property(track, "locked")),
-    isMuted: booleanValue(property(track, "isMuted") ?? property(track, "muted")),
-    isTargeted: booleanValue(property(track, "isTargeted") ?? property(track, "targeted")),
+    isLocked: booleanValue(await readValue(track, "isLocked", "locked")),
+    isMuted: booleanValue(await readValue(track, "isMuted", "muted")),
+    isTargeted: booleanValue(await readValue(track, "isTargeted", "targeted")),
     typename: asString(property(track, "typename")) ?? asString(property(track, "typeName"))
   };
 }
@@ -356,43 +381,81 @@ function serializeTrack(track: unknown, index: number, mediaType: "video" | "aud
 async function trackClips(request: RpcRequest) {
   const sequence = await requireSequence(request.args?.[0]);
   const mediaType = normalizeMediaType(request.args?.[1]);
-  const track = findTrack(sequence, mediaType, request.args?.[2]);
-  if (!track) unavailable("Premiere track");
-  return collectionItems(property(track, "clips")).map(serializeClip).filter((clip) => clip !== null);
+  const found = await findTrack(sequence, mediaType, request.args?.[2]);
+  if (!found) unavailable("Premiere track");
+  const clips = await trackClipObjects(found.track);
+  return Promise.all(clips.map((clip, index) => serializeClip(clip, sequence, mediaType, found.index, index)));
 }
 
-function selectedClips(sequence: unknown) {
-  const clips = [
-    ...sequenceTracks(sequence, "video").flatMap((track) => collectionItems(property(track, "clips"))),
-    ...sequenceTracks(sequence, "audio").flatMap((track) => collectionItems(property(track, "clips")))
-  ];
-  return clips.filter((clip) => booleanValue(property(clip, "isSelected") ?? property(clip, "selected")) === true).map(serializeClip).filter((clip) => clip !== null);
+async function selectedClips(sequence: unknown) {
+  const selected = [];
+  let count = 0;
+  for (const mediaType of ["video", "audio"] as const) {
+    const tracks = await sequenceTracks(sequence, mediaType);
+    for (let trackIndex = 0; trackIndex < tracks.length; trackIndex += 1) {
+      const clips = await trackClipObjects(tracks[trackIndex]);
+      count += clips.length;
+      validateCollectionCount(count);
+      for (let index = 0; index < clips.length; index += 1) {
+        if (booleanValue(await readValue(clips[index], "getIsSelected", "isSelected", "selected")) === true) {
+          selected.push(await serializeClip(clips[index], sequence, mediaType, trackIndex, index));
+        }
+      }
+    }
+  }
+  return selected;
 }
 
-function findTrack(sequence: unknown, mediaType: "video" | "audio", idOrIndex: unknown) {
-  const tracks = sequenceTracks(sequence, mediaType);
-  if (idOrIndex === undefined || idOrIndex === null) return tracks[0];
-  return tracks.find((track, index) => {
-    const values = [property(track, "id"), property(track, "trackID"), property(track, "trackId"), property(track, "name"), property(track, "index"), index];
-    return values.some((value) => value !== undefined && String(value) === String(idOrIndex));
-  });
+async function findTrack(sequence: unknown, mediaType: "video" | "audio", idOrIndex: unknown) {
+  const tracks = await sequenceTracks(sequence, mediaType);
+  let index = 0;
+  if (idOrIndex !== undefined && idOrIndex !== null) {
+    const matches = (value: unknown) => value !== undefined && String(value) === String(idOrIndex);
+    index = tracks.findIndex((track) => matches(serializeId(property(track, "id") ?? property(track, "trackID") ?? property(track, "trackId"))));
+    if (index < 0) index = tracks.findIndex((track) => matches(property(track, "name")));
+    if (index < 0) {
+      const indices = await Promise.all(tracks.map((track, position) => readValue(track, "getIndex", "index").then((value) => value ?? position)));
+      index = indices.findIndex(matches);
+    }
+  }
+  return index >= 0 && tracks[index] ? { track: tracks[index], index } : undefined;
 }
 
-function serializeClip(clip: unknown) {
-  if (!isObject(clip)) return null;
-  const projectItem = property(clip, "projectItem");
+async function trackClipObjects(track: unknown) {
+  const getTrackItems = property<Callable>(track, "getTrackItems");
+  if (getTrackItems) {
+    const constants = property(premiereModule(), "Constants") ?? property(premiereModule(), "constants");
+    const clipType = property(property(constants, "TrackItemType"), "CLIP");
+    if (clipType === undefined) unavailable("Premiere TrackItemType.CLIP");
+    return collectionItems(await maybePromise(getTrackItems.call(track, clipType, false)), true);
+  }
+  return collectionItems(property(track, "clips"), true);
+}
+
+async function serializeClip(clip: unknown, sequence: unknown, mediaType: "video" | "audio", trackIndex: number, clipIndex: number) {
+  if (!isObject(clip)) unavailable("Premiere clip object");
+  const projectItem = await readValue(clip, "getProjectItem", "projectItem");
+  const nativeId = serializeId(property(clip, "id") ?? property(clip, "nodeId") ?? property(clip, "nodeID"));
+  const parentSequenceId = sequenceId(sequence);
+  if (nativeId === undefined && parentSequenceId === undefined) unavailable("Premiere clip sequence ID");
+  let isEnabled = booleanValue(await readValue(clip, "isEnabled", "enabled"));
+  if (isEnabled === undefined) {
+    const disabled = booleanValue(await readValue(clip, "isDisabled"));
+    if (disabled !== undefined) isEnabled = !disabled;
+  }
   return {
-    id: property(clip, "id") ?? property(clip, "nodeId") ?? property(clip, "nodeID"),
-    name: asString(property(clip, "name")) ?? asString(property(projectItem, "name")),
-    projectItemId: property(projectItem, "id") ?? property(projectItem, "nodeId") ?? property(projectItem, "nodeID"),
-    mediaPath: asString(property(clip, "mediaPath")) ?? asString(property(projectItem, "mediaPath")) ?? asString(property(projectItem, "treePath")),
-    start: serializeTime(property(clip, "start")),
-    end: serializeTime(property(clip, "end")),
-    inPoint: serializeTime(property(clip, "inPoint")),
-    outPoint: serializeTime(property(clip, "outPoint")),
-    duration: serializeTime(property(clip, "duration")),
-    isEnabled: booleanValue(property(clip, "isEnabled") ?? property(clip, "enabled")),
-    isSelected: booleanValue(property(clip, "isSelected") ?? property(clip, "selected")),
+    id: nativeId ?? `${parentSequenceId}/${mediaType}/${trackIndex}/${clipIndex}`,
+    idSource: nativeId === undefined ? "derived" : "native",
+    name: asString(await readValue(clip, "getName", "name")) ?? asString(property(projectItem, "name")),
+    projectItemId: await projectItemId(projectItem),
+    mediaPath: asString(property(clip, "mediaPath")) ?? await projectItemMediaPath(projectItem) ?? asString(property(projectItem, "treePath")),
+    start: serializeTime(await readValue(clip, "getStartTime", "start")),
+    end: serializeTime(await readValue(clip, "getEndTime", "end")),
+    inPoint: serializeTime(await readValue(clip, "getInPoint", "inPoint")),
+    outPoint: serializeTime(await readValue(clip, "getOutPoint", "outPoint")),
+    duration: serializeTime(await readValue(clip, "getDuration", "duration")),
+    isEnabled,
+    isSelected: booleanValue(await readValue(clip, "getIsSelected", "isSelected", "selected")),
     typename: asString(property(clip, "typename")) ?? asString(property(clip, "typeName"))
   };
 }
@@ -633,7 +696,7 @@ function serializeEncoderPreset(preset: unknown) {
   };
 }
 
-function serializeExportJob(result: unknown, payload: Record<string, unknown>, kind: string, source?: unknown) {
+async function serializeExportJob(result: unknown, payload: Record<string, unknown>, kind: string, source?: unknown) {
   const resultObject = isObject(result) ? result : {};
   const resultJobId = property(resultObject, "jobId") ?? property(resultObject, "jobID") ?? property(resultObject, "id");
   const jobId = resultJobId ?? (typeof result === "string" || typeof result === "number" ? result : undefined);
@@ -644,7 +707,7 @@ function serializeExportJob(result: unknown, payload: Record<string, unknown>, k
     status: asString(property(resultObject, "status")) ?? (started === false ? "failed" : kind === "exportFrame" ? "exported" : "queued"),
     outputPath: asString(property(resultObject, "outputPath")) ?? asString(property(resultObject, "outputFile")) ?? asString(property(payload, "outputPath")),
     presetPath: asString(property(resultObject, "presetPath")) ?? asString(property(resultObject, "presetFile")) ?? asString(property(payload, "presetPath")),
-    sourceId: property(resultObject, "sourceId") ?? projectItemId(source) ?? property(source, "id") ?? property(payload, "sourcePath"),
+    sourceId: property(resultObject, "sourceId") ?? await projectItemId(source) ?? property(source, "id") ?? property(payload, "sourcePath"),
     sourceName: asString(property(resultObject, "sourceName")) ?? asString(property(source, "name")) ?? asString(property(payload, "sourcePath")),
     exportType: asString(property(resultObject, "exportType")) ?? asString(property(payload, "exportType")),
     removeUponCompletion: booleanValue(property(resultObject, "removeUponCompletion") ?? property(payload, "removeUponCompletion") ?? property(payload, "removeOnCompletion") ?? property(payload, "remove_on_completion")),
@@ -688,33 +751,36 @@ function parentDirectory(outputPath: string): string {
   return index > 0 ? outputPath.slice(0, index + 1) : "";
 }
 
-function serializeProjectItems(items: unknown[]) {
-  return items.map(serializeProjectItem).filter((item) => item !== null);
+async function serializeProjectItems(items: unknown[]) {
+  return (await Promise.all(items.map(serializeProjectItem))).filter((item) => item !== null);
 }
 
-function serializeProjectItem(item: unknown) {
+async function serializeProjectItem(item: unknown) {
   if (!isObject(item)) return null;
-  const children = projectItemChildObjects(item);
+  const children = await projectItemChildObjects(item);
   const typename = asString(property(item, "typename")) ?? asString(property(item, "typeName"));
-  const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
+  const mediaPath = await projectItemMediaPath(item);
   const treePath = asString(property(item, "treePath")) ?? asString(property(item, "path"));
-  const itemType = projectItemType(item, children, typename, mediaPath);
+  const folder = await castProjectItem(item, "FolderItem");
+  const clip = await castProjectItem(item, "ClipProjectItem");
+  const isSequence = booleanValue(await readValue(clip ?? item, "isSequence"));
+  const itemType = folder || property<Callable>(item, "getItems") ? "bin" : isSequence ? "sequence" : clip ? "clip" : projectItemType(item, children, typename, mediaPath);
   return {
-    id: projectItemId(item),
+    id: await projectItemId(item),
     name: asString(property(item, "name")),
     type: property(item, "type"),
     itemType,
     path: treePath ?? mediaPath,
     mediaPath,
     treePath,
-    parentId: projectItemId(property(item, "parent")),
+    parentId: await projectItemId(await readValue(item, "getParentBin", "parent")),
     childCount: children.length,
     isBin: itemType === "bin",
     isClip: itemType === "clip",
     isSequence: itemType === "sequence",
-    canProxy: booleanValue(property(item, "canProxy")) ?? booleanValue(safeCall(item, "canProxy")),
-    hasProxy: booleanValue(property(item, "hasProxy")) ?? booleanValue(safeCall(item, "hasProxy")),
-    isOffline: booleanValue(property(item, "isOffline")) ?? booleanValue(safeCall(item, "isOffline")),
+    canProxy: booleanValue(await readValue(clip ?? item, "canProxy")),
+    hasProxy: booleanValue(await readValue(clip ?? item, "hasProxy")),
+    isOffline: booleanValue(await readValue(clip ?? item, "isOffline")),
     typename
   };
 }
@@ -731,66 +797,103 @@ function projectItemType(item: unknown, children: unknown[], typename?: string, 
   return type === undefined ? undefined : String(type);
 }
 
-function projectItemId(item: unknown) {
-  return property(item, "id") ?? property(item, "guid") ?? property(item, "nodeId") ?? property(item, "nodeID");
+async function projectItemId(item: unknown) {
+  if (!item) return undefined;
+  const direct = await readValue(item, "getId", "id", "guid", "nodeId", "nodeID");
+  if (direct !== undefined && direct !== null) return serializeId(direct);
+  const base = await castProjectItem(item, "ProjectItem");
+  return serializeId(await readValue(base, "getId"));
 }
 
-function projectItemChildObjects(item: unknown): unknown[] {
-  const direct = collectionItems(property(item, "children") ?? property(item, "items"));
-  if (direct.length > 0) return direct;
-  return collectionItems(safeCall(item, "getItems") ?? safeCall(item, "getChildren"));
+async function projectItemMediaPath(item: unknown) {
+  if (!item) return undefined;
+  const direct = await readValue(item, "getMediaFilePath", "mediaPath");
+  if (direct !== undefined) return asString(direct);
+  const clip = await castProjectItem(item, "ClipProjectItem");
+  if (!clip) return undefined;
+  const getPath = property<Callable>(clip, "getMediaFilePath");
+  if (!getPath) unavailable("Premiere ClipProjectItem.getMediaFilePath");
+  return asString(await maybePromise(getPath.call(clip)));
 }
 
-function findProjectItem(root: unknown, idOrName: unknown): unknown {
+async function castProjectItem(item: unknown, type: string) {
+  const api = property(premiereModule(), type);
+  const cast = property<Callable>(api, "cast");
+  return cast && item ? await maybePromise(cast.call(api, item)) : undefined;
+}
+
+async function projectItemChildObjects(item: unknown): Promise<unknown[]> {
+  if (!isObject(item)) unavailable("Premiere project item object");
+  const direct = await readValue(item, "getItems", "getChildren", "children", "items");
+  if (direct !== undefined && direct !== null) return collectionItems(direct, true);
+  const folder = await castProjectItem(item, "FolderItem");
+  if (folder) {
+    const getItems = property<Callable>(folder, "getItems");
+    if (!getItems) unavailable("Premiere FolderItem.getItems");
+    return collectionItems(await maybePromise(getItems.call(folder)), true);
+  }
+  const clip = await castProjectItem(item, "ClipProjectItem");
+  if (clip || await projectItemMediaPath(item) !== undefined || /clip|sequence/i.test(asString(property(item, "typename")) ?? asString(property(item, "itemType")) ?? "")) return [];
+  unavailable("Premiere project item children");
+}
+
+async function findProjectItem(root: unknown, idOrName: unknown): Promise<unknown> {
   if (idOrName === undefined || idOrName === null) return root;
-  return collectProjectItems(root).find((item) => projectItemMatches(item, idOrName));
+  const items = await collectProjectItems(root);
+  const target = String(idOrName);
+  for (const item of items) {
+    const id = await projectItemId(item);
+    if (id !== undefined && String(id) === target) return item;
+  }
+  for (const item of items) {
+    const values = [property(item, "name"), property(item, "treePath"), property(item, "path"), await projectItemMediaPath(item)];
+    if (values.some((value) => value !== undefined && String(value) === target)) return item;
+  }
+  return undefined;
 }
 
-function collectProjectItems(root: unknown): unknown[] {
+async function collectProjectItems(root: unknown): Promise<unknown[]> {
   const result: unknown[] = [];
   const queue: unknown[] = root ? [root] : [];
   const seen = new Set<unknown>();
-  while (queue.length > 0) {
-    const item = queue.shift();
+  const seenIds = new Set<string | number>();
+  for (let index = 0; index < queue.length; index += 1) {
+    const item = queue[index];
     if (!item || seen.has(item)) continue;
     seen.add(item);
+    const id = await projectItemId(item);
+    if (id !== undefined && seenIds.has(id)) continue;
+    if (id !== undefined) seenIds.add(id);
     result.push(item);
-    queue.push(...projectItemChildObjects(item));
+    validateCollectionCount(result.length);
+    for (const child of await projectItemChildObjects(item)) {
+      if (seen.has(child)) continue;
+      queue.push(child);
+      validateCollectionCount(queue.length);
+    }
   }
   return result;
 }
 
-function projectItemMatches(item: unknown, idOrName: unknown): boolean {
-  if (!isObject(item)) return false;
-  const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
-  const values = [
-    projectItemId(item),
-    property(item, "name"),
-    property(item, "treePath"),
-    property(item, "path"),
-    mediaPath
-  ];
-  return values.some((value) => value !== undefined && String(value) === String(idOrName));
+async function findProjectItemsMatchingMediaPath(root: unknown, matchString: string): Promise<unknown[]> {
+  const matches = [];
+  for (const item of await collectProjectItems(root)) {
+    const mediaPath = await projectItemMediaPath(item);
+    if (mediaPath?.includes(matchString)) matches.push(item);
+  }
+  return matches;
 }
 
-function findProjectItemsMatchingMediaPath(root: unknown, matchString: string): unknown[] {
-  return collectProjectItems(root).filter((item) => {
-    const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
-    return mediaPath?.includes(matchString) || asString(property(item, "name"))?.includes(matchString);
-  });
-}
-
-function findImportedProjectItems(filePaths: string[], root: unknown): unknown[] {
-  const candidates = collectProjectItems(root);
-  return filePaths
-    .map((filePath) => {
-      const fileName = filePath.split(/[\\/]/).filter(Boolean).pop() ?? filePath;
-      return candidates.find((item) => {
-        const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
-        return mediaPath === filePath || asString(property(item, "name")) === fileName;
-      });
-    })
-    .filter((item) => item !== undefined);
+async function findImportedProjectItems(filePaths: string[], root: unknown): Promise<unknown[]> {
+  const candidates = await collectProjectItems(root);
+  const mediaPaths = await Promise.all(candidates.map(projectItemMediaPath));
+  const matches = [];
+  for (const filePath of filePaths) {
+    const fileName = filePath.split(/[\\/]/).filter(Boolean).pop() ?? filePath;
+    const index = candidates.findIndex((item, position) => mediaPaths[position] === filePath || asString(property(item, "name")) === fileName);
+    if (index >= 0) matches.push(candidates[index]);
+  }
+  return matches;
 }
 
 function normalizeFilePaths(value: unknown): string[] {
@@ -798,26 +901,54 @@ function normalizeFilePaths(value: unknown): string[] {
   return values.map((item) => asString(item)).filter((item) => item !== undefined);
 }
 
-function safeCall(receiver: unknown, method: string, ...args: unknown[]): unknown {
-  const fn = property<Callable>(receiver, method);
-  if (!fn) return undefined;
-  try {
-    return fn.apply(receiver, args);
-  } catch {
-    return undefined;
+async function readValue(receiver: unknown, ...names: string[]): Promise<unknown> {
+  for (const name of names) {
+    const value = property(receiver, name);
+    if (value !== undefined && value !== null) {
+      return typeof value === "function" ? await maybePromise(value.call(receiver)) : value;
+    }
   }
+  return undefined;
 }
 
-function collectionItems(value: unknown): unknown[] {
-  const direct = asArray(value);
-  if (direct.length > 0) return direct;
+function serializeId(value: unknown): string | number | undefined {
+  if (typeof value === "string" || typeof value === "number") return value;
+  const toString = property<Callable>(value, "toString");
+  if (!toString || toString === Object.prototype.toString) return undefined;
+  const converted = toString.call(value);
+  return typeof converted === "string" && converted !== "[object Object]" ? converted : undefined;
+}
+
+function validateCollectionCount(count: unknown): asserts count is number {
+  if (typeof count !== "number" || !Number.isInteger(count) || count < 0) unavailable("Premiere collection count");
+  if (count > COLLECTION_LIMIT) unavailable(`Premiere collection limit ${COLLECTION_LIMIT}`);
+}
+
+function collectionItems(value: unknown, required = false): unknown[] {
+  if (Array.isArray(value)) {
+    validateCollectionCount(value.length);
+    return value;
+  }
+  const iterator = isObject(value) ? (value as unknown as Iterable<unknown>)[Symbol.iterator] : undefined;
+  if (iterator) {
+    const result = [];
+    for (const item of value as Iterable<unknown>) {
+      result.push(item);
+      validateCollectionCount(result.length);
+    }
+    return result;
+  }
   const count = asNumber(property(value, "numItems")) ?? asNumber(property(value, "numTracks")) ?? asNumber(property(value, "numMarkers")) ?? asNumber(property(value, "length"));
-  if (count === undefined || count <= 0) return [];
+  if (count === undefined) {
+    if (required) unavailable("Premiere collection read");
+    return [];
+  }
+  validateCollectionCount(count);
   const at = property<Callable>(value, "at") ?? property<Callable>(value, "getAt") ?? property<Callable>(value, "item");
-  if (!at) return [];
   const result: unknown[] = [];
   for (let index = 0; index < count; index += 1) {
-    const item = at.call(value, index);
+    const item = at ? at.call(value, index) : property(value, String(index));
+    if ((item === undefined || item === null) && required) unavailable(`Premiere collection item ${index}`);
     if (item !== undefined && item !== null) result.push(item);
   }
   return result;

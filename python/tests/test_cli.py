@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+import xml.etree.ElementTree as ET
 from contextlib import redirect_stdout
 from unittest import mock
 
@@ -30,6 +31,21 @@ def _make_bridge_tree(root: pathlib.Path, kind: str, host: str) -> pathlib.Path:
 
 
 class WebsocketUrlTests(unittest.TestCase):
+    def test_premiere_default_uses_manifest_localhost_permission(self):
+        for broker_url in (None, "", "  "):
+            self.assertEqual(
+                cli.websocket_url("premiere", broker_url),
+                "ws://localhost:47391/v1/bridge/premiere/ws",
+            )
+
+    def test_premiere_explicit_broker_is_preserved(self):
+        self.assertEqual(
+            cli.websocket_url("premiere", "http://127.0.0.1:47391"),
+            "ws://127.0.0.1:47391/v1/bridge/premiere/ws",
+        )
+        url = "wss://broker.example.com/v1/bridge/premiere/ws"
+        self.assertEqual(cli.websocket_url("premiere", url), url)
+
     def test_default_and_scheme_conversion(self):
         self.assertEqual(
             cli.websocket_url("photoshop", None),
@@ -56,6 +72,18 @@ class WebsocketUrlTests(unittest.TestCase):
 
 
 class BridgeConfigTests(unittest.TestCase):
+    def test_premiere_template_matches_host_and_network_permission(self):
+        template = REPO_ROOT / "bridges" / "uxp" / "premiere"
+        manifest = json.loads((template / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["host"]["app"], "premierepro")
+        self.assertIn("ws://localhost:47391", manifest["requiredPermissions"]["network"]["domains"])
+        config = (template / "adobepy.config.js").read_text(encoding="utf-8")
+        self.assertIn("ws://localhost:47391/v1/bridge/premiere/ws", config)
+
+    def test_premiere_config_uses_localhost_default(self):
+        config = cli.bridge_config_js("premiere", None, "tok", "default")
+        self.assertIn('brokerUrl:"ws://localhost:47391/v1/bridge/premiere/ws"', config)
+
     def test_config_matches_the_rust_cli_contract(self):
         # Key names are unquoted exactly as the Rust CLI emits them; the bridge
         # reads this file, so the two implementations must stay byte-compatible.
@@ -92,6 +120,45 @@ class BridgeConfigTests(unittest.TestCase):
 
 
 class StageBridgeTests(unittest.TestCase):
+    def test_real_panel_metadata_survives_staging_without_build_outputs(self):
+        for host in ("after-effects", "premiere"):
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                kind = cli.default_bridge_kind(host)
+                bridge_root = root / "bridges"
+                source = _make_bridge_tree(bridge_root, kind, host)
+                manifest_path = "manifest.json" if kind == "uxp" else "CSXS/manifest.xml"
+                # Quick CI has no built bundles. Stage real UI metadata with
+                # inert transport fixtures; the bridge gate tests real bundles.
+                for relative in (manifest_path, "index.html"):
+                    target = source / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes((REPO_ROOT / "bridges" / kind / host / relative).read_bytes())
+                destination = root / "staged"
+                cli.stage_bridge(
+                    host,
+                    destination,
+                    "test-token",
+                    bridge_root=bridge_root,
+                )
+                if host == "premiere":
+                    manifest = json.loads((destination / "manifest.json").read_text("utf-8"))
+                    self.assertEqual(manifest["id"], "com.adobepy.bridge.premiere")
+                    self.assertEqual(manifest["host"]["minVersion"], "25.6.0")
+                    panels = [entry for entry in manifest["entrypoints"] if entry["type"] == "panel"]
+                    self.assertEqual(len(panels), 1)
+                    self.assertEqual(panels[0]["id"], "adobepyBridgePanel")
+                    label = panels[0]["label"]["default"]
+                else:
+                    manifest = ET.parse(destination / "CSXS" / "manifest.xml").getroot()
+                    self.assertEqual(manifest.get("ExtensionBundleId"), "com.adobepy.bridge.after-effects")
+                    label = manifest.findtext(".//UI/Menu")
+                self.assertIn("DCC-MCP", label)
+                self.assertIn("AdobePy", label)
+                page = (destination / "index.html").read_text("utf-8")
+                self.assertIn("<h1>DCC-MCP / AdobePy Bridge</h1>", page)
+                self.assertIn("does not verify", page)
+
     def test_stage_bridge_copies_template_and_writes_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
