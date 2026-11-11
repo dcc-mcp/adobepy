@@ -7,14 +7,16 @@
       body { font-family: sans-serif; margin: 12px; }
       h1 { font-size: 18px; margin: 0 0 12px; }
       p { font-size: 12px; margin: 0 0 8px; }
+      #adobepy-bridge-status { padding: 8px; border: 1px solid currentColor; }
     </style>
     <script src="adobepy.config.js"></script>
-    <script src="dist/main.js"></script>
   </head>
   <body>
     <h1>DCC-MCP / AdobePy Bridge</h1>
-    <p>Premiere Pro</p>
+    <p>Premiere Pro 25.6+ required</p>
+    <p id="adobepy-bridge-status" role="status" aria-live="polite" aria-atomic="true">Bridge not started.</p>
     <p>Use your Python or DCC-MCP client to connect to this host.</p>
     <p>Opening this panel does not verify the broker connection.</p>
+    <script src="dist/main.js"></script>
   </body>
 </html>

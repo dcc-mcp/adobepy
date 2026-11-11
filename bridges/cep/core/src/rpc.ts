@@ -1,5 +1,6 @@
 import type { BridgeIdentityClaim, Capabilities, RpcRequest } from "./protocol";
 import { ERROR_CODES } from "./protocol";
+import type { BridgeStatus } from "../../../shared/status";
 
 export interface CepConfig {
   host: string;
@@ -8,18 +9,26 @@ export interface CepConfig {
   target: string;
   capabilities: Capabilities;
   identityProvider?: () => Promise<BridgeIdentityClaim | undefined> | BridgeIdentityClaim | undefined;
+  onStatus?: (status: BridgeStatus) => void;
 }
 
 declare const WebSocket: any;
 
 export function startCepBridge(config: CepConfig): void {
+  config.onStatus?.("starting");
   const cep = (globalThis as any).__adobe_cep__;
-  if (!cep || typeof cep.evalScript !== "function") throw new Error("Adobe CEP evalScript API unavailable");
+  if (!cep || typeof cep.evalScript !== "function") {
+    config.onStatus?.("error");
+    throw new Error("Adobe CEP evalScript API unavailable");
+  }
   if (typeof config.token !== "string" || config.token.trim() === "") {
+    config.onStatus?.("error");
     throw new Error("ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
   }
   const extensionPath = cep.getSystemPath("extension").replace(/\\/g, "/");
   const connect = async () => {
+    config.onStatus?.("connecting");
+    let failed = false;
     let identity: BridgeIdentityClaim | undefined;
     if (config.identityProvider) {
       try {
@@ -28,6 +37,8 @@ export function startCepBridge(config: CepConfig): void {
           ? await (provided as Promise<BridgeIdentityClaim | undefined>)
           : provided as BridgeIdentityClaim | undefined;
       } catch {
+        failed = true;
+        config.onStatus?.("error");
         console.error("[adobepy] runtime identity is unavailable; exact-instance verification will fail closed.");
       }
     }
@@ -35,25 +46,55 @@ export function startCepBridge(config: CepConfig): void {
     const capabilities = identity?.host.hostVersion
       ? { ...config.capabilities, hostVersion: identity.host.hostVersion }
       : config.capabilities;
-    const socket = new WebSocket(config.brokerUrl);
+    let socket: any;
+    try {
+      socket = new WebSocket(config.brokerUrl);
+    } catch (error) {
+      config.onStatus?.("error");
+      throw error;
+    }
     let greeted = false;
     const greet = () => {
       if (greeted || socket.readyState !== 1) return;
       greeted = true;
-      socket.send(JSON.stringify({
-        type: "hello",
-        token: config.token,
-        target: config.target,
-        capabilities,
-        ...(identity ? { identity } : {}),
-        ...(bootstrapNonce ? { bootstrapNonce } : {})
-      }));
-      console.log("adobepy CEP bridge connected", capabilities);
+      try {
+        socket.send(JSON.stringify({
+          type: "hello",
+          token: config.token,
+          target: config.target,
+          capabilities,
+          ...(identity ? { identity } : {}),
+          ...(bootstrapNonce ? { bootstrapNonce } : {})
+        }));
+      } catch (error) {
+        failed = true;
+        config.onStatus?.("error");
+        throw error;
+      }
+      config.onStatus?.(failed ? "error" : "ready");
+      console.log("adobepy CEP bridge hello sent; connection verification pending", capabilities);
     };
     socket.onopen = greet;
+    socket.onerror = () => {
+      failed = true;
+      config.onStatus?.("error");
+    };
+    socket.onclose = () => config.onStatus?.(failed ? "error" : "disconnected");
     setTimeout(greet, 0);
     socket.onmessage = (event: { data: string }) => {
-      const message = JSON.parse(event.data);
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch (error) {
+        failed = true;
+        config.onStatus?.("error");
+        throw error;
+      }
+      if (message.jsonrpc === "2.0" && message.error) {
+        failed = true;
+        config.onStatus?.("error");
+        return;
+      }
       if (message.type !== "request") return;
       const request = message.request as RpcRequest;
       const requestLiteral = JSON.stringify(JSON.stringify(request))
@@ -94,7 +135,10 @@ export function startCepBridge(config: CepConfig): void {
     ].join(" && ");
     cep.evalScript(`${probe} ? "ready" : "missing"`, (status: string) => {
       if (status === "ready") void connect();
-      else console.error("adobepy CEP host runtime failed to initialize", status);
+      else {
+        config.onStatus?.("error");
+        console.error("adobepy CEP host runtime failed to initialize", status);
+      }
     });
   };
   const loadDispatcher = () => {

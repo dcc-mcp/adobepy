@@ -1,7 +1,9 @@
 import { startCepBridge } from "../../core/src/rpc";
+import { showBridgeStatus } from "../../../shared/status";
 import { afterEffectsRuntimeIdentity } from "./identity";
 
 startCepBridge({
+  onStatus: showBridgeStatus,
   host: "after-effects",
   brokerUrl: (globalThis as any).__ADOBEPY_BROKER_URL || "ws://127.0.0.1:47391/v1/bridge/after-effects/ws",
   token: (globalThis as any).__ADOBEPY_TOKEN || "",

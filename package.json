@@ -14,7 +14,7 @@
     "uxp:build:premiere": "node scripts/build-uxp.js premiere",
     "uxpdt": "node scripts/uxpdt.js",
     "test:quick": "npm run version:check && npm run bridge:check && npm run protocol:check && npm run capabilities:check && npm run architecture:check && npm run facades:check && npm run stubs:check && npm run api:sources:validate && npm run api:coverage && npm run abi3:check && npm run ir:validate && npm run test:coverage && npm run test:rust",
-    "test:bridges": "npm run test:cep && npm run test:uxp-bridge && npm run test:uxpdt",
+    "test:bridges": "npm run test:cep && npm run test:uxp-bridge && npm run test:uxpdt && node scripts/test-bridge-status.js",
     "test:cep": "npm run cep:build && node scripts/test-cep.js",
     "test:uxp-bridge": "npm run uxp:build && node scripts/test-uxp-bridge.js",
     "test:photoshop-bootstrap-contract": "npm run uxp:build:photoshop && cargo test -p adobepy-broker --lib tests::photoshop_generated_config_hello_fails_closed_without_observed_profile -- --ignored --exact",

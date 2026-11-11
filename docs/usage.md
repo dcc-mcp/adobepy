@@ -287,6 +287,14 @@ These are panels in Adobe's existing menus, not a new top-level DCC-MCP menu.
 Python and DCC-MCP clients use the same bridge. Opening a panel does not verify
 its broker connection or trusted runtime identity.
 
+AE and Premiere panels show bridge startup, broker connection attempts,
+disconnects and failures. **Bridge service ready** means the host runtime has
+initialized and sent its hello over an open WebSocket. The current protocol has
+no accepted-hello or client-connection acknowledgement, so the panel explicitly
+keeps the broker/client connection **not verified**, even after a host request.
+Use the client's typed readiness and runtime-identity checks for acceptance.
+Error text stays generic; detailed diagnostics remain in bridge/broker logs.
+
 The visible label belongs to the installed manifest. Older AE templates,
 including adobepy 0.12.0, use **adobepy Bridge**. Editing a source template does
 not update an installed extension or a running host. An adapter pinned to an

@@ -181,6 +181,11 @@ the manifest, creates the archive, and writes the SHA256 file.
   Real bundles run through the separate bridge gate. These tests do not prove
   Adobe displays the entry; menu visibility still needs compatible-host
   verification after approved installation.
+- Panel lifecycle status: `test:bridges` exercises the built AE/Premiere bundles
+  with mock hosts, WebSockets and a status element. It covers startup, missing
+  configuration/runtime, hello sent without an acknowledgement, a host RPC,
+  broker rejection, transport error, disconnect and close-during-open. These
+  checks do not observe an Adobe window or prove native bridge acceptance.
 - After Effects render queue tests: mock coverage verifies queue serialization,
   selected-composition queueing, output-module template/settings/path
   pass-through, and host-script error mapping. A live After Effects host is still

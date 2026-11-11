@@ -158,6 +158,9 @@ class StageBridgeTests(unittest.TestCase):
                 page = (destination / "index.html").read_text("utf-8")
                 self.assertIn("<h1>DCC-MCP / AdobePy Bridge</h1>", page)
                 self.assertIn("does not verify", page)
+                self.assertIn('id="adobepy-bridge-status" role="status"', page)
+                self.assertIn("Bridge not started.", page)
+                self.assertGreater(page.index('<script src="dist/main.js">'), page.index('id="adobepy-bridge-status"'))
 
     def test_stage_bridge_copies_template_and_writes_config(self):
         with tempfile.TemporaryDirectory() as tmp:

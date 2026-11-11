@@ -22,8 +22,9 @@ async function loadBundle(relativeBundlePath, modules, globals = {}, generatedCo
     constructor(url) {
       this.url = url;
       this.listeners = {};
+      this.readyState = 0;
       socketInstance = this;
-      setImmediate(() => this.emit("open", {}));
+      setImmediate(() => { this.readyState = 1; this.emit("open", {}); });
     }
     addEventListener(name, listener) {
       this.listeners[name] = this.listeners[name] || [];
