@@ -1241,6 +1241,77 @@ async function testPremiereIdSerializationBoundaries() {
   assert.strictEqual(rejected.code, -32004, "the string 'undefined' must not match an unserializable ID");
 }
 
+// End-to-end regression through the real RPC/DOM dispatch. A function receiver
+// reached via dom.root/dom.get must not expose Function.prototype members, while
+// ordinary own properties and host DOM prototype methods remain reachable.
+async function testDomDispatchMemberBoundary() {
+  function HostConstructor() {
+    this.tag = "instance";
+  }
+  HostConstructor.nativeStatic = 7;
+  HostConstructor.prototype.hostMethod = function (suffix) {
+    return `host:${suffix}:${this.tag}`;
+  };
+
+  const env = await loadBundle("bridges/uxp/premiere/dist/main.js", {
+    premierepro: { version: "25.6.0", HostConstructor }
+  });
+  assert.strictEqual(env.sent[0].capabilities.host, "premiere");
+
+  const moduleRef = result(await rpc(env, "premiere", "dom", "root", ["module"]));
+  assert.ok(moduleRef && typeof moduleRef.$adobepyRef === "string");
+  const fnRef = result(await rpc(env, "premiere", "dom", "get", [moduleRef, "HostConstructor"]));
+  assert.ok(fnRef && typeof fnRef.$adobepyRef === "string");
+
+  // Own properties of a function receiver are legitimate host capabilities.
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "get", [fnRef, "nativeStatic"])), 7);
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "get", [fnRef, "name"])), "HostConstructor");
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "set", [fnRef, "dynamicOwn", 42])), 42);
+
+  // Prototype-chain escape hatches are denied at every dispatch read path.
+  for (const blocked of ["__proto__", "constructor", "prototype"]) {
+    assert.match(
+      error(await rpc(env, "premiere", "dom", "get", [fnRef, blocked])).message,
+      /not accessible/i,
+      `dom.get must reject ${blocked}`
+    );
+  }
+  for (const member of ["call", "apply", "bind"]) {
+    assert.strictEqual(
+      result(await rpc(env, "premiere", "dom", "get", [fnRef, member])),
+      null,
+      `dom.get must not expose Function.prototype.${member}`
+    );
+    assert.match(
+      error(await rpc(env, "premiere", "dom", "call", [fnRef, member, []])).message,
+      /not callable/i,
+      `dom.call must reject Function.prototype.${member}`
+    );
+    assert.match(
+      error(await rpc(env, "premiere", "dom", "construct", [fnRef, member, []])).message,
+      /not a constructor/i,
+      `dom.construct must reject Function.prototype.${member}`
+    );
+  }
+  assert.deepStrictEqual(
+    result(await rpc(env, "premiere", "dom", "snapshot", [fnRef, ["nativeStatic", "call", "apply", "bind"]])),
+    { nativeStatic: 7, call: null, apply: null, bind: null }
+  );
+  const fnKeys = result(await rpc(env, "premiere", "dom", "keys", [fnRef]));
+  assert.ok(fnKeys.includes("nativeStatic"));
+  for (const member of ["call", "apply", "bind"]) {
+    assert.ok(!fnKeys.includes(member), `dom.keys must not enumerate Function.prototype.${member}`);
+  }
+
+  // Object receivers still reach their host DOM prototype methods.
+  const instanceRef = result(await rpc(env, "premiere", "dom", "construct", [moduleRef, "HostConstructor", []]));
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "get", [instanceRef, "tag"])), "instance");
+  assert.strictEqual(
+    result(await rpc(env, "premiere", "dom", "call", [instanceRef, "hostMethod", ["ok"]])),
+    "host:ok:instance"
+  );
+}
+
 // Own-property boundary for the shared runtime member reader. Function receivers
 // must never expose the Function/Object prototype chain escapes.
 function testRuntimeMemberBoundary() {
@@ -1315,6 +1386,7 @@ async function main() {
   await testPremiereNativeReadQueries();
   await testPremiereAsyncNativeCollections();
   await testPremiereIdSerializationBoundaries();
+  await testDomDispatchMemberBoundary();
   testRuntimeMemberBoundary();
   console.log("UXP bridge protocol test passed");
 }
