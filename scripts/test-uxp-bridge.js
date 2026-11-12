@@ -1125,6 +1125,149 @@ async function testPremiereNativeReadQueries() {
   assert.strictEqual(overridden.socket.url, "wss://fixture.invalid/v1/bridge/premiere/ws");
 }
 
+// Native Premiere 25.6 collections are objects rather than arrays: the value can
+// be a Promise, its count can be asynchronous, and item access can be asynchronous.
+// Fixtures that only return arrays would make the "Premiere collection read" path
+// self-fulfilling and would not catch the reported regression.
+async function testPremiereAsyncNativeCollections() {
+  const guidValues = new WeakMap();
+  class Guid {
+    constructor(value) { guidValues.set(this, value); }
+    toString() { return guidValues.get(this); }
+  }
+  class ProjectItem {
+    constructor(id, name) { this.id = id; this.name = name; this.typename = "Clip"; }
+    getId() { return this.id; }
+    static cast(item) { return item instanceof ProjectItem ? item : undefined; }
+  }
+  class FolderItem {
+    static cast(item) { return item instanceof FolderItem ? item : undefined; }
+  }
+  class ClipProjectItem {
+    static cast() { return undefined; }
+  }
+
+  // Four native shapes: async count method with async at(), async count method
+  // with async getAt(), a Promise-valued count property, and a Promise-valued
+  // collection object. None is an array or a plain Promise<Array>.
+  function nativeCollection(items, shape) {
+    if (shape === "promise-value") {
+      return Promise.resolve({
+        async getNumItems() { return items.length; },
+        async at(index) { return items[index]; }
+      });
+    }
+    if (shape === "promise-count") {
+      return {
+        get numItems() { return Promise.resolve(items.length); },
+        async item(index) { return items[index]; }
+      };
+    }
+    if (shape === "count-method") {
+      return {
+        async getItemCount() { return items.length; },
+        async getAt(index) { return items[index]; }
+      };
+    }
+    return {
+      async getNumItems() { return items.length; },
+      async at(index) { return items[index]; }
+    };
+  }
+
+  for (const shape of ["async-count", "count-method", "promise-count", "promise-value"]) {
+    const clip = { id: "clip-native", name: "Native clip" };
+    const track = { id: "track-native", name: "V1", clips: nativeCollection([clip], shape) };
+    const sequence = {
+      guid: new Guid("sequence-async"), name: "Async sequence",
+      videoTracks: nativeCollection([track], shape),
+      audioTracks: nativeCollection([], shape)
+    };
+    const children = [new ProjectItem("child-a", "A"), new ProjectItem("child-b", "B")];
+    const rootItem = { name: "Root", getItems: async () => nativeCollection(children, shape) };
+    const project = {
+      guid: new Guid("project-async"), name: "async.prproj",
+      sequences: nativeCollection([sequence], shape),
+      getActiveSequence: async () => sequence,
+      getRootItem: async () => rootItem
+    };
+    class Project {
+      static async getActiveProject() { return project; }
+    }
+    const env = await loadBundle("bridges/uxp/premiere/dist/main.js", {
+      premierepro: { version: "25.6.0", Project, ProjectItem, FolderItem, ClipProjectItem }
+    });
+    const sequences = result(await rpc(env, "premiere", "project", "getSequences"));
+    assert.deepStrictEqual(sequences.map((value) => value.id), ["sequence-async"], `shape ${shape}: project sequences`);
+    const tracks = result(await rpc(env, "premiere", "sequence", "getVideoTracks", ["sequence-async"]));
+    assert.strictEqual(tracks.length, 1, `shape ${shape}: video tracks`);
+    assert.strictEqual(tracks[0].id, "track-native");
+    const clips = result(await rpc(env, "premiere", "track", "getClips", ["sequence-async", "video"]));
+    assert.strictEqual(clips.length, 1, `shape ${shape}: track clips`);
+    assert.strictEqual(clips[0].id, "clip-native");
+    const childItems = result(await rpc(env, "premiere", "projectItem", "getChildren"));
+    assert.deepStrictEqual(childItems.map((value) => value.id).sort(), ["child-a", "child-b"], `shape ${shape}: project item children`);
+  }
+}
+
+// serializeId() must isolate broken native IDs and never let an unserializable
+// value become the literal string "undefined" during sequence matching.
+async function testPremiereIdSerializationBoundaries() {
+  const throwingToString = { toString() { throw new Error("native toString failed"); } };
+  const asyncToString = { toString() { return Promise.resolve("async-id"); } };
+  const throwingGetter = {};
+  Object.defineProperty(throwingGetter, "toString", { get() { throw new Error("native getter failed"); } });
+  const plainObject = {};
+  for (const badId of [throwingToString, asyncToString, throwingGetter, plainObject]) {
+    const project = { guid: badId, name: "boundary.prproj" };
+    class Project { static async getActiveProject() { return project; } }
+    const env = await loadBundle("bridges/uxp/premiere/dist/main.js", {
+      premierepro: { version: "25.6.0", Project }
+    });
+    const active = result(await rpc(env, "premiere", "project", "getActive"));
+    assert.strictEqual(active.id, undefined, "a broken native ID must be isolated from the RPC boundary");
+    assert.strictEqual(active.guid, undefined);
+    assert.strictEqual(active.name, "boundary.prproj");
+  }
+
+  const badGuid = { toString() { return "[object Object]"; } };
+  const sequence = { guid: badGuid, name: "Real sequence", videoTracks: [], audioTracks: [] };
+  const project = { getActiveSequence: async () => sequence, sequences: [sequence] };
+  class Project { static async getActiveProject() { return project; } }
+  const env = await loadBundle("bridges/uxp/premiere/dist/main.js", {
+    premierepro: { version: "25.6.0", Project }
+  });
+  const rejected = error(await rpc(env, "premiere", "sequence", "getVideoTracks", ["undefined"]));
+  assert.strictEqual(rejected.code, -32004, "the string 'undefined' must not match an unserializable ID");
+}
+
+// Own-property boundary for the shared runtime member reader. Function receivers
+// must never expose the Function/Object prototype chain escapes.
+function testRuntimeMemberBoundary() {
+  const source = fs.readFileSync(path.join(root, "bridges/uxp/core/src/runtime.ts"), "utf8");
+  const { code } = require("esbuild").transformSync(source, { loader: "ts", format: "cjs", target: "es2020" });
+  const module = { exports: {} };
+  vm.runInNewContext(code, { module, exports: module.exports, require, console, globalThis: {} }, { filename: "runtime.ts" });
+  const { property, readMember, BLOCKED_MEMBERS } = module.exports;
+  assert.strictEqual(typeof readMember, "function", "a bounded readMember helper must be exported");
+  for (const blocked of ["__proto__", "constructor", "prototype"]) {
+    assert.ok(BLOCKED_MEMBERS.has(blocked), `${blocked} must be in the denylist`);
+    assert.strictEqual(property({}, blocked), undefined, `${blocked} must not be readable on objects`);
+  }
+  assert.strictEqual(property({ own: 1 }, "own"), 1);
+  const inherited = Object.create({ sharedMethod: 5 });
+  assert.strictEqual(property(inherited, "sharedMethod"), 5, "object receivers still reach prototype methods");
+  function hostConstructor() {}
+  hostConstructor.nativeStatic = 7;
+  assert.strictEqual(property(hostConstructor, "nativeStatic"), 7);
+  for (const blocked of ["constructor", "__proto__", "prototype", "call", "apply", "bind"]) {
+    assert.strictEqual(property(hostConstructor, blocked), undefined,
+      `function receiver must not expose ${blocked} from the prototype chain`);
+  }
+  assert.strictEqual(property(null, "x"), undefined);
+  assert.strictEqual(property("scalar", "length"), undefined);
+}
+
 function testManifestPermissions() {
   for (const host of ["photoshop", "indesign", "premiere"]) {
     const manifest = JSON.parse(fs.readFileSync(path.join(root, "bridges", "uxp", host, "manifest.json"), "utf8"));
@@ -1170,6 +1313,9 @@ async function main() {
   await testInDesignBridge();
   await testPremiereBridge();
   await testPremiereNativeReadQueries();
+  await testPremiereAsyncNativeCollections();
+  await testPremiereIdSerializationBoundaries();
+  testRuntimeMemberBoundary();
   console.log("UXP bridge protocol test passed");
 }
 

@@ -81,16 +81,41 @@ export function startCepBridge(config: CepConfig): void {
     };
     socket.onclose = () => config.onStatus?.(failed ? "error" : "disconnected");
     setTimeout(greet, 0);
+    const reportProtocolViolation = (reason: string): void => {
+      failed = true;
+      config.onStatus?.("error");
+      console.error(`[adobepy] ${reason}`);
+      try {
+        // Answer a bad frame through the shared BridgeError envelope instead of
+        // letting an uncaught exception escape the message handler.
+        socket.send(JSON.stringify({
+          type: "error",
+          error: {
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: ERROR_CODES.ERROR_PARSE, message: "Invalid bridge frame" }
+          }
+        }));
+      } catch {
+        // The transport may already be gone; the status is already failed.
+      }
+      if (typeof socket.close === "function") socket.close();
+    };
     socket.onmessage = (event: { data: string }) => {
-      let message;
+      let message: unknown;
       try {
         message = JSON.parse(event.data);
-      } catch (error) {
-        failed = true;
-        config.onStatus?.("error");
-        throw error;
+      } catch {
+        reportProtocolViolation("Invalid JSON frame from broker");
+        return;
       }
-      if (message.jsonrpc === "2.0" && message.error) {
+      if (!isBridgeEnvelope(message)) {
+        reportProtocolViolation("Invalid bridge frame from broker");
+        return;
+      }
+      // Broker rejections arrive either as a bare JSON-RPC error object or as
+      // the shared BridgeError envelope (type: "error"). Both must fail closed.
+      if (isBrokerError(message)) {
         failed = true;
         config.onStatus?.("error");
         return;
@@ -156,4 +181,12 @@ function boundedBootstrapNonce(value: unknown): string | undefined {
 
 function hostScriptError(id: string | number, error: any) {
   return { jsonrpc: "2.0", id, error: { code: ERROR_CODES.ERROR_HOST_SCRIPT, message: error?.message || String(error) } };
+}
+
+function isBridgeEnvelope(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isBrokerError(message: Record<string, unknown>): boolean {
+  return Boolean(message.error) && (message.type === "error" || message.jsonrpc === "2.0");
 }

@@ -1289,7 +1289,12 @@ class ClipProxy:
     @property
     def id_source(self) -> str | None:
         """ID provenance; derived locators may change after timeline edits."""
-        return self._payload.get("idSource")
+        # The canonical wire form is snake_case, but the UXP host and older
+        # brokers emit camelCase. Accept both so provenance is never lost.
+        payload = self._payload
+        if "idSource" in payload:
+            return payload.get("idSource")
+        return payload.get("id_source")
 
     @property
     def idSource(self) -> str | None:

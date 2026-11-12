@@ -1,5 +1,6 @@
 import type { HostAdapter } from "./host-adapter";
 import type { BridgeIdentityClaim, RpcRequest } from "./protocol";
+import { ERROR_CODES } from "./protocol";
 import { BridgeRpcError, ERROR_HOST_SCRIPT } from "./errors";
 import type { BridgeStatus } from "../../../shared/status";
 
@@ -62,16 +63,41 @@ export function connectBridge(
     }
     onStatus?.(failed ? "error" : "ready");
   });
+  const reportProtocolViolation = (reason: string): void => {
+    failed = true;
+    onStatus?.("error");
+    console.error(`[adobepy] ${reason}`);
+    try {
+      // Answer a bad frame through the shared BridgeError envelope instead of
+      // letting an uncaught exception escape the message handler.
+      socket.send(JSON.stringify({
+        type: "error",
+        error: {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: ERROR_CODES.ERROR_PARSE, message: "Invalid bridge frame" }
+        }
+      }));
+    } catch {
+      // The transport may already be gone; the status is already failed.
+    }
+    if (typeof socket.close === "function") socket.close();
+  };
   socket.addEventListener("message", async (event: { data: string }) => {
-    let message;
+    let message: unknown;
     try {
       message = JSON.parse(event.data);
-    } catch (error) {
-      failed = true;
-      onStatus?.("error");
-      throw error;
+    } catch {
+      reportProtocolViolation("Invalid JSON frame from broker");
+      return;
     }
-    if (message.jsonrpc === "2.0" && message.error) {
+    if (!isBridgeEnvelope(message)) {
+      reportProtocolViolation("Invalid bridge frame from broker");
+      return;
+    }
+    // Broker rejections arrive either as a bare JSON-RPC error object or as the
+    // shared BridgeError envelope (type: "error"). Both must fail closed.
+    if (isBrokerError(message)) {
       failed = true;
       onStatus?.("error");
       return;
@@ -85,6 +111,14 @@ export function connectBridge(
       socket.send(JSON.stringify({ type: "error", error: hostError(request.id, error) }));
     }
   });
+}
+
+function isBridgeEnvelope(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isBrokerError(message: Record<string, unknown>): boolean {
+  return Boolean(message.error) && (message.type === "error" || message.jsonrpc === "2.0");
 }
 
 function boundedBootstrapNonce(value: unknown): string | undefined {

@@ -1,10 +1,9 @@
 import { BridgeRpcError, ERROR_HOST_SCRIPT, methodNotFound } from "./errors";
 import type { RpcRequest } from "./protocol";
-import { asString, isObject, maybePromise, property } from "./runtime";
+import { BLOCKED_MEMBERS, asString, isObject, maybePromise, property } from "./runtime";
 
 const REFERENCE_KEY = "$adobepyRef";
 const TYPE_KEY = "$adobepyType";
-const BLOCKED_MEMBERS = new Set(["__proto__", "constructor", "prototype"]);
 
 type DomRootResolver = (name: string) => unknown;
 type DomMutationRunner = (
@@ -257,6 +256,12 @@ function domTypeName(value: unknown): string {
   if (!isObject(value)) return typeof value;
   const typename = asString(property(value, "typename")) ?? asString(property(value, "typeName"));
   if (typename) return typename;
-  const constructor = property<{ name?: unknown }>(value, "constructor");
-  return asString(constructor?.name) ?? "Object";
+  // Read the constructor name from the prototype directly: `constructor` is a
+  // blocked member for the generic property() reader.
+  try {
+    const prototype = Object.getPrototypeOf(value) as { constructor?: { name?: unknown } } | null;
+    return asString(prototype?.constructor?.name) ?? "Object";
+  } catch {
+    return "Object";
+  }
 }

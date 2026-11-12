@@ -105,9 +105,9 @@ async function activeProject() {
 async function projectSequences(project: unknown): Promise<unknown[]> {
   if (!project) return [];
   const getSequences = property<Callable>(project, "getSequences");
-  if (getSequences) return collectionItems(await maybePromise(getSequences.call(project)), true);
+  if (getSequences) return await collectionItems(await maybePromise(getSequences.call(project)), true);
   const sequences = property(project, "sequences") ?? property(project, "sequenceCollection");
-  return collectionItems(sequences, true);
+  return await collectionItems(sequences, true);
 }
 
 async function saveProject() {
@@ -202,6 +202,7 @@ async function requireSequence(idOrName: unknown) {
 function sequenceMatches(sequence: unknown, idOrName: unknown): boolean {
   if (!isObject(sequence)) return false;
   if (idOrName === undefined || idOrName === null) return true;
+  const target = String(idOrName);
   const values = [
     property(sequence, "id"),
     property(sequence, "guid"),
@@ -209,7 +210,18 @@ function sequenceMatches(sequence: unknown, idOrName: unknown): boolean {
     property(sequence, "sequenceID"),
     property(sequence, "name")
   ];
-  return values.some((value) => value !== undefined && String(serializeId(value)) === String(idOrName));
+  return values.some((value) => {
+    if (value === undefined || value === null) return false;
+    const serialized = serializeId(value);
+    // Never let an unserializable ID become the literal string "undefined" and
+    // accidentally match a caller that passed the string "undefined".
+    return serialized !== undefined && String(serialized) === target;
+  });
+}
+
+function isThenable(value: unknown): boolean {
+  return (isObject(value) || typeof value === "function")
+    && typeof (value as { then?: unknown }).then === "function";
 }
 
 function serializeProject(project: unknown) {
@@ -251,7 +263,7 @@ async function importFiles(request: RpcRequest) {
   const suppressUI = booleanValue(property(payload, "suppressUI") ?? property(payload, "suppress_ui")) ?? true;
   const asNumberedStills = booleanValue(property(payload, "asNumberedStills") ?? property(payload, "as_numbered_stills")) ?? false;
   const result = await maybePromise(importProjectFiles.call(project, filePaths, suppressUI, targetBin, asNumberedStills));
-  const resultItems = collectionItems(result);
+  const resultItems = await collectionItems(result);
   if (resultItems.length > 0) return serializeProjectItems(resultItems);
   return serializeProjectItems(await findImportedProjectItems(filePaths, targetBin ?? (await rootProjectItem(project))));
 }
@@ -268,10 +280,10 @@ async function selectedProjectItems() {
   const getSelection = property<Callable>(projectUtils, "getSelection");
   if (getSelection) {
     const selection = await maybePromise(getSelection.call(projectUtils, project));
-    return serializeProjectItems(collectionItems(await readValue(selection, "getItems") ?? selection, true));
+    return serializeProjectItems(await collectionItems((await readValue(selection, "getItems")) ?? selection, true));
   }
   const selection = property(project, "selection") ?? property(premiere, "selection");
-  return serializeProjectItems(collectionItems(selection, true));
+  return serializeProjectItems(await collectionItems(selection, true));
 }
 
 async function projectItemsByMediaPath(request: RpcRequest) {
@@ -280,7 +292,7 @@ async function projectItemsByMediaPath(request: RpcRequest) {
   const ignoreSubclips = booleanValue(request.args?.[2]) ?? false;
   if (!matchString) unavailable("Premiere media path match");
   const directFind = property<Callable>(root, "findItemsMatchingMediaPath");
-  if (directFind) return serializeProjectItems(collectionItems(await maybePromise(directFind.call(root, matchString, ignoreSubclips))));
+  if (directFind) return serializeProjectItems(await collectionItems(await maybePromise(directFind.call(root, matchString, ignoreSubclips))));
   if (ignoreSubclips) unavailable("Premiere media path search excluding subclips");
   return serializeProjectItems(await findProjectItemsMatchingMediaPath(root, matchString));
 }
@@ -357,7 +369,7 @@ async function sequenceTracks(sequence: unknown, mediaType: "video" | "audio"): 
     return tracks;
   }
   const propertyName = mediaType === "video" ? "videoTracks" : "audioTracks";
-  return collectionItems(property(sequence, propertyName), true);
+  return await collectionItems(property(sequence, propertyName), true);
 }
 
 async function serializeTracks(tracks: unknown[], mediaType: "video" | "audio") {
@@ -427,9 +439,9 @@ async function trackClipObjects(track: unknown) {
     const constants = property(premiereModule(), "Constants") ?? property(premiereModule(), "constants");
     const clipType = property(property(constants, "TrackItemType"), "CLIP");
     if (clipType === undefined) unavailable("Premiere TrackItemType.CLIP");
-    return collectionItems(await maybePromise(getTrackItems.call(track, clipType, false)), true);
+    return await collectionItems(await maybePromise(getTrackItems.call(track, clipType, false)), true);
   }
-  return collectionItems(property(track, "clips"), true);
+  return await collectionItems(property(track, "clips"), true);
 }
 
 async function serializeClip(clip: unknown, sequence: unknown, mediaType: "video" | "audio", trackIndex: number, clipIndex: number) {
@@ -463,8 +475,8 @@ async function serializeClip(clip: unknown, sequence: unknown, mediaType: "video
 async function sequenceMarkers(sequence: unknown) {
   const markers = property(sequence, "markers") ?? property(sequence, "markerCollection");
   const getMarkers = property<Callable>(markers, "getMarkers") ?? property<Callable>(sequence, "getMarkers");
-  if (getMarkers) return collectionItems(await maybePromise(getMarkers.call(markers ?? sequence))).map(serializeMarker).filter((marker) => marker !== null);
-  return markerItems(markers).map(serializeMarker).filter((marker) => marker !== null);
+  if (getMarkers) return (await collectionItems(await maybePromise(getMarkers.call(markers ?? sequence)))).map(serializeMarker).filter((marker) => marker !== null);
+  return (await markerItems(markers)).map(serializeMarker).filter((marker) => marker !== null);
 }
 
 async function createMarker(request: RpcRequest) {
@@ -492,8 +504,8 @@ function applyMarkerPayload(marker: Record<string, unknown>, payload: Record<str
   }
 }
 
-function markerItems(markers: unknown): unknown[] {
-  const direct = collectionItems(markers);
+async function markerItems(markers: unknown): Promise<unknown[]> {
+  const direct = await collectionItems(markers);
   if (direct.length > 0) return direct;
   const getFirstMarker = property<Callable>(markers, "getFirstMarker");
   const getNextMarker = property<Callable>(markers, "getNextMarker");
@@ -557,7 +569,7 @@ async function encoderPresets() {
   const manager = await encoderManager();
   const getPresets = property<Callable>(manager, "getPresets") ?? property<Callable>(manager, "getPresetList");
   const rawPresets = getPresets ? await maybePromise(getPresets.call(manager)) : property(manager, "presets");
-  return collectionItems(rawPresets).map(serializeEncoderPreset);
+  return (await collectionItems(rawPresets)).map(serializeEncoderPreset);
 }
 
 async function getExportFileExtension(request: RpcRequest) {
@@ -825,12 +837,12 @@ async function castProjectItem(item: unknown, type: string) {
 async function projectItemChildObjects(item: unknown): Promise<unknown[]> {
   if (!isObject(item)) unavailable("Premiere project item object");
   const direct = await readValue(item, "getItems", "getChildren", "children", "items");
-  if (direct !== undefined && direct !== null) return collectionItems(direct, true);
+  if (direct !== undefined && direct !== null) return await collectionItems(direct, true);
   const folder = await castProjectItem(item, "FolderItem");
   if (folder) {
     const getItems = property<Callable>(folder, "getItems");
     if (!getItems) unavailable("Premiere FolderItem.getItems");
-    return collectionItems(await maybePromise(getItems.call(folder)), true);
+    return await collectionItems(await maybePromise(getItems.call(folder)), true);
   }
   const clip = await castProjectItem(item, "ClipProjectItem");
   if (clip || await projectItemMediaPath(item) !== undefined || /clip|sequence/i.test(asString(property(item, "typename")) ?? asString(property(item, "itemType")) ?? "")) return [];
@@ -913,10 +925,26 @@ async function readValue(receiver: unknown, ...names: string[]): Promise<unknown
 
 function serializeId(value: unknown): string | number | undefined {
   if (typeof value === "string" || typeof value === "number") return value;
-  const toString = property<Callable>(value, "toString");
-  if (!toString || toString === Object.prototype.toString) return undefined;
-  const converted = toString.call(value);
-  return typeof converted === "string" && converted !== "[object Object]" ? converted : undefined;
+  if (value === undefined || value === null) return undefined;
+  try {
+    const toString = property<Callable>(value, "toString");
+    if (typeof toString !== "function" || toString === Object.prototype.toString) return undefined;
+    const converted = toString.call(value);
+    // A native toString may return a Promise/thenable. An ID must be a scalar,
+    // so drop it and swallow a possible rejection instead of leaking an
+    // unhandled error into the RPC boundary.
+    if (isThenable(converted)) {
+      Promise.resolve(converted).catch(() => undefined);
+      return undefined;
+    }
+    return typeof converted === "string" && converted.length > 0 && converted !== "[object Object]"
+      ? converted
+      : undefined;
+  } catch {
+    // ID is optional metadata. A throwing getter/toString on a native object
+    // must be isolated rather than surfacing as an RPC error.
+    return undefined;
+  }
 }
 
 function validateCollectionCount(count: unknown): asserts count is number {
@@ -924,21 +952,31 @@ function validateCollectionCount(count: unknown): asserts count is number {
   if (count > COLLECTION_LIMIT) unavailable(`Premiere collection limit ${COLLECTION_LIMIT}`);
 }
 
-function collectionItems(value: unknown, required = false): unknown[] {
+/**
+ * Normalize a native Premiere collection into an array. UXP 25.6 collections
+ * may be Promise/thenable values with asynchronous counts and asynchronous item
+ * accessors, so the whole read path is awaited instead of treating a missing
+ * synchronous `numItems` as "collection read unavailable".
+ */
+async function collectionItems(value: unknown, required = false): Promise<unknown[]> {
+  return collectItems(await maybePromise(value), required);
+}
+
+async function collectItems(value: unknown, required: boolean): Promise<unknown[]> {
   if (Array.isArray(value)) {
     validateCollectionCount(value.length);
     return value;
   }
   const iterator = isObject(value) ? (value as unknown as Iterable<unknown>)[Symbol.iterator] : undefined;
-  if (iterator) {
-    const result = [];
+  if (typeof iterator === "function") {
+    const result: unknown[] = [];
     for (const item of value as Iterable<unknown>) {
       result.push(item);
       validateCollectionCount(result.length);
     }
     return result;
   }
-  const count = asNumber(property(value, "numItems")) ?? asNumber(property(value, "numTracks")) ?? asNumber(property(value, "numMarkers")) ?? asNumber(property(value, "length"));
+  const count = await readCollectionCount(value);
   if (count === undefined) {
     if (required) unavailable("Premiere collection read");
     return [];
@@ -947,11 +985,38 @@ function collectionItems(value: unknown, required = false): unknown[] {
   const at = property<Callable>(value, "at") ?? property<Callable>(value, "getAt") ?? property<Callable>(value, "item");
   const result: unknown[] = [];
   for (let index = 0; index < count; index += 1) {
-    const item = at ? at.call(value, index) : property(value, String(index));
+    const item = await maybePromise(at ? at.call(value, index) : property(value, String(index)));
     if ((item === undefined || item === null) && required) unavailable(`Premiere collection item ${index}`);
     if (item !== undefined && item !== null) result.push(item);
   }
   return result;
+}
+
+async function readCollectionCount(value: unknown): Promise<number | undefined> {
+  const countNames = ["numItems", "numTracks", "numMarkers", "length"];
+  const methodNames = ["getNumItems", "getNumTracks", "getNumMarkers", "getItemCount", "getCount", "getLength"];
+  try {
+    for (const name of countNames) {
+      const raw = property(value, name);
+      if (raw === undefined || raw === null) continue;
+      const resolved = typeof raw === "function"
+        ? await maybePromise(raw.call(value))
+        : await maybePromise(raw);
+      const count = asNumber(resolved);
+      if (count !== undefined) return count;
+    }
+    for (const name of methodNames) {
+      const method = property<Callable>(value, name);
+      if (typeof method !== "function") continue;
+      const count = asNumber(await maybePromise(method.call(value)));
+      if (count !== undefined) return count;
+    }
+  } catch {
+    // A rejecting/throw-ing native count getter is not a synchronously readable
+    // collection; do not turn it into an unhandled RPC error.
+    return undefined;
+  }
+  return undefined;
 }
 
 function normalizeMediaType(value: unknown): "video" | "audio" {

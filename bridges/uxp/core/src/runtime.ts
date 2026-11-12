@@ -44,9 +44,32 @@ export function asNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * Members that must never be reachable through a host object read. They are the
+ * JavaScript prototype-chain escape hatches, not Adobe DOM capabilities.
+ */
+export const BLOCKED_MEMBERS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
+
+/**
+ * Bounded member access for native/host objects. The prototype chain is not a
+ * capability surface: blocked names are denied for every receiver, and function
+ * receivers are limited to their own properties so `Function.prototype` (and
+ * from there `Function`/`Object` constructors) cannot be traversed. Regular
+ * object receivers still reach prototype methods, which the UXP DOM legitimately
+ * exposes.
+ */
+export function readMember<T = unknown>(value: unknown, name: string | number): T | undefined {
+  if ((!isObject(value) && typeof value !== "function") || BLOCKED_MEMBERS.has(String(name))) {
+    return undefined;
+  }
+  if (typeof value === "function" && !Object.prototype.hasOwnProperty.call(value, name)) {
+    return undefined;
+  }
+  return (value as HostObject)[name as string] as T | undefined;
+}
+
 export function property<T = unknown>(value: unknown, name: string): T | undefined {
-  if (!isObject(value) && typeof value !== "function") return undefined;
-  return (value as HostObject)[name] as T | undefined;
+  return readMember<T>(value, name);
 }
 
 export async function maybePromise<T>(value: T | Promise<T>): Promise<T> {

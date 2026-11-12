@@ -18,12 +18,14 @@ async function loadPanel(host, options = {}) {
     constructor() {
       this.readyState = 0;
       this.listeners = {};
+      this.closed = false;
       sockets.push(this);
     }
     addEventListener(name, listener) {
       (this.listeners[name] ||= []).push(listener);
     }
     send(payload) { sent.push(JSON.parse(payload)); }
+    close() { this.closed = true; this.readyState = 3; }
     async emit(name, event = {}) {
       if (name === "open") this.readyState = 1;
       if (name === "close") this.readyState = 3;
@@ -89,12 +91,28 @@ async function main() {
     if (host === "after-effects") assert.match(missingToken.startupError.message, /ADOBEPY_TOKEN is missing/);
     else assert.ok(missingToken.errors.some((message) => message.includes("ADOBEPY_TOKEN is missing")));
 
-    for (const event of ["error", "rejection", "malformed"]) {
+    for (const event of ["error", "rejection", "malformed", "invalid-envelope", "envelope-error"]) {
       const failed = await loadPanel(host);
       await failed.sockets[0].emit("open");
       if (event === "error") await failed.sockets[0].emit("error", { message: "PRIVATE_ERROR" });
-      else if (event === "malformed") await assert.rejects(failed.sockets[0].emit("message", { data: "{" }), { name: "SyntaxError" });
-      else await failed.sockets[0].emit("message", { data: JSON.stringify({
+      else if (event === "malformed") {
+        // A bad frame must be adjudicated, not thrown out of the message handler.
+        await failed.sockets[0].emit("message", { data: "{" });
+        assert.strictEqual(failed.sent.length, 2, "a malformed frame must be answered, not thrown");
+        assert.strictEqual(failed.sent[1].type, "error", "use the shared BridgeError envelope");
+        assert.strictEqual(failed.sent[1].error.error.code, -32700);
+        assert.ok(failed.sockets[0].closed, "a malformed frame must close the transport safely");
+      } else if (event === "invalid-envelope") {
+        await failed.sockets[0].emit("message", { data: "[]" });
+        assert.strictEqual(failed.sent[1].type, "error", "non-object frames are protocol violations");
+        assert.strictEqual(failed.sent[1].error.error.code, -32700);
+        assert.ok(failed.sockets[0].closed);
+      } else if (event === "envelope-error") {
+        // The same protocol's BridgeError envelope must fail the status closed.
+        await failed.sockets[0].emit("message", { data: JSON.stringify({
+          type: "error", error: { jsonrpc: "2.0", id: "broker-reject", error: { code: -32009, message: "PRIVATE_ERROR" } }
+        }) });
+      } else await failed.sockets[0].emit("message", { data: JSON.stringify({
         jsonrpc: "2.0", error: { code: -32009, message: "PRIVATE_ERROR" }
       }) });
       await failed.sockets[0].emit("close", { reason: "PRIVATE_ERROR" });
