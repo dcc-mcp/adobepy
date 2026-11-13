@@ -214,6 +214,14 @@ def _real_native_pwsh_step(
     ever assigned: each exit is produced by an actual child process.
     """
 
+    executable = pathlib.PureWindowsPath(sys.executable)
+    if sys.platform == "win32" and (
+        not executable.is_absolute()
+        or executable.suffix.lower() != ".exe"
+        or not pathlib.Path(sys.executable).is_file()
+    ):
+        raise RuntimeError("PowerShell native fixtures require an existing absolute Python .exe; select python.exe explicitly")
+
     script = "\n".join(
         [
             "$ErrorActionPreference = 'stop'",
@@ -237,6 +245,31 @@ def _real_native_pwsh_step(
 
 
 class CiFailPropagationTests(unittest.TestCase):
+    def test_native_pwsh_step_rejects_unsafe_interpreters_before_writing_or_spawning(self) -> None:
+        for executable, exists in (
+            ("C:/Program Files/Git/usr/bin/python", True),
+            ("python.exe", True),
+            ("C:/missing/python.exe", False),
+        ):
+            with self.subTest(executable=executable), tempfile.TemporaryDirectory() as tmp_dir:
+                tmp = pathlib.Path(tmp_dir)
+                with mock.patch.object(sys, "platform", "win32"), mock.patch.object(sys, "executable", executable), mock.patch.object(pathlib.Path, "is_file", return_value=exists), mock.patch.object(subprocess, "run") as run:
+                    with self.assertRaisesRegex(RuntimeError, "select python.exe explicitly"):
+                        _real_native_pwsh_step("pwsh.exe", ["exit 0"], tmp)
+                    run.assert_not_called()
+                self.assertEqual(list(tmp.iterdir()), [])
+
+    def test_native_pwsh_step_accepts_absolute_exe_without_launching_a_process(self) -> None:
+        executable = "C:/Python Tools/Python.EXE"
+        completed = subprocess.CompletedProcess([], 0, "fixture", "")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = pathlib.Path(tmp_dir)
+            with mock.patch.object(sys, "platform", "win32"), mock.patch.object(sys, "executable", executable), mock.patch.object(pathlib.Path, "is_file", return_value=True), mock.patch.object(subprocess, "run", return_value=completed) as run:
+                result = _real_native_pwsh_step("pwsh.exe", [f"& {_ps_quote(sys.executable)} -c 'pass'"], tmp)
+            self.assertIs(result, completed)
+            self.assertIn(f"& {_ps_quote(executable)} -c 'pass'", (tmp / "step.ps1").read_text(encoding="utf-8"))
+            self.assertEqual(run.call_args.args[0], ["pwsh.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(tmp / "step.ps1")])
+
     def test_distribution_commands_are_single_command_steps(self) -> None:
         text = CI_FILE.read_text(encoding="utf-8")
         inline = _inline_run_commands(text)
