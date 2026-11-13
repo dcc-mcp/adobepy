@@ -1268,18 +1268,15 @@ impl BrokerState {
             };
             if !inserted {
                 transaction.revoke();
-                // The reservation can be gone because the request deadline
-                // expired. The caller's deadline is the stronger signal, so
-                // report the timeout instead of an identity error that would
-                // only describe the recovery the deadline caused.
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(bootstrap_timeout_error(&request, "prepare"));
-                }
                 let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
                 let _ = self
                     .bootstrap_blocking
                     .execute_cleanup(cleanup_deadline, move || transaction.rollback())
                     .await;
+                // A timeout must preserve cleanup of the unclaimed transaction.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(bootstrap_timeout_error(&request, "prepare"));
+                }
                 return Err(identity_error(
                     ERROR_IDENTITY_STALE,
                     "Photoshop bootstrap reservation was cancelled",
@@ -1372,20 +1369,15 @@ impl BrokerState {
                 }
             };
             if !inserted_launch {
-                // A reservation can vanish because the request deadline expired
-                // and recovery already discarded the grant. The caller's own
-                // deadline is the stronger signal: report the timeout rather
-                // than an identity error, so a slow launch is never reported
-                // as a stale identity.
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(bootstrap_timeout_error(&request, "launch"));
-                }
                 let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
                 let _ = launched
                     .take()
                     .expect("unclaimed launched host is present")
                     .terminate_and_reap(cleanup_deadline)
                     .await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(bootstrap_timeout_error(&request, "launch"));
+                }
                 return Err(identity_error(
                     ERROR_IDENTITY_STALE,
                     "Photoshop bootstrap reservation was cancelled",
@@ -1711,17 +1703,14 @@ impl BrokerState {
             };
             if !inserted {
                 transaction.revoke();
-                // The caller's deadline is the stronger signal: if it expired,
-                // report the timeout rather than an identity error describing
-                // the recovery the deadline itself triggered.
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(illustrator_bootstrap_timeout_error(&request, "prepare"));
-                }
                 let cleanup_deadline = tokio::time::Instant::now() + Duration::from_millis(175);
                 let _ = self
                     .bootstrap_blocking
                     .execute_cleanup(cleanup_deadline, move || transaction.rollback())
                     .await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(illustrator_bootstrap_timeout_error(&request, "prepare"));
+                }
                 return Err(identity_error(
                     ERROR_IDENTITY_STALE,
                     "Illustrator bootstrap reservation was cancelled",
@@ -4585,6 +4574,7 @@ mod tests {
         prepare_delay_ms: AtomicU64,
         prepare_fails: AtomicBool,
         prepare_panics: AtomicBool,
+        transaction_gate: std::sync::Mutex<Option<FakePhaseGate>>,
         activate_delay_ms: Arc<AtomicU64>,
         launches: AtomicUsize,
         launch_delay_ms: AtomicU64,
@@ -4802,6 +4792,9 @@ mod tests {
             &self,
             prepared: PreparedBootstrap,
         ) -> anyhow::Result<Arc<dyn PhotoshopBootstrapTransaction>> {
+            if let Some(gate) = self.transaction_gate.lock().unwrap().clone() {
+                gate.enter_and_wait();
+            }
             Ok(Arc::new(FakeBootstrapTransaction {
                 module_sha256: prepared.module_sha256,
                 cancelled: AtomicBool::new(false),
@@ -6970,6 +6963,68 @@ mod tests {
         assert_eq!(backend.terminations.load(Ordering::SeqCst), 1);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
         assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_missing_reservation_still_rolls_back_owned_transaction() {
+        for illustrator in [false, true] {
+            let backend = FakeBootstrapBackend::ready();
+            let (gate, mut entered) = FakePhaseGate::new();
+            *backend.transaction_gate.lock().unwrap() = Some(gate.clone());
+            let state = if illustrator {
+                illustrator_bootstrap_state(backend.clone())
+            } else {
+                bootstrap_state(backend.clone())
+            };
+            let expires = tokio::time::Instant::now() + Duration::from_millis(1_100);
+            let task = tokio::spawn({
+                let state = state.clone();
+                async move {
+                    if illustrator {
+                        state
+                            .bootstrap_illustrator(illustrator_bootstrap_request(1_000))
+                            .await
+                            .unwrap_err()
+                    } else {
+                        state
+                            .bootstrap_photoshop(bootstrap_request(1_000))
+                            .await
+                            .unwrap_err()
+                    }
+                }
+            });
+            while !*entered.borrow() {
+                entered.changed().await.unwrap();
+            }
+            let mut grants = state.bootstrap_grants.lock().await;
+            grants.clear();
+            gate.release().await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state
+                    .bootstrap_blocking
+                    .active_workers
+                    .load(Ordering::SeqCst)
+                    != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("ownership worker must finish before its insertion is released");
+            tokio::time::sleep_until(expires).await;
+            drop(grants);
+            let error = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(error.error.code, ERROR_TIMEOUT);
+            assert_eq!(
+                backend.rollbacks.load(Ordering::SeqCst),
+                1,
+                "illustrator={illustrator}"
+            );
+            assert_eq!(backend.launches.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

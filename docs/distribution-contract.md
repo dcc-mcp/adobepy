@@ -178,10 +178,10 @@ named `adobepy-windows-x64`.
    - `standalone-package`: builds the macOS arm64 and Linux x86_64 standalone
      interpreters and uploads them to the same release.
 
-`release-please.yml` is the only workflow that publishes to a release tag.
-`release.yml` is the manual rebuild path (`workflow_dispatch` with an explicit
-`release_tag`); it has no macOS or Linux standalone jobs, so those assets have
-one publishing owner.
+`release-please.yml` is the sole publisher of the macOS and Linux standalone
+assets. `release.yml` is the manual rebuild path (`workflow_dispatch` with an
+explicit `release_tag`); it can upload Windows assets to that release, and has
+no macOS or Linux standalone jobs.
 
 ### Version scheme
 
@@ -221,8 +221,8 @@ bundle.
 Built by the `standalone-package` matrix in `release-please.yml`, on
 `macos-latest` and `ubuntu-latest` respectively. Each leg builds the wheel, runs
 `pyoxidizer build`, asserts the runner architecture, packages the `install`
-directory as a zip plus sha256, and then smoke-tests the unpacked interpreter
-before uploading.
+directory as a zip plus sha256, and then smoke-tests the interpreter in the
+build directory before uploading. The archive is not extracted for this smoke.
 
 The smoke test runs:
 
