@@ -1,10 +1,11 @@
 import type { BridgeIdentityClaim, HostIdentityClaim } from "../../core/src/protocol";
+import { cepSystemPath } from "../../core/src/system-path";
 
 let bridgeInstanceId: string | undefined;
 
 export async function illustratorRuntimeIdentity(): Promise<BridgeIdentityClaim> {
   const cep = (globalThis as any).__adobe_cep__;
-  const pluginRoot = absolutePath(cep?.getSystemPath?.("extension"));
+  const pluginRoot = absolutePath(cepSystemPath(cep?.getSystemPath?.("extension")));
   const hostVersion = await illustratorHostVersion(cep);
   const instanceId = runtimeInstanceId();
   return {

@@ -73,7 +73,7 @@ async function rpc(env, host, namespace, method, args = [], options = {}) {
 }
 
 function result(message) {
-  assert.strictEqual(message.type, "response");
+  assert.strictEqual(message.type, "response", JSON.stringify(message));
   return message.response.result;
 }
 
@@ -791,7 +791,9 @@ async function testPremiereBridge() {
         }
       },
       Exporter: exporter,
+      ClipProjectItem: { cast: (item) => item.typename === "ClipProjectItem" ? item : undefined },
       TickTime: {
+        TIME_INVALID: { seconds: -1 },
         createWithSeconds(seconds) {
           return { seconds };
         },
@@ -1349,6 +1351,7 @@ function testManifestPermissions() {
     );
     if (host === "photoshop") assert.strictEqual(manifest.requiredPermissions.localFileSystem, "fullAccess");
     if (host === "premiere") assert.strictEqual(manifest.host.app, "premierepro");
+    assert.ok(manifest.entrypoints.some((entry) => entry.type === "panel"), `${host} must declare an invokable panel`);
   }
 }
 
@@ -1375,11 +1378,16 @@ async function emitPhotoshopGeneratedConfigHello() {
 }
 
 async function main() {
+  if (process.argv[2] === "--review-regressions") {
+    await testNativeReviewRegressions();
+    return;
+  }
   if (process.argv[2] === "--photoshop-generated-config-hello") {
     await emitPhotoshopGeneratedConfigHello();
     return;
   }
   testManifestPermissions();
+  await testNativeReviewRegressions();
   await testPhotoshopBridge();
   await testInDesignBridge();
   await testPremiereBridge();
@@ -1389,6 +1397,164 @@ async function main() {
   await testDomDispatchMemberBoundary();
   testRuntimeMemberBoundary();
   console.log("UXP bridge protocol test passed");
+}
+
+async function testNativeReviewRegressions() {
+  class TickTime {
+    constructor(seconds, ticks) { this.seconds = seconds; this.ticks = ticks; }
+    static createWithSeconds(seconds) { return new TickTime(seconds); }
+    static createWithTicks(ticks) { return new TickTime(undefined, ticks); }
+    subtract(other) { return TickTime.createWithSeconds(this.seconds - other.seconds); }
+  }
+  TickTime.TIME_INVALID = new TickTime(-1);
+  const media = { id: "media", name: "shot.mov" };
+  const parent = { id: "parent", name: "Dailies" };
+  const rootItem = { id: "root", name: "Root" };
+  const clip = { getMediaFilePath: () => "C:/a/shot.mov" };
+  const folderChildren = new Map([[rootItem, [parent]], [parent, [media]]]);
+  const clips = new Map([[media, clip]]);
+  let mutationsSucceed = true;
+  const markerList = [];
+  const nativeMarker = (name, markerType, start, duration, comments) => ({
+    getName: () => name, getType: () => markerType, getStart: () => start,
+    getDuration: () => duration, getComments: () => comments
+  });
+  const markers = {
+    getMarkers: () => markerList,
+    createAddMarkerAction(name, type, start, duration, comments) {
+      assert.ok(start instanceof TickTime && duration instanceof TickTime);
+      return () => markerList.push(nativeMarker(name, type, start, duration, comments));
+    }
+  };
+  const folders = new Map(Array.from(folderChildren, ([item, children]) => [item, {
+    getItems: () => children,
+    createBinAction: (name) => () => {
+      const created = { id: `new-${children.length}`, name };
+      children.push(created);
+      folders.set(created, { getItems: () => [] });
+    }
+  }]));
+  const sequence = { id: "seq", name: "Sequence" };
+  const project = {
+    getRootItem: () => rootItem, getActiveSequence: () => sequence,
+    getSequences: () => [sequence], save: () => mutationsSucceed, saveAs: () => mutationsSucceed,
+    lockedAccess(callback) { callback(); },
+    executeTransaction(callback) {
+      if (!mutationsSucceed) return false;
+      const actions = [];
+      callback({ addAction: (action) => actions.push(action) });
+      actions.forEach((action) => action());
+      return true;
+    },
+    importFiles(paths) {
+      if (!mutationsSucceed) return false;
+      for (const path of paths) {
+        const item = { id: `import-${path}`, name: path.split("/").pop() };
+        folderChildren.get(parent).push(item);
+        clips.set(item, { getMediaFilePath: () => path });
+      }
+      return true;
+    }
+  };
+  const encoded = [];
+  const modules = {
+    premierepro: {
+      version: "25.6.0", Project: { getActiveProject: () => project }, TickTime,
+      FolderItem: { cast: (item) => folders.get(item) },
+      ClipProjectItem: { cast: (item) => clips.get(item) },
+      Markers: { getMarkers: (owner) => { assert.strictEqual(owner, sequence); return markers; } },
+      Marker: { MARKER_TYPE_COMMENT: "Comment" },
+      SequenceEditor: { getEditor: () => ({
+        createInsertProjectItemAction: (item, time) => { assert.ok(time instanceof TickTime); return () => {}; },
+        createOverwriteItemAction: () => () => {}
+      }) },
+      EncoderManager: { getManager: () => ({
+        encodeFile: (...args) => { encoded.push(args); assert.ok(args[3] instanceof TickTime && args[4] instanceof TickTime); return true; },
+        encodeProjectItem: (item) => { assert.strictEqual(item, clip); return true; }
+      }) },
+      Exporter: { exportSequenceFrame: (seq, time) => { assert.ok(time instanceof TickTime); return true; } }
+    },
+    uxp: { host: { version: "25.6.0" } }
+  };
+  const env = await loadBundle("bridges/uxp/premiere/dist/main.js", modules);
+  const failures = [];
+  async function check(name, callback) {
+    try { await callback(); } catch (err) { failures.push(`${name}: ${err.message}`); }
+  }
+  for (const [namespace, method, args] of [
+    ["project", "save", []], ["project", "saveAs", ["C:/out.prproj"]],
+    ["project", "importFiles", [{ filePaths: ["C:/a/shot.mov"] }]],
+    ["sequence", "insertProjectItem", ["seq", { projectItem: "media", time: 1 }]],
+    ["sequence", "overwriteProjectItem", ["seq", { projectItem: "media", time: 1 }]],
+    ["bin", "create", [{ parentId: "parent", name: "Rejected" }]],
+    ["marker", "create", ["seq", { name: "Rejected" }]]
+  ]) {
+    await check(`${namespace}.${method} false result`, async () => {
+      mutationsSucceed = false;
+      assert.strictEqual(error(await rpc(env, "premiere", namespace, method, args)).code, -32004);
+      mutationsSucceed = true;
+    });
+    mutationsSucceed = true;
+  }
+  await check("native time factories", async () => {
+    result(await rpc(env, "premiere", "sequence", "insertProjectItem", ["seq", { projectItem: "media", time: { ticks: "254016000000" } }]));
+    result(await rpc(env, "premiere", "export", "exportFrame", [{ sequence: "seq", outputPath: "C:/out.png", time: 1 }]));
+    result(await rpc(env, "premiere", "encoder", "encodeFile", [{ sourcePath: "C:/in.mov", outputPath: "C:/out.mov" }]));
+    assert.strictEqual(encoded[0][4], TickTime.TIME_INVALID);
+  });
+  await check("FolderItem and new direct child", async () => {
+    const created = result(await rpc(env, "premiere", "bin", "create", [{ parentId: "parent", name: "Dailies" }]));
+    assert.strictEqual(created.name, "Dailies");
+    assert.notStrictEqual(created.id, parent.id);
+  });
+  await check("exact imported path", async () => {
+    const imported = result(await rpc(env, "premiere", "project", "importFiles", [{ filePaths: ["C:/b/shot.mov"], targetBin: "parent" }]));
+    assert.strictEqual(imported[0].mediaPath, "C:/b/shot.mov");
+    const importFiles = project.importFiles;
+    project.importFiles = () => true;
+    const unknown = { id: "unknown-path", name: "unknown.mov", typename: "ClipProjectItem" };
+    folderChildren.get(parent).push(unknown);
+    clips.set(unknown, { getMediaFilePath: () => undefined });
+    assert.deepStrictEqual(result(await rpc(env, "premiere", "project", "importFiles", [{ filePaths: ["C:/b/unknown.mov"], targetBin: "parent" }])), []);
+    project.importFiles = importFiles;
+  });
+  await check("ClipProjectItem encoder cast", async () => {
+    result(await rpc(env, "premiere", "encoder", "encodeProjectItem", [{ projectItemId: "media", outputPath: "C:/out.mov" }]));
+    assert.strictEqual(error(await rpc(env, "premiere", "encoder", "encodeProjectItem", [{ projectItemId: "parent", outputPath: "C:/out.mov" }])).code, -32004);
+  });
+  await check("native marker transaction and reads", async () => {
+    const created = result(await rpc(env, "premiere", "marker", "create", ["seq", { name: "Review", start: 2, duration: 1, comments: "check" }]));
+    assert.strictEqual(created.name, "Review");
+    const listed = result(await rpc(env, "premiere", "marker", "getMarkers", ["seq"]));
+    assert.strictEqual(listed[0].comments, "check");
+    assert.strictEqual(listed[0].start, 2);
+    const second = result(await rpc(env, "premiere", "marker", "create", ["seq", { name: "Until", start: 2, end: 5 }]));
+    assert.strictEqual(second.duration, 3);
+  });
+  const activeLayer = { id: 1, name: "User layer" };
+  const requestedLayer = { id: 7, name: "Requested" };
+  const owner = { id: 9, layers: [requestedLayer], activeLayers: [requestedLayer] };
+  const app = { activeDocument: { id: 2, layers: [activeLayer], activeLayers: [activeLayer] }, documents: [owner] };
+  app.documents.unshift(app.activeDocument);
+  let pickerCalls = 0;
+  const commands = [];
+  const ps = await loadBundle("bridges/uxp/photoshop/dist/main.js", {
+    photoshop: { app, action: { batchPlay: async (descriptors) => { commands.push(...descriptors); return []; } } },
+    uxp: { storage: { localFileSystem: {
+      getEntryWithUrl: async () => { throw new Error("requested path missing"); },
+      getFileForOpening: async () => { pickerCalls++; return {}; }, createSessionToken: () => "unexpected"
+    } } }
+  });
+  await check("smart object owning document", async () => {
+    assert.strictEqual(result(await rpc(ps, "photoshop", "smartObject", "editContents", [7])).id, 7);
+    for (const command of commands) assert.ok(command._target.some((target) => target._ref === "document" && target._id === owner.id));
+  });
+  await check("explicit path must never invoke picker", async () => {
+    assert.match(error(await rpc(ps, "photoshop", "smartObject", "replaceContents", [7, "C:/missing.psb"])).message, /requested path missing/);
+    assert.strictEqual(pickerCalls, 0);
+  });
+  assert.deepStrictEqual(failures, [], failures.join("\n"));
+  console.log("Native contract review regressions passed");
 }
 
 main().catch((error) => {

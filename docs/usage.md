@@ -315,5 +315,7 @@ signature, path, version and runtime checks.
 
 The UXP manifests allow the default local broker WebSocket endpoints on
 `127.0.0.1:47391` and `localhost:47391`. If you run the broker on a different
-port or host, update the bridge manifest's `requiredPermissions.network.domains`
-before loading the plugin.
+port or host, add its exact WebSocket origin to the template manifest's
+`requiredPermissions.network.domains` before staging the plugin. Both installers
+reject an undeclared broker origin before copying files; they do not broaden
+the template's network permissions.

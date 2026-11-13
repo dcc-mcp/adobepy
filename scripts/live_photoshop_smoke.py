@@ -75,7 +75,7 @@ def assert_wheel_only() -> pathlib.Path:
         problems.append("the interpreter is not a virtual environment")
     if purelib != origin.parent and purelib not in origin.parents:
         problems.append(f"adobe is not in this venv's site-packages ({purelib})")
-    if origin == ROOT or ROOT in origin.parents:
+    if origin == PYTHON_ROOT or PYTHON_ROOT in origin.parents:
         problems.append("adobe resolved from the source checkout")
     if os.environ.get("PYTHONPATH"):
         problems.append("PYTHONPATH is set; re-run with it unset")

@@ -26,11 +26,24 @@ def _make_bridge_tree(root: pathlib.Path, kind: str, host: str) -> pathlib.Path:
     (source / "index.html").write_text("<html></html>\n", encoding="utf-8")
     if kind == "cep":
         (source / "dist" / "dom.jsx").write_text("// dom\n", encoding="utf-8")
-    (source / "manifest.json").write_text("{}\n", encoding="utf-8")
+    (source / "manifest.json").write_text(json.dumps({"requiredPermissions": {"network": {"domains": [
+        "ws://127.0.0.1:47391", "ws://localhost:47391", "ws://127.0.0.1:5000"
+    ]}}}), encoding="utf-8")
     return source
 
 
 class WebsocketUrlTests(unittest.TestCase):
+    def test_uxp_install_rejects_an_undeclared_origin_before_copying(self):
+        for host in ("photoshop", "premiere", "indesign"):
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                source = _make_bridge_tree(root, "uxp", host)
+                (source / "manifest.json").write_text(json.dumps({"requiredPermissions": {"network": {"domains": ["ws://localhost:47391"]}}}))
+                destination = root / "staged"
+                with self.assertRaisesRegex(cli.CliError, "broker origin"):
+                    cli.stage_bridge(host, destination, "fixture-token", broker_url="ws://unlisted.invalid:47391", bridge_root=root)
+                self.assertFalse(destination.exists())
+
     def test_premiere_default_uses_manifest_localhost_permission(self):
         for broker_url in (None, "", "  "):
             self.assertEqual(

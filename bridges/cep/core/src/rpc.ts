@@ -1,6 +1,7 @@
 import type { BridgeIdentityClaim, Capabilities, RpcRequest } from "./protocol";
 import { ERROR_CODES } from "./protocol";
 import type { BridgeStatus } from "../../../shared/status";
+import { cepSystemPath } from "./system-path";
 
 export interface CepConfig {
   host: string;
@@ -25,7 +26,11 @@ export function startCepBridge(config: CepConfig): void {
     config.onStatus?.("error");
     throw new Error("ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
   }
-  const extensionPath = cep.getSystemPath("extension").replace(/\\/g, "/");
+  const extensionPath = cepSystemPath(cep.getSystemPath("extension"));
+  if (!extensionPath) {
+    config.onStatus?.("error");
+    throw new Error("Adobe CEP extension path unavailable");
+  }
   const connect = async () => {
     config.onStatus?.("connecting");
     let failed = false;

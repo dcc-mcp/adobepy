@@ -752,12 +752,17 @@
     return smartObjectBatchPlay(request, [descriptor], "Replace smart object contents");
   }
   async function smartObjectBatchPlay(request, descriptors, defaultCommandName) {
-    const layer = findLayer(request.args?.[0]);
-    if (!layer) unavailable("Photoshop layer");
+    const target = findLayerTarget(request.args?.[0]);
+    if (!target?.layer) unavailable("Photoshop layer");
+    const { layer, document } = target;
     const layerId = property(layer, "id") ?? request.args?.[0];
-    const commands = [selectLayerDescriptor(layerId), ...descriptors];
+    const documentId = asNumber(property(document, "id"));
+    if (documentId === void 0) unavailable("Photoshop layer owning document");
+    const selection = selectLayerDescriptor(layerId);
+    const references = [layerReference(layerId), { _ref: "document", _id: documentId }];
+    const commands = [{ ...selection, _target: references }, ...descriptors.map((descriptor) => ({ ...descriptor, _target: references }))];
     await runBatchPlay(request, commands, {}, defaultCommandName);
-    return serializeLayer(activeLayer() ?? layer);
+    return serializeLayer(asArray(property(document, "activeLayers"))[0] ?? findLayerInTree(property(document, "layers"), layerId) ?? layer);
   }
   async function exportWithPreset(request) {
     const payload = requestPayload(request);
@@ -785,10 +790,13 @@
     return preset;
   }
   function findLayer(id) {
-    if (id === void 0 || id === null) return activeLayer();
+    return findLayerTarget(id)?.layer;
+  }
+  function findLayerTarget(id) {
+    if (id === void 0 || id === null) return { document: activeDocument(), layer: activeLayer() };
     for (const document of openDocuments()) {
       const match = findLayerInTree(property(document, "layers"), id) ?? findLayerInTree(property(document, "activeLayers"), id);
-      if (match) return match;
+      if (match) return { document, layer: match };
     }
     return void 0;
   }
@@ -1034,15 +1042,8 @@
   async function fileEntryForOpening(path) {
     const localFileSystem = property(property(uxpModule(), "storage"), "localFileSystem");
     const getEntryWithUrl = property(localFileSystem, "getEntryWithUrl");
-    if (getEntryWithUrl) {
-      try {
-        return await maybePromise(getEntryWithUrl.call(localFileSystem, toFileUrl(path)));
-      } catch {
-      }
-    }
-    const getFileForOpening = property(localFileSystem, "getFileForOpening");
-    if (getFileForOpening) return await maybePromise(getFileForOpening.call(localFileSystem));
-    return path;
+    if (!getEntryWithUrl) unavailable("UXP localFileSystem.getEntryWithUrl");
+    return await maybePromise(getEntryWithUrl.call(localFileSystem, toFileUrl(path)));
   }
   async function withModal(request, defaultCommandName, work) {
     const options = request.options ?? {};

@@ -600,7 +600,12 @@ function adobepyIllustratorSelectedTextFrames(document) {
 }
 
 function adobepyIllustratorTextFrameByName(document, name) {
-  return adobepyIllustratorTextFrame(adobepyIllustratorFindTextFrame(document, name), null);
+  var items = document ? document.textFrames : null;
+  for (var index = 0; index < adobepyCollectionLength(items); index += 1) {
+    var item = adobepyCollectionItem(items, index);
+    if (String(adobepySafeValue(item, "name")) === String(name)) return adobepyIllustratorTextFrame(item, index);
+  }
+  return null;
 }
 
 function adobepyIllustratorSetTextFrameContents(document, key, contents) {

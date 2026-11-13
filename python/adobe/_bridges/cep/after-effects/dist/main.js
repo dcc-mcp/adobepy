@@ -20,9 +20,28 @@
     ERROR_IDENTITY_MISMATCH: -32013
   });
 
+  // bridges/cep/core/src/system-path.ts
+  function cepSystemPath(value) {
+    if (typeof value !== "string") return void 0;
+    let path = value;
+    if (/^file:\/\//i.test(path)) {
+      try {
+        path = decodeURI(path).replace(/^file:\/\//i, "");
+      } catch (e) {
+        return void 0;
+      }
+      if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+    }
+    path = path.replace(/\\/g, "/").replace(/\/+$/, "");
+    if (!path || path.length > 32768 || path.trim() !== path || /[\u0000-\u001f\u007f]/.test(path)) return void 0;
+    if (!path.startsWith("/") && !/^[A-Za-z]:\//.test(path)) return void 0;
+    if (path.split("/").some((part) => part === "." || part === "..")) return void 0;
+    return path;
+  }
+
   // bridges/cep/core/src/rpc.ts
   function startCepBridge(config) {
-    var _a, _b, _c;
+    var _a, _b, _c, _d;
     (_a = config.onStatus) == null ? void 0 : _a.call(config, "starting");
     const cep = globalThis.__adobe_cep__;
     if (!cep || typeof cep.evalScript !== "function") {
@@ -33,7 +52,11 @@
       (_c = config.onStatus) == null ? void 0 : _c.call(config, "error");
       throw new Error("ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
     }
-    const extensionPath = cep.getSystemPath("extension").replace(/\\/g, "/");
+    const extensionPath = cepSystemPath(cep.getSystemPath("extension"));
+    if (!extensionPath) {
+      (_d = config.onStatus) == null ? void 0 : _d.call(config, "error");
+      throw new Error("Adobe CEP extension path unavailable");
+    }
     const connect = async () => {
       var _a2, _b2, _c2;
       (_a2 = config.onStatus) == null ? void 0 : _a2.call(config, "connecting");
@@ -95,7 +118,7 @@
         var _a3;
         failed = true;
         (_a3 = config.onStatus) == null ? void 0 : _a3.call(config, "error");
-        console.error(`[adobepy] ${reason}`);
+        console.error("[adobepy] ".concat(reason));
         try {
           socket.send(JSON.stringify({
             type: "error",
@@ -131,7 +154,7 @@
         const request = message.request;
         const requestLiteral = JSON.stringify(JSON.stringify(request)).replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
         try {
-          cep.evalScript(`adobepyDispatch(${requestLiteral})`, (raw) => {
+          cep.evalScript("adobepyDispatch(".concat(requestLiteral, ")"), (raw) => {
             var _a4;
             try {
               if (typeof raw !== "string" || raw.trim() === "") {
@@ -164,7 +187,7 @@
         'typeof JSON.parse === "function"',
         'typeof JSON.stringify === "function"'
       ].join(" && ");
-      cep.evalScript(`${probe} ? "ready" : "missing"`, (status) => {
+      cep.evalScript("".concat(probe, ' ? "ready" : "missing"'), (status) => {
         var _a2;
         if (status === "ready") void connect();
         else {
@@ -174,12 +197,12 @@
       });
     };
     const loadDispatcher = () => {
-      cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/host/dispatcher.jsx`)})`, verifyRuntime);
+      cep.evalScript("$.evalFile(".concat(JSON.stringify("".concat(extensionPath, "/host/dispatcher.jsx")), ")"), verifyRuntime);
     };
     const loadDomRuntime = () => {
-      cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/dist/dom.jsx`)})`, loadDispatcher);
+      cep.evalScript("$.evalFile(".concat(JSON.stringify("".concat(extensionPath, "/dist/dom.jsx")), ")"), loadDispatcher);
     };
-    cep.evalScript(`$.evalFile(${JSON.stringify(`${extensionPath}/dist/json.jsx`)})`, loadDomRuntime);
+    cep.evalScript("$.evalFile(".concat(JSON.stringify("".concat(extensionPath, "/dist/json.jsx")), ")"), loadDomRuntime);
   }
   function boundedBootstrapNonce(value) {
     return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : void 0;
@@ -213,13 +236,13 @@
   async function afterEffectsRuntimeIdentity() {
     var _a;
     const cep = globalThis.__adobe_cep__;
-    const pluginRoot = absolutePath((_a = cep == null ? void 0 : cep.getSystemPath) == null ? void 0 : _a.call(cep, "extension"));
+    const pluginRoot = absolutePath(cepSystemPath((_a = cep == null ? void 0 : cep.getSystemPath) == null ? void 0 : _a.call(cep, "extension")));
     const hostVersion = await afterEffectsHostVersion(cep);
     return {
       host: { ...externalHostIdentity(), ...hostVersion ? { hostVersion } : {} },
       bridge: {
         ...bridgeInstanceIdValue() ? { instanceId: bridgeInstanceIdValue() } : {},
-        ...pluginRoot ? { installedPluginRoot: pluginRoot, moduleOrigin: `${pluginRoot}/dist/main.js` } : {}
+        ...pluginRoot ? { installedPluginRoot: pluginRoot, moduleOrigin: "".concat(pluginRoot, "/dist/main.js") } : {}
       }
     };
   }
@@ -272,7 +295,7 @@
       bytes[6] = bytes[6] & 15 | 64;
       bytes[8] = bytes[8] & 63 | 128;
       const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
-      candidate = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+      candidate = "".concat(hex.slice(0, 8), "-").concat(hex.slice(8, 12), "-").concat(hex.slice(12, 16), "-").concat(hex.slice(16, 20), "-").concat(hex.slice(20));
     }
     if (candidate && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate)) bridgeInstanceId = candidate.toLowerCase();
     return bridgeInstanceId;

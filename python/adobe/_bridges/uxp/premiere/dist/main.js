@@ -525,7 +525,7 @@
     const project = await activeProject();
     const save = property(project, "save");
     if (!save) unavailable("Premiere project save");
-    await maybePromise(save.call(project));
+    if (await maybePromise(save.call(project)) === false) unavailable("Premiere project save failed");
     return serializeProject(project);
   }
   async function saveProjectAs(request) {
@@ -533,7 +533,7 @@
     const path = asString(request.args?.[0]);
     const saveAs = property(project, "saveAs");
     if (!path || !saveAs) unavailable("Premiere project saveAs");
-    await maybePromise(saveAs.call(project, path));
+    if (await maybePromise(saveAs.call(project, path)) === false) unavailable("Premiere project saveAs failed");
     return serializeProject(project);
   }
   async function createSequence(request) {
@@ -561,24 +561,40 @@
     const editor = getEditor ? getEditor.call(editorType, sequence) : null;
     const method = property(editor, overwrite ? "createOverwriteItemAction" : "createInsertProjectItemAction");
     const project = await activeProject();
-    const execute = property(project, "executeTransaction");
-    if (!method || !execute) unavailable(`Premiere SequenceEditor ${overwrite ? "overwrite" : "insert"}`);
+    if (!method) unavailable(`Premiere SequenceEditor ${overwrite ? "overwrite" : "insert"}`);
     const action = overwrite ? method.call(editor, item, time, videoTrack, audioTrack) : method.call(editor, item, time, videoTrack, audioTrack, booleanValue(property(payload, "limitShift") ?? property(payload, "limit_shift")) ?? false);
-    await maybePromise(execute.call(project, (compound) => {
-      const add = property(compound, "addAction") ?? property(compound, "add");
-      if (add) add.call(compound, action);
-    }, asString(request.options?.commandName) ?? (overwrite ? "Overwrite project item" : "Insert project item")));
+    await executeProjectAction(project, action, asString(request.options?.commandName) ?? (overwrite ? "Overwrite project item" : "Insert project item"));
     return { edited: true, mode: overwrite ? "overwrite" : "insert", sequence: await serializeSequence(sequence), projectItem: await serializeProjectItem(item) };
   }
   function premiereTickTime(value) {
-    if (isObject(value) && property(value, "ticks") !== void 0) return value;
     const tickTime = property(premiereModule(), "TickTime");
-    const ticks = typeof value === "string" ? value : null;
-    const createWithTicks = property(tickTime, "createWithTicks");
-    if (ticks && createWithTicks) return createWithTicks.call(tickTime, ticks);
+    const ticks = typeof value === "string" ? value : property(value, "ticks");
+    if (ticks !== void 0) {
+      const createWithTicks = property(tickTime, "createWithTicks");
+      if (typeof ticks !== "string" || !/^-?\d+$/.test(ticks) || !createWithTicks) unavailable("Premiere TickTime ticks");
+      return createWithTicks.call(tickTime, ticks);
+    }
+    const seconds = asNumber(isObject(value) ? property(value, "seconds") : value);
+    if (seconds === void 0 || !Number.isFinite(seconds)) unavailable("Premiere TickTime seconds");
     const createWithSeconds = property(tickTime, "createWithSeconds");
     if (!createWithSeconds) unavailable("Premiere TickTime.createWithSeconds");
-    return createWithSeconds.call(tickTime, asNumber(value) ?? 0);
+    return createWithSeconds.call(tickTime, seconds);
+  }
+  async function executeProjectAction(project, action, commandName) {
+    const execute = property(project, "executeTransaction");
+    if (!execute) unavailable("Premiere project.executeTransaction");
+    let result;
+    const run = () => {
+      result = execute.call(project, (compound) => {
+        const add = property(compound, "addAction") ?? property(compound, "add");
+        if (!add) unavailable("Premiere compound action");
+        add.call(compound, action);
+      }, commandName);
+    };
+    const lockedAccess = property(project, "lockedAccess");
+    if (lockedAccess) await maybePromise(lockedAccess.call(project, run));
+    else run();
+    if (await maybePromise(result) === false) unavailable("Premiere transaction failed");
   }
   async function activeSequence() {
     const project = await activeProject();
@@ -656,6 +672,7 @@
     const suppressUI = booleanValue(property(payload, "suppressUI") ?? property(payload, "suppress_ui")) ?? true;
     const asNumberedStills = booleanValue(property(payload, "asNumberedStills") ?? property(payload, "as_numbered_stills")) ?? false;
     const result = await maybePromise(importProjectFiles.call(project, filePaths, suppressUI, targetBin, asNumberedStills));
+    if (result === false) unavailable("Premiere project importFiles failed");
     const resultItems = await collectionItems(result);
     if (resultItems.length > 0) return serializeProjectItems(resultItems);
     return serializeProjectItems(await findImportedProjectItems(filePaths, targetBin ?? await rootProjectItem(project)));
@@ -692,31 +709,28 @@
     const name = asString(property(payload, "name"));
     if (!name) unavailable("Premiere bin name");
     const parentId = property(payload, "parentId") ?? property(payload, "parent_id");
-    const parent = parentId === void 0 || parentId === null ? await rootProjectItem(project) : await requireProjectItem(parentId);
+    const resolvedParent = parentId === void 0 || parentId === null ? await rootProjectItem(project) : await requireProjectItem(parentId);
+    const parent = await castProjectItem(resolvedParent, "FolderItem") ?? resolvedParent;
     if (!parent) unavailable("Premiere parent bin");
+    const existingIds = new Set(await Promise.all((await projectItemChildObjects(parent)).map(projectItemId)));
     const makeUnique = booleanValue(property(payload, "makeUnique") ?? property(payload, "make_unique")) ?? true;
     const createDirect = property(parent, "createBin");
     if (createDirect) {
       const created = await maybePromise(createDirect.call(parent, name, makeUnique));
-      return serializeProjectItem(isObject(created) ? created : await findProjectItem(parent, name));
+      if (created === false) unavailable("Premiere bin creation failed");
+      if (isObject(created)) return serializeProjectItem(created);
+    } else {
+      const createAction = property(parent, "createBinAction");
+      if (!createAction) unavailable("Premiere bin.create");
+      await executeProjectAction(project, createAction.call(parent, name, makeUnique), asString(request.options?.commandName) ?? "Create bin");
     }
-    const createAction = property(parent, "createBinAction");
-    const executeTransaction = property(project, "executeTransaction");
-    if (createAction && executeTransaction) {
-      await maybePromise(
-        executeTransaction.call(
-          project,
-          (compoundAction) => {
-            const action = createAction.call(parent, name, makeUnique);
-            const addAction = property(compoundAction, "addAction") ?? property(compoundAction, "add");
-            if (addAction) addAction.call(compoundAction, action);
-          },
-          asString(request.options?.commandName) ?? "Create bin"
-        )
-      );
-      return serializeProjectItem(await findProjectItem(parent, name));
+    const createdChildren = [];
+    for (const child of await projectItemChildObjects(parent)) {
+      const id = await projectItemId(child);
+      if (id !== void 0 && !existingIds.has(id)) createdChildren.push(child);
     }
-    unavailable("Premiere bin.create");
+    if (createdChildren.length !== 1) unavailable("Premiere newly created bin identity");
+    return serializeProjectItem(createdChildren[0]);
   }
   async function serializeSequences(sequences) {
     return (await Promise.all(sequences.map(serializeSequence))).filter((sequence) => sequence !== null);
@@ -849,16 +863,59 @@
       typename: asString(property(clip, "typename")) ?? asString(property(clip, "typeName"))
     };
   }
+  async function markerCollection(sequence) {
+    const api = property(premiereModule(), "Markers");
+    const getMarkers = property(api, "getMarkers");
+    if (getMarkers) return await maybePromise(getMarkers.call(api, sequence));
+    return property(sequence, "markers") ?? property(sequence, "markerCollection");
+  }
   async function sequenceMarkers(sequence) {
-    const markers = property(sequence, "markers") ?? property(sequence, "markerCollection");
+    const markers = await markerCollection(sequence);
     const getMarkers = property(markers, "getMarkers") ?? property(sequence, "getMarkers");
-    if (getMarkers) return (await collectionItems(await maybePromise(getMarkers.call(markers ?? sequence)))).map(serializeMarker).filter((marker) => marker !== null);
-    return (await markerItems(markers)).map(serializeMarker).filter((marker) => marker !== null);
+    const items = getMarkers ? await collectionItems(await maybePromise(getMarkers.call(markers ?? sequence))) : await markerItems(markers);
+    return (await Promise.all(items.map(serializeMarker))).filter((marker) => marker !== null);
   }
   async function createMarker(request) {
     const sequence = await requireSequence(request.args?.[0]);
     const payload = isObject(request.args?.[1]) ? request.args?.[1] : {};
-    const markers = property(sequence, "markers") ?? property(sequence, "markerCollection");
+    const markers = await markerCollection(sequence);
+    const createAction = property(markers, "createAddMarkerAction");
+    if (createAction) {
+      const before = /* @__PURE__ */ new Map();
+      for (const marker2 of await sequenceMarkers(sequence)) {
+        const key = JSON.stringify(marker2);
+        before.set(key, (before.get(key) ?? 0) + 1);
+      }
+      const start2 = premiereTickTime(property(payload, "start") ?? property(payload, "time") ?? 0);
+      const end = property(payload, "end");
+      const durationValue = property(payload, "duration");
+      let duration = premiereTickTime(durationValue ?? 0);
+      if (durationValue === void 0 && end !== void 0) {
+        const endTime = premiereTickTime(end);
+        const subtract = property(endTime, "subtract");
+        if (!subtract) unavailable("Premiere TickTime.subtract");
+        duration = subtract.call(endTime, start2);
+      }
+      if ((asNumber(property(duration, "seconds")) ?? 0) < 0) unavailable("Premiere marker duration");
+      const markerType = asString(property(payload, "markerType") ?? property(payload, "marker_type")) ?? asString(property(property(premiereModule(), "Marker"), "MARKER_TYPE_COMMENT"));
+      if (!markerType) unavailable("Premiere marker type");
+      const action = createAction.call(
+        markers,
+        asString(property(payload, "name")) ?? "",
+        markerType,
+        start2,
+        duration,
+        asString(property(payload, "comments") ?? property(payload, "comment")) ?? ""
+      );
+      await executeProjectAction(await activeProject(), action, asString(request.options?.commandName) ?? "Create marker");
+      for (const marker2 of await sequenceMarkers(sequence)) {
+        const key = JSON.stringify(marker2);
+        const count = before.get(key) ?? 0;
+        if (count === 0) return marker2;
+        before.set(key, count - 1);
+      }
+      unavailable("Premiere newly created marker");
+    }
     const create = property(markers, "createMarker") ?? property(sequence, "createMarker");
     if (!create) unavailable("Premiere marker.createMarker");
     const start = property(payload, "start") ?? property(payload, "time") ?? 0;
@@ -894,16 +951,16 @@
     }
     return [];
   }
-  function serializeMarker(marker) {
+  async function serializeMarker(marker) {
     if (!isObject(marker)) return null;
     return {
-      id: property(marker, "id") ?? property(marker, "guid") ?? property(marker, "markerID") ?? property(marker, "markerId"),
-      name: asString(property(marker, "name")),
-      comments: asString(property(marker, "comments")) ?? asString(property(marker, "comment")),
-      start: serializeTime(property(marker, "start") ?? property(marker, "time")),
+      id: serializeId(property(marker, "id") ?? property(marker, "guid") ?? property(marker, "markerID") ?? property(marker, "markerId")),
+      name: asString(await readValue(marker, "getName", "name")),
+      comments: asString(await readValue(marker, "getComments", "comments", "comment")),
+      start: serializeTime(await readValue(marker, "getStart", "start", "time")),
       end: serializeTime(property(marker, "end")),
-      duration: serializeTime(property(marker, "duration")),
-      markerType: asString(property(marker, "markerType")) ?? asString(property(marker, "marker_type")),
+      duration: serializeTime(await readValue(marker, "getDuration", "duration")),
+      markerType: asString(await readValue(marker, "getType", "markerType", "marker_type")),
       typename: asString(property(marker, "typename")) ?? asString(property(marker, "typeName"))
     };
   }
@@ -962,15 +1019,18 @@
     const manager = await encoderManager();
     const encode = property(manager, "encodeFile");
     if (!encode) unavailable("Premiere EncoderManager.encodeFile");
+    const outPoint = property(payload, "outPoint") ?? property(payload, "out_point");
+    const nativeOutPoint = outPoint === void 0 ? property(property(premiereModule(), "TickTime"), "TIME_INVALID") : premiereTickTime(outPoint);
+    if (!nativeOutPoint) unavailable("Premiere TickTime.TIME_INVALID");
     const result = await maybePromise(
       encode.call(
         manager,
         sourcePath,
         outputPath,
         presetPath,
-        property(payload, "inPoint") ?? property(payload, "in_point"),
-        property(payload, "outPoint") ?? property(payload, "out_point"),
-        property(payload, "workArea") ?? property(payload, "work_area"),
+        premiereTickTime(property(payload, "inPoint") ?? property(payload, "in_point") ?? 0),
+        nativeOutPoint,
+        asNumber(property(payload, "workArea") ?? property(payload, "work_area")) ?? 0,
         booleanValue(property(payload, "removeUponCompletion") ?? property(payload, "removeOnCompletion") ?? property(payload, "remove_on_completion")) ?? true,
         booleanValue(property(payload, "startQueueImmediately") ?? property(payload, "start_queue_immediately")) ?? true
       )
@@ -980,7 +1040,8 @@
   async function encodeProjectItem(request) {
     const payload = requestPayload(request);
     const projectItemId2 = property(payload, "projectItem") ?? property(payload, "project_item") ?? property(payload, "projectItemId") ?? property(payload, "project_item_id") ?? property(payload, "sourceId") ?? property(payload, "source_id");
-    const projectItem = await requireProjectItem(projectItemId2);
+    const projectItem = await castProjectItem(await requireProjectItem(projectItemId2), "ClipProjectItem");
+    if (!projectItem) unavailable("Premiere ClipProjectItem for encoder");
     const outputPath = requiredPath(property(payload, "outputPath") ?? property(payload, "output_path") ?? property(payload, "outputFile") ?? property(payload, "output_file") ?? property(payload, "path"), "Premiere encode output file");
     const presetPath = optionalPath(property(payload, "presetPath") ?? property(payload, "preset_path") ?? property(payload, "presetFile") ?? property(payload, "preset_file") ?? property(payload, "preset"));
     const manager = await encoderManager();
@@ -992,7 +1053,7 @@
         projectItem,
         outputPath,
         presetPath,
-        property(payload, "workArea") ?? property(payload, "work_area"),
+        asNumber(property(payload, "workArea") ?? property(payload, "work_area")) ?? 0,
         booleanValue(property(payload, "removeUponCompletion") ?? property(payload, "removeOnCompletion") ?? property(payload, "remove_on_completion")) ?? true,
         booleanValue(property(payload, "startQueueImmediately") ?? property(payload, "start_queue_immediately")) ?? true
       )
@@ -1034,7 +1095,7 @@
       exportSequenceFrame.call(
         exporter,
         sequence,
-        property(payload, "time") ?? property(payload, "tickTime") ?? property(payload, "tick_time"),
+        premiereTickTime(property(payload, "time") ?? property(payload, "tickTime") ?? property(payload, "tick_time") ?? 0),
         outputPath,
         outputDirectory,
         asNumber(property(payload, "width")),
@@ -1239,8 +1300,7 @@
     const mediaPaths = await Promise.all(candidates.map(projectItemMediaPath));
     const matches = [];
     for (const filePath of filePaths) {
-      const fileName = filePath.split(/[\\/]/).filter(Boolean).pop() ?? filePath;
-      const index = candidates.findIndex((item, position) => mediaPaths[position] === filePath || asString(property(item, "name")) === fileName);
+      const index = mediaPaths.findIndex((path) => path?.replace(/\\/g, "/") === filePath.replace(/\\/g, "/"));
       if (index >= 0) matches.push(candidates[index]);
     }
     return matches;

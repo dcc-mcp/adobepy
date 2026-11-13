@@ -870,6 +870,20 @@ def _doctor_report(*, overrides: dict | None = None) -> str:
 
 
 class WheelOnlyDoctorTests(unittest.TestCase):
+    def test_import_proof_rejects_source_inside_a_venv(self) -> None:
+        fake = types.ModuleType("adobe")
+        fake.__file__ = str(ROOT / "python" / "adobe" / "__init__.py")
+        with mock.patch.dict(sys.modules, {"adobe": fake}), mock.patch.object(sys, "prefix", "fixture-venv"), mock.patch.object(sysconfig, "get_paths", return_value={"purelib": "fixture-venv/site-packages"}):
+            with self.assertRaisesRegex(SystemExit, "site-packages"):
+                exec(smoke.WHEEL_ORIGIN_CHECK, {})
+
+    def test_validation_environment_removes_python_and_runtime_overrides(self) -> None:
+        with mock.patch.dict(os.environ, {"PYTHONPATH": "checkout/python", "PYTHONHOME": "foreign", "ADOBEPY_TOKEN": "fixture", "KEEP_SMOKE": "yes"}, clear=True):
+            environment = smoke.bridge_smoke_environment()
+        for name in ("PYTHONPATH", "PYTHONHOME", "ADOBEPY_TOKEN"):
+            self.assertTrue(name not in environment, f"validation environment retained {name}")
+        self.assertEqual(environment["KEEP_SMOKE"], "yes")
+
     def _invoke(self, report: str, returncode: int = 1):
         doctor = subprocess.CompletedProcess([], returncode, stdout=report, stderr="")
         with mock.patch.object(smoke, "run") as install, mock.patch.object(
@@ -1141,6 +1155,12 @@ class LiveSmokeSafetyTests(unittest.TestCase):
     def test_require_wheel_accepts_a_clean_venv_install(self) -> None:
         with tempfile.TemporaryDirectory(prefix="adobepy-wheel-proof-") as tmp_dir:
             with self._wheel_env(pathlib.Path(tmp_dir)) as origin:
+                self.assertEqual(live.assert_wheel_only(), origin.resolve())
+
+    def test_require_wheel_accepts_a_repository_local_venv(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="adobepy-repository-venv-") as tmp_dir:
+            root = pathlib.Path(tmp_dir)
+            with self._wheel_env(root) as origin, mock.patch.object(live, "ROOT", root), mock.patch.object(live, "PYTHON_ROOT", root / "python"):
                 self.assertEqual(live.assert_wheel_only(), origin.resolve())
 
     def test_require_wheel_rejects_another_source_checkout_on_sys_path(self) -> None:

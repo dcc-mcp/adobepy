@@ -1,11 +1,12 @@
 import type { BridgeIdentityClaim, HostIdentityClaim } from "../../core/src/protocol";
+import { cepSystemPath } from "../../core/src/system-path";
 
 let bridgeInstanceId: string | undefined;
 
 /** Return only bounded, host-observable identity; no commands or JSX are accepted. */
 export async function afterEffectsRuntimeIdentity(): Promise<BridgeIdentityClaim> {
   const cep = (globalThis as any).__adobe_cep__;
-  const pluginRoot = absolutePath(cep?.getSystemPath?.("extension"));
+  const pluginRoot = absolutePath(cepSystemPath(cep?.getSystemPath?.("extension")));
   const hostVersion = await afterEffectsHostVersion(cep);
   return {
     host: { ...externalHostIdentity(), ...(hostVersion ? { hostVersion } : {}) },

@@ -12,7 +12,21 @@ import tempfile
 import venv
 from typing import Iterable, Optional, Sequence
 
-SMOKE_SOURCE = """
+WHEEL_ORIGIN_CHECK = """
+import pathlib
+import sys
+import sysconfig
+import adobe
+
+origin = pathlib.Path(adobe.__file__).resolve()
+purelib = pathlib.Path(sysconfig.get_paths()["purelib"]).resolve()
+if sys.prefix == sys.base_prefix:
+    raise SystemExit("wheel smoke requires a virtual environment")
+if purelib not in origin.parents:
+    raise SystemExit("adobe did not resolve from this venv's site-packages")
+"""
+
+SMOKE_SOURCE = WHEEL_ORIGIN_CHECK + """
 from adobe.photoshop import Photoshop
 from adobe.core import PhotoshopBootstrapRequest, PhotoshopBootstrapResult
 from adobe.indesign import InDesign
@@ -62,7 +76,7 @@ def run(
 
 # The wheel-only path that used to fail outright: no release bundle, no
 # ADOBEPY_* overrides, and a cwd outside any source checkout.
-BRIDGE_SMOKE_SOURCE = """
+BRIDGE_SMOKE_SOURCE = WHEEL_ORIGIN_CHECK + """
 import json
 import pathlib
 import subprocess
@@ -106,9 +120,13 @@ print("adobepy wheel bridge install smoke passed")
 
 
 def bridge_smoke_environment() -> dict:
-    """Strip every ADOBEPY_* override so only bundled assets can resolve."""
+    """Exclude runtime overrides and source imports from wheel validation."""
 
-    return {key: value for key, value in os.environ.items() if not key.startswith("ADOBEPY_")}
+    return {
+        key: value for key, value in os.environ.items()
+        if not key.upper().startswith("ADOBEPY_")
+        and key.upper() not in ("PYTHONPATH", "PYTHONHOME")
+    }
 
 
 # Doctor checks that describe the wheel itself; these must pass in a clean,
@@ -230,10 +248,11 @@ def smoke_wheel(wheel: pathlib.Path) -> None:
         venv_dir = tmp_path / ".venv"
         venv.EnvBuilder(with_pip=True).create(venv_dir)
         python = venv_python(venv_dir)
+        environment = bridge_smoke_environment()
         run(
-            [str(python), "-m", "pip", "install", "--no-deps", str(wheel)], cwd=tmp_path
+            [str(python), "-m", "pip", "install", "--no-deps", str(wheel)], cwd=tmp_path, env=environment
         )
-        run([str(python), "-c", SMOKE_SOURCE], cwd=tmp_path)
+        run([str(python), "-c", SMOKE_SOURCE], cwd=tmp_path, env=environment)
         smoke_bridge_install(python, tmp_path)
 
 

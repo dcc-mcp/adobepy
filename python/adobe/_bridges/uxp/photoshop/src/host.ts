@@ -592,12 +592,17 @@ async function smartObjectReplaceContents(request: RpcRequest) {
 }
 
 async function smartObjectBatchPlay(request: RpcRequest, descriptors: Record<string, unknown>[], defaultCommandName: string) {
-  const layer = findLayer(request.args?.[0]);
-  if (!layer) unavailable("Photoshop layer");
+  const target = findLayerTarget(request.args?.[0]);
+  if (!target?.layer) unavailable("Photoshop layer");
+  const { layer, document } = target;
   const layerId = property(layer, "id") ?? request.args?.[0];
-  const commands = [selectLayerDescriptor(layerId), ...descriptors];
+  const documentId = asNumber(property(document, "id"));
+  if (documentId === undefined) unavailable("Photoshop layer owning document");
+  const selection = selectLayerDescriptor(layerId);
+  const references = [layerReference(layerId), { _ref: "document", _id: documentId }];
+  const commands = [{ ...selection, _target: references }, ...descriptors.map((descriptor) => ({ ...descriptor, _target: references }))];
   await runBatchPlay(request, commands, {}, defaultCommandName);
-  return serializeLayer(activeLayer() ?? layer);
+  return serializeLayer(asArray(property(document, "activeLayers"))[0] ?? findLayerInTree(property(document, "layers"), layerId) ?? layer);
 }
 
 async function exportWithPreset(request: RpcRequest) {
@@ -628,10 +633,14 @@ function exportPreset(name: string) {
 }
 
 function findLayer(id: unknown) {
-  if (id === undefined || id === null) return activeLayer();
+  return findLayerTarget(id)?.layer;
+}
+
+function findLayerTarget(id: unknown) {
+  if (id === undefined || id === null) return { document: activeDocument(), layer: activeLayer() };
   for (const document of openDocuments()) {
     const match = findLayerInTree(property(document, "layers"), id) ?? findLayerInTree(property(document, "activeLayers"), id);
-    if (match) return match;
+    if (match) return { document, layer: match };
   }
   return undefined;
 }
@@ -904,16 +913,8 @@ async function actionFileReference(path: string) {
 async function fileEntryForOpening(path: string) {
   const localFileSystem = property(property(uxpModule(), "storage"), "localFileSystem");
   const getEntryWithUrl = property<Callable>(localFileSystem, "getEntryWithUrl");
-  if (getEntryWithUrl) {
-    try {
-      return await maybePromise(getEntryWithUrl.call(localFileSystem, toFileUrl(path)));
-    } catch {
-      // If direct URL access is unavailable, fall through to Photoshop's picker-backed opening API.
-    }
-  }
-  const getFileForOpening = property<Callable>(localFileSystem, "getFileForOpening");
-  if (getFileForOpening) return await maybePromise(getFileForOpening.call(localFileSystem));
-  return path;
+  if (!getEntryWithUrl) unavailable("UXP localFileSystem.getEntryWithUrl");
+  return await maybePromise(getEntryWithUrl.call(localFileSystem, toFileUrl(path)));
 }
 
 async function withModal(request: RpcRequest, defaultCommandName: string, work: () => Promise<unknown>) {

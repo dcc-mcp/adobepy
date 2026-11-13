@@ -214,6 +214,14 @@ fn install_bridge(args: InstallBridgeArgs) -> Result<()> {
         BridgeInstallKind::Cep => root.join("bridges").join("cep").join(host.as_str()),
     };
     ensure_bridge_bundle(&source, kind)?;
+    if matches!(kind, BridgeInstallKind::Uxp) {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
+        validate_uxp_broker_origin(
+            &manifest,
+            &bridge_websocket_url(host, args.broker_url.as_deref()),
+        )?;
+    }
     copy_dir_all(&source, &args.dest)?;
     write_bridge_config(
         &args.dest,
@@ -239,6 +247,27 @@ fn install_bridge(args: InstallBridgeArgs) -> Result<()> {
             "installed bridge template for {host} to {} (token configured)",
             args.dest.display()
         );
+    }
+    Ok(())
+}
+
+fn validate_uxp_broker_origin(manifest: &serde_json::Value, endpoint: &str) -> Result<()> {
+    let domains = manifest
+        .pointer("/requiredPermissions/network/domains")
+        .and_then(|value| value.as_array());
+    let allowed = domains.is_some_and(|domains| {
+        domains.iter().any(|domain| {
+            domain.as_str().is_some_and(|origin| {
+                (origin.starts_with("ws://") || origin.starts_with("wss://"))
+                    && (endpoint == origin
+                        || endpoint
+                            .strip_prefix(origin)
+                            .is_some_and(|suffix| suffix.starts_with('/')))
+            })
+        })
+    });
+    if !allowed {
+        bail!("UXP manifest does not permit this broker origin; use a declared network origin");
     }
     Ok(())
 }
@@ -469,6 +498,26 @@ fn copy_dir_all_inner(source: &Path, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uxp_broker_origin_must_match_manifest_before_staging() {
+        let manifest =
+            json!({"requiredPermissions": {"network": {"domains": ["ws://localhost:47391"]}}});
+        assert!(validate_uxp_broker_origin(
+            &manifest,
+            "ws://localhost:47391/v1/bridge/premiere/ws"
+        )
+        .is_ok());
+        for endpoint in [
+            "ws://unlisted.invalid:47391/path",
+            "ws://localhost:47392/path",
+            "ws://localhost:47391.evil/path",
+            "ws://user@localhost:47391/path",
+        ] {
+            assert!(validate_uxp_broker_origin(&manifest, endpoint).is_err());
+        }
+        assert!(validate_uxp_broker_origin(&json!({}), "ws://localhost:47391/path").is_err());
+    }
 
     #[test]
     fn websocket_url_and_config() {
