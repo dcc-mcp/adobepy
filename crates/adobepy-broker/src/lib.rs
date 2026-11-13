@@ -6976,7 +6976,6 @@ mod tests {
             } else {
                 bootstrap_state(backend.clone())
             };
-            let expires = tokio::time::Instant::now() + Duration::from_millis(1_100);
             let task = tokio::spawn({
                 let state = state.clone();
                 async move {
@@ -6996,6 +6995,7 @@ mod tests {
             while !*entered.borrow() {
                 entered.changed().await.unwrap();
             }
+            let expires = tokio::time::Instant::now() + Duration::from_millis(1_100);
             let mut grants = state.bootstrap_grants.lock().await;
             grants.clear();
             gate.release().await;
