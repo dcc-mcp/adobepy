@@ -244,6 +244,7 @@ async function testPhotoshopBridge() {
         batchPlay: async (descriptors, options) => {
           events.push({ kind: "batchPlay", descriptors, options });
           if (descriptors.some((descriptor) => descriptor._obj === "newPlacedLayer")) textLayer.kind = "smartObject";
+          if (descriptors.some((descriptor) => descriptor._obj === "placedLayerMakeCopy")) document.layers.push({ ...textLayer, id: 17 });
           if (descriptors.some((descriptor) => descriptor._obj === "fail")) {
             return [{ _obj: "error", message: "Forced batchPlay failure", result: -1 }];
           }
@@ -342,7 +343,7 @@ async function testPhotoshopBridge() {
   assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySharpen", [{ layerId: 7, documentId: 9 }], { modal: true })).id, 7);
   assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySmartBlur", [{ layerId: 7, documentId: 9 }, 3, 12, "high"], { modal: true })).id, 7);
   assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "convertToSmartObject", [{ layerId: 7, documentId: 9 }], { modal: true })).isSmartObject, true);
-  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "newSmartObjectViaCopy", [{ layerId: 7, documentId: 9 }], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "newSmartObjectViaCopy", [{ layerId: 7, documentId: 9 }], { modal: true })).id, 17);
   assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "editContents", [{ layerId: 7, documentId: 9 }], { modal: true })).id, 7);
   assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "replaceContents", [{ layerId: 7, documentId: 9 }, "C:/replacement.psb"], { modal: true })).id, 7);
   assert.strictEqual(result(await rpc(env, "photoshop", "export", "getPresets"))[0].name, "png");
@@ -1547,7 +1548,9 @@ async function testNativeReviewRegressions() {
   const activeLayer = { id: 1, name: "User layer" };
   const requestedLayer = { id: 7, name: "Requested" };
   const ownerSelectedLayer = { id: 8, name: "Another selected layer" };
-  const owner = { id: 9, layers: [requestedLayer, ownerSelectedLayer], activeLayers: [ownerSelectedLayer] };
+  const group = { id: 90, name: "Owner group", layers: [requestedLayer] };
+  const owner = { id: 9, layers: [group, ownerSelectedLayer], activeLayers: [ownerSelectedLayer] };
+  group.document = owner;
   const app = { activeDocument: { id: 2, layers: [activeLayer], activeLayers: [activeLayer] }, documents: [owner] };
   const collidingLayer = { id: 7, name: "Same ID in another document", document: app.activeDocument };
   app.activeDocument.layers.push(collidingLayer);
@@ -1561,11 +1564,21 @@ async function testNativeReviewRegressions() {
   app.documents.unshift(app.activeDocument);
   let pickerCalls = 0;
   const commands = [];
+  let nextCopyIds = [27];
   const ps = await loadBundle("bridges/uxp/photoshop/dist/main.js", {
-    photoshop: { app, action: { batchPlay: async (descriptors) => { commands.push(...descriptors); return []; } } },
+    photoshop: { app, action: { batchPlay: async (descriptors) => {
+      commands.push(...descriptors);
+      if (descriptors.some((descriptor) => descriptor._obj === "placedLayerMakeCopy")) {
+        group.layers.push(...nextCopyIds.map((id) => ({ id, name: "Copy", kind: "smartObject", document: owner })));
+      }
+      if (descriptors.some((descriptor) => descriptor._obj === "newPlacedLayer")) {
+        group.layers.splice(group.layers.indexOf(requestedLayer), 1, { id: 37, name: "Converted", kind: "smartObject", document: owner });
+      }
+      return [];
+    } } },
     uxp: { storage: { localFileSystem: {
-      getEntryWithUrl: async () => { throw new Error("requested path missing"); },
-      getFileForOpening: async () => { pickerCalls++; return {}; }, createSessionToken: () => "unexpected"
+      getEntryWithUrl: async (url) => { if (url.endsWith("/replacement.psb")) return { isFile: true, url }; throw new Error("requested path missing"); },
+      getFileForOpening: async () => { pickerCalls++; return {}; }, createSessionToken: () => "replacement-token"
     } } }
   });
   await check("smart object owning document", async () => {
@@ -1608,6 +1621,30 @@ async function testNativeReviewRegressions() {
   await check("explicit path must never invoke picker", async () => {
     assert.match(error(await rpc(ps, "photoshop", "smartObject", "replaceContents", [{ layerId: 7, documentId: 9 }, "C:/missing.psb"])).message, /requested path missing/);
     assert.strictEqual(pickerCalls, 0);
+  });
+  await check("smart object copy returns its newly created nested layer", async () => {
+    commands.length = 0;
+    const copied = result(await rpc(ps, "photoshop", "smartObject", "newSmartObjectViaCopy", [{ layerId: 7, documentId: 9 }]));
+    assert.strictEqual(copied.id, 27);
+    assert.strictEqual(copied.documentId, 9);
+    assert.ok(group.layers.includes(requestedLayer));
+    assert.strictEqual(owner.activeLayers[0].id, 8);
+    commands.length = 0;
+    const replaced = result(await rpc(ps, "photoshop", "smartObject", "replaceContents", [{ layerId: copied.id, documentId: copied.documentId }, "C:/replacement.psb"]));
+    assert.strictEqual(replaced.id, 27);
+    assert.ok(commands.every((command) => command._target.some((target) => target._ref === "layer" && target._id === 27)));
+    assert.ok(commands.every((command) => command._target.some((target) => target._ref === "document" && target._id === 9)));
+  });
+  await check("missing or ambiguous copy identity never returns the source", async () => {
+    for (const ids of [[], [28, 29]]) {
+      nextCopyIds = ids;
+      assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "newSmartObjectViaCopy", [{ layerId: 7, documentId: 9 }])).code, -32004);
+    }
+  });
+  await check("conversion returns its replacement layer", async () => {
+    const converted = result(await rpc(ps, "photoshop", "smartObject", "convertToSmartObject", [{ layerId: 7, documentId: 9 }]));
+    assert.strictEqual(converted.id, 37);
+    assert.strictEqual(converted.documentId, 9);
   });
   assert.deepStrictEqual(failures, [], failures.join("\n"));
   console.log("Native contract review regressions passed");

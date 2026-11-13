@@ -135,7 +135,7 @@ class CapturingClient:
         if namespace == "filter":
             return {"id": args[0], "name": "Layer 1", "kind": "pixel", "lastFilter": method}
         if namespace == "smartObject":
-            return {"id": args[0]["layerId"], "name": "Layer 1", "kind": "smartObject", "isSmartObject": True}
+            return {"id": 13 if method == "newSmartObjectViaCopy" else args[0]["layerId"], "name": "Layer 1", "kind": "smartObject", "isSmartObject": True}
         if namespace == "export":
             if method == "getPresets":
                 return [
@@ -1110,8 +1110,11 @@ class FacadeTests(unittest.TestCase):
         client = CapturingClient()
         layer = PhotoshopLayerProxy(PhotoshopSession(client), {"id": 11, "documentId": 7})
         for method, args in (("convert_to_smart_object", ()), ("new_smart_object_via_copy", ()), ("edit_contents", ()), ("replace_contents", ("C:/replacement.psb",))):
+            before_id = layer.id
             getattr(layer.smart_object, method)(*args)
-            self.assertEqual(client.calls[-1]["args"][0], {"layerId": 11, "documentId": 7})
+            self.assertEqual(client.calls[-1]["args"][0], {"layerId": before_id, "documentId": 7})
+            if method == "new_smart_object_via_copy":
+                self.assertEqual(layer.id, 13)
         child = layer.layers[0]
         child.smart_object.edit_contents()
         self.assertEqual(client.calls[-1]["args"][0], {"layerId": 12, "documentId": 7})

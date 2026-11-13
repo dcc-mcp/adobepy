@@ -762,10 +762,18 @@
     const layerId = property(layer, "id");
     const ownerId = asNumber(property(document, "id"));
     if (ownerId === void 0) unavailable("Photoshop layer owning document");
+    const beforeIds = request.method === "newSmartObjectViaCopy" || request.method === "convertToSmartObject" ? new Set(layerIdsInTree(property(document, "layers"))) : void 0;
     const selection = selectLayerDescriptor(layerId);
     const references = [layerReference(layerId), { _ref: "document", _id: ownerId }];
     const commands = [{ ...selection, _target: references }, ...descriptors.map((descriptor) => ({ ...descriptor, _target: references }))];
     await runBatchPlay(request, commands, {}, defaultCommandName);
+    if (beforeIds) {
+      const createdIds = [...new Set(layerIdsInTree(property(document, "layers")))].filter((id) => !beforeIds.has(id));
+      if (createdIds.length === 1) return serializeLayer(findLayer({ layerId: createdIds[0], documentId: ownerId }));
+      const converted = findLayerInTree(property(document, "layers"), layerId);
+      if (request.method === "convertToSmartObject" && createdIds.length === 0 && converted) return serializeLayer(converted);
+      unavailable("Photoshop created layer identity is missing or ambiguous");
+    }
     return serializeLayer(findLayerInTree(property(document, "layers"), layerId) ?? layer);
   }
   async function exportWithPreset(request) {
@@ -848,6 +856,15 @@
       if (match) return match;
     }
     return void 0;
+  }
+  function layerIdsInTree(layers) {
+    const ids = [];
+    for (const layer of asArray(layers)) {
+      const id = property(layer, "id");
+      if (id !== void 0 && id !== null) ids.push(String(id));
+      ids.push(...layerIdsInTree(property(layer, "layers")));
+    }
+    return ids;
   }
   function findLayerInTree(layers, id) {
     for (const layer of asArray(layers)) {

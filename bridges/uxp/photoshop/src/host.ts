@@ -602,10 +602,20 @@ async function smartObjectBatchPlay(request: RpcRequest, descriptors: Record<str
   const layerId = property(layer, "id");
   const ownerId = asNumber(property(document, "id"));
   if (ownerId === undefined) unavailable("Photoshop layer owning document");
+  const beforeIds = request.method === "newSmartObjectViaCopy" || request.method === "convertToSmartObject"
+    ? new Set(layerIdsInTree(property(document, "layers")))
+    : undefined;
   const selection = selectLayerDescriptor(layerId);
   const references = [layerReference(layerId), { _ref: "document", _id: ownerId }];
   const commands = [{ ...selection, _target: references }, ...descriptors.map((descriptor) => ({ ...descriptor, _target: references }))];
   await runBatchPlay(request, commands, {}, defaultCommandName);
+  if (beforeIds) {
+    const createdIds = [...new Set(layerIdsInTree(property(document, "layers")))].filter((id) => !beforeIds.has(id));
+    if (createdIds.length === 1) return serializeLayer(findLayer({ layerId: createdIds[0], documentId: ownerId }));
+    const converted = findLayerInTree(property(document, "layers"), layerId);
+    if (request.method === "convertToSmartObject" && createdIds.length === 0 && converted) return serializeLayer(converted);
+    unavailable("Photoshop created layer identity is missing or ambiguous");
+  }
   return serializeLayer(findLayerInTree(property(document, "layers"), layerId) ?? layer);
 }
 
@@ -697,6 +707,16 @@ function findChannel(document: unknown, idOrName: unknown) {
     if (match) return match;
   }
   return undefined;
+}
+
+function layerIdsInTree(layers: unknown): string[] {
+  const ids: string[] = [];
+  for (const layer of asArray(layers)) {
+    const id = property(layer, "id");
+    if (id !== undefined && id !== null) ids.push(String(id));
+    ids.push(...layerIdsInTree(property(layer, "layers")));
+  }
+  return ids;
 }
 
 function findLayerInTree(layers: unknown, id: unknown): unknown {
