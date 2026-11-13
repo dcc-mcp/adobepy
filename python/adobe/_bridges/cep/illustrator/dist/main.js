@@ -22,49 +22,117 @@
 
   // bridges/cep/core/src/rpc.ts
   function startCepBridge(config) {
+    var _a, _b, _c;
+    (_a = config.onStatus) == null ? void 0 : _a.call(config, "starting");
     const cep = globalThis.__adobe_cep__;
-    if (!cep || typeof cep.evalScript !== "function") throw new Error("Adobe CEP evalScript API unavailable");
+    if (!cep || typeof cep.evalScript !== "function") {
+      (_b = config.onStatus) == null ? void 0 : _b.call(config, "error");
+      throw new Error("Adobe CEP evalScript API unavailable");
+    }
     if (typeof config.token !== "string" || config.token.trim() === "") {
+      (_c = config.onStatus) == null ? void 0 : _c.call(config, "error");
       throw new Error("ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
     }
     const extensionPath = cep.getSystemPath("extension").replace(/\\/g, "/");
     const connect = async () => {
+      var _a2, _b2, _c2;
+      (_a2 = config.onStatus) == null ? void 0 : _a2.call(config, "connecting");
+      let failed = false;
       let identity;
       if (config.identityProvider) {
         try {
           const provided = config.identityProvider();
           identity = provided && typeof provided.then === "function" ? await provided : provided;
         } catch (e) {
+          failed = true;
+          (_b2 = config.onStatus) == null ? void 0 : _b2.call(config, "error");
           console.error("[adobepy] runtime identity is unavailable; exact-instance verification will fail closed.");
         }
       }
       const bootstrapNonce = boundedBootstrapNonce(globalThis.__ADOBEPY_BOOTSTRAP_NONCE);
       const capabilities = (identity == null ? void 0 : identity.host.hostVersion) ? { ...config.capabilities, hostVersion: identity.host.hostVersion } : config.capabilities;
-      const socket = new WebSocket(config.brokerUrl);
+      let socket;
+      try {
+        socket = new WebSocket(config.brokerUrl);
+      } catch (error) {
+        (_c2 = config.onStatus) == null ? void 0 : _c2.call(config, "error");
+        throw error;
+      }
       let greeted = false;
       const greet = () => {
+        var _a3, _b3;
         if (greeted || socket.readyState !== 1) return;
         greeted = true;
-        socket.send(JSON.stringify({
-          type: "hello",
-          token: config.token,
-          target: config.target,
-          capabilities,
-          ...identity ? { identity } : {},
-          ...bootstrapNonce ? { bootstrapNonce } : {}
-        }));
-        console.log("adobepy CEP bridge connected", capabilities);
+        try {
+          socket.send(JSON.stringify({
+            type: "hello",
+            token: config.token,
+            target: config.target,
+            capabilities,
+            ...identity ? { identity } : {},
+            ...bootstrapNonce ? { bootstrapNonce } : {}
+          }));
+        } catch (error) {
+          failed = true;
+          (_a3 = config.onStatus) == null ? void 0 : _a3.call(config, "error");
+          throw error;
+        }
+        (_b3 = config.onStatus) == null ? void 0 : _b3.call(config, failed ? "error" : "ready");
+        console.log("adobepy CEP bridge hello sent; connection verification pending", capabilities);
       };
       socket.onopen = greet;
+      socket.onerror = () => {
+        var _a3;
+        failed = true;
+        (_a3 = config.onStatus) == null ? void 0 : _a3.call(config, "error");
+      };
+      socket.onclose = () => {
+        var _a3;
+        return (_a3 = config.onStatus) == null ? void 0 : _a3.call(config, failed ? "error" : "disconnected");
+      };
       setTimeout(greet, 0);
+      const reportProtocolViolation = (reason) => {
+        var _a3;
+        failed = true;
+        (_a3 = config.onStatus) == null ? void 0 : _a3.call(config, "error");
+        console.error(`[adobepy] ${reason}`);
+        try {
+          socket.send(JSON.stringify({
+            type: "error",
+            error: {
+              jsonrpc: "2.0",
+              id: null,
+              error: { code: ERROR_CODES.ERROR_PARSE, message: "Invalid bridge frame" }
+            }
+          }));
+        } catch (e) {
+        }
+        if (typeof socket.close === "function") socket.close();
+      };
       socket.onmessage = (event) => {
-        const message = JSON.parse(event.data);
+        var _a3;
+        let message;
+        try {
+          message = JSON.parse(event.data);
+        } catch (e) {
+          reportProtocolViolation("Invalid JSON frame from broker");
+          return;
+        }
+        if (!isBridgeEnvelope(message)) {
+          reportProtocolViolation("Invalid bridge frame from broker");
+          return;
+        }
+        if (isBrokerError(message)) {
+          failed = true;
+          (_a3 = config.onStatus) == null ? void 0 : _a3.call(config, "error");
+          return;
+        }
         if (message.type !== "request") return;
         const request = message.request;
         const requestLiteral = JSON.stringify(JSON.stringify(request)).replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
         try {
           cep.evalScript(`adobepyDispatch(${requestLiteral})`, (raw) => {
-            var _a;
+            var _a4;
             try {
               if (typeof raw !== "string" || raw.trim() === "") {
                 throw new Error("Adobe CEP evalScript returned no JSON response");
@@ -74,7 +142,7 @@
               }
               const parsed = JSON.parse(raw);
               if (parsed.error) {
-                socket.send(JSON.stringify({ type: "error", error: { ...parsed, id: (_a = parsed.id) != null ? _a : request.id } }));
+                socket.send(JSON.stringify({ type: "error", error: { ...parsed, id: (_a4 = parsed.id) != null ? _a4 : request.id } }));
                 return;
               }
               if (!Object.prototype.hasOwnProperty.call(parsed, "result")) parsed.result = null;
@@ -97,8 +165,12 @@
         'typeof JSON.stringify === "function"'
       ].join(" && ");
       cep.evalScript(`${probe} ? "ready" : "missing"`, (status) => {
+        var _a2;
         if (status === "ready") void connect();
-        else console.error("adobepy CEP host runtime failed to initialize", status);
+        else {
+          (_a2 = config.onStatus) == null ? void 0 : _a2.call(config, "error");
+          console.error("adobepy CEP host runtime failed to initialize", status);
+        }
       });
     };
     const loadDispatcher = () => {
@@ -114,6 +186,12 @@
   }
   function hostScriptError(id, error) {
     return { jsonrpc: "2.0", id, error: { code: ERROR_CODES.ERROR_HOST_SCRIPT, message: (error == null ? void 0 : error.message) || String(error) } };
+  }
+  function isBridgeEnvelope(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+  function isBrokerError(message) {
+    return Boolean(message.error) && (message.type === "error" || message.jsonrpc === "2.0");
   }
 
   // bridges/cep/illustrator/src/identity.ts

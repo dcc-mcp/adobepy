@@ -46,34 +46,91 @@
   }
 
   // bridges/uxp/core/src/rpc.ts
-  function connectBridge(adapter, identityProvider) {
+  function connectBridge(adapter, identityProvider, onStatus) {
+    onStatus?.("starting");
     const url = globalThis.__ADOBEPY_BROKER_URL || `ws://127.0.0.1:47391/v1/bridge/${adapter.capabilities().host}/ws`;
     const token = globalThis.__ADOBEPY_TOKEN;
     if (typeof token !== "string" || token.trim() === "") {
+      onStatus?.("error");
       console.error("[adobepy] ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
       return;
     }
     const target = globalThis.__ADOBEPY_TARGET || "default";
-    const socket = new WebSocket(url);
+    onStatus?.("connecting");
+    let failed = false;
+    let socket;
+    try {
+      socket = new WebSocket(url);
+    } catch (error) {
+      onStatus?.("error");
+      throw error;
+    }
+    socket.addEventListener("error", () => {
+      failed = true;
+      onStatus?.("error");
+    });
+    socket.addEventListener("close", () => onStatus?.(failed ? "error" : "disconnected"));
     socket.addEventListener("open", async () => {
       let identity;
       try {
         identity = await identityProvider?.();
       } catch {
+        failed = true;
+        onStatus?.("error");
         console.error("[adobepy] runtime identity is unavailable; exact-instance verification will fail closed.");
       }
+      if (socket.readyState !== 1) return;
       const bootstrapNonce = boundedBootstrapNonce(globalThis.__ADOBEPY_BOOTSTRAP_NONCE);
-      socket.send(JSON.stringify({
-        type: "hello",
-        token,
-        target,
-        capabilities: adapter.capabilities(),
-        ...identity ? { identity } : {},
-        ...bootstrapNonce ? { bootstrapNonce } : {}
-      }));
+      try {
+        socket.send(JSON.stringify({
+          type: "hello",
+          token,
+          target,
+          capabilities: adapter.capabilities(),
+          ...identity ? { identity } : {},
+          ...bootstrapNonce ? { bootstrapNonce } : {}
+        }));
+      } catch (error) {
+        failed = true;
+        onStatus?.("error");
+        throw error;
+      }
+      onStatus?.(failed ? "error" : "ready");
     });
+    const reportProtocolViolation = (reason) => {
+      failed = true;
+      onStatus?.("error");
+      console.error(`[adobepy] ${reason}`);
+      try {
+        socket.send(JSON.stringify({
+          type: "error",
+          error: {
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: ERROR_CODES.ERROR_PARSE, message: "Invalid bridge frame" }
+          }
+        }));
+      } catch {
+      }
+      if (typeof socket.close === "function") socket.close();
+    };
     socket.addEventListener("message", async (event) => {
-      const message = JSON.parse(event.data);
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch {
+        reportProtocolViolation("Invalid JSON frame from broker");
+        return;
+      }
+      if (!isBridgeEnvelope(message)) {
+        reportProtocolViolation("Invalid bridge frame from broker");
+        return;
+      }
+      if (isBrokerError(message)) {
+        failed = true;
+        onStatus?.("error");
+        return;
+      }
       if (message.type !== "request") return;
       const request = message.request;
       try {
@@ -83,6 +140,12 @@
         socket.send(JSON.stringify({ type: "error", error: hostError(request.id, error) }));
       }
     });
+  }
+  function isBridgeEnvelope(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+  function isBrokerError(message) {
+    return Boolean(message.error) && (message.type === "error" || message.jsonrpc === "2.0");
   }
   function boundedBootstrapNonce(value) {
     return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : void 0;
@@ -132,9 +195,18 @@
     }
     return void 0;
   }
-  function property(value, name) {
-    if (!isObject(value)) return void 0;
+  var BLOCKED_MEMBERS = /* @__PURE__ */ new Set(["__proto__", "constructor", "prototype"]);
+  function readMember(value, name) {
+    if (!isObject(value) && typeof value !== "function" || BLOCKED_MEMBERS.has(String(name))) {
+      return void 0;
+    }
+    if (typeof value === "function" && !Object.prototype.hasOwnProperty.call(value, name)) {
+      return void 0;
+    }
     return value[name];
+  }
+  function property(value, name) {
+    return readMember(value, name);
   }
   async function maybePromise(value) {
     return await value;
@@ -159,7 +231,6 @@
   // bridges/uxp/core/src/dom.ts
   var REFERENCE_KEY = "$adobepyRef";
   var TYPE_KEY = "$adobepyType";
-  var BLOCKED_MEMBERS = /* @__PURE__ */ new Set(["__proto__", "constructor", "prototype"]);
   var DomRuntime = class {
     constructor(options) {
       this.options = options;
@@ -182,7 +253,7 @@
       if (request.method === "get") {
         const receiver = this.resolve(request.args?.[0]);
         const member = requiredMember(request.args?.[1]);
-        return this.encode(await maybePromise(readMember(receiver, member)));
+        return this.encode(await maybePromise(readMember2(receiver, member)));
       }
       if (request.method === "set") {
         return this.runMutation(request, "Set official DOM property", async () => {
@@ -190,14 +261,14 @@
           const member = requiredMember(request.args?.[1]);
           const value = this.decode(request.args?.[2]);
           writeMember(receiver, member, value);
-          return this.encode(await maybePromise(readMember(receiver, member)));
+          return this.encode(await maybePromise(readMember2(receiver, member)));
         });
       }
       if (request.method === "call") {
         const operation = async () => {
           const receiver = this.resolve(request.args?.[0]);
           const member = requiredMember(request.args?.[1]);
-          const callable = readMember(receiver, member);
+          const callable = readMember2(receiver, member);
           if (typeof callable !== "function") {
             throw new BridgeRpcError(ERROR_HOST_SCRIPT, `official DOM member '${String(member)}' is not callable`);
           }
@@ -213,7 +284,7 @@
         return this.runMutation(request, "Construct official DOM object", async () => {
           const receiver = this.resolve(request.args?.[0]);
           const member = requiredMember(request.args?.[1]);
-          const constructor = readMember(receiver, member);
+          const constructor = readMember2(receiver, member);
           if (typeof constructor !== "function") {
             throw new BridgeRpcError(ERROR_HOST_SCRIPT, `official DOM member '${String(member)}' is not a constructor`);
           }
@@ -230,7 +301,7 @@
         const snapshot = {};
         for (const member of members) {
           try {
-            const value = await maybePromise(readMember(receiver, member));
+            const value = await maybePromise(readMember2(receiver, member));
             if (typeof value !== "function") snapshot[String(member)] = this.encode(value);
           } catch (error) {
             snapshot[String(member)] = {
@@ -320,11 +391,11 @@
     }
     return value;
   }
-  function readMember(receiver, member) {
+  function readMember2(receiver, member) {
     if (typeof receiver !== "object" && typeof receiver !== "function" || receiver === null) {
       throw new BridgeRpcError(ERROR_HOST_SCRIPT, `cannot read '${String(member)}' from a primitive value`);
     }
-    return receiver[member];
+    return readMember(receiver, member);
   }
   function writeMember(receiver, member, value) {
     if (typeof receiver !== "object" && typeof receiver !== "function" || receiver === null) {
@@ -335,8 +406,9 @@
   function collectKeys(value) {
     if (typeof value !== "object" && typeof value !== "function" || value === null) return [];
     const keys = /* @__PURE__ */ new Set();
+    const maxDepth = typeof value === "function" ? 1 : 8;
     let current = value;
-    for (let depth = 0; current && depth < 8; depth += 1) {
+    for (let depth = 0; current && depth < maxDepth; depth += 1) {
       try {
         for (const key of Object.getOwnPropertyNames(current)) {
           if (!BLOCKED_MEMBERS.has(key) && key !== "constructor") keys.add(key);
@@ -361,8 +433,12 @@
     if (!isObject(value)) return typeof value;
     const typename = asString(property(value, "typename")) ?? asString(property(value, "typeName"));
     if (typename) return typename;
-    const constructor = property(value, "constructor");
-    return asString(constructor?.name) ?? "Object";
+    try {
+      const prototype = Object.getPrototypeOf(value);
+      return asString(prototype?.constructor?.name) ?? "Object";
+    } catch {
+      return "Object";
+    }
   }
 
   // bridges/uxp/indesign/src/host.ts

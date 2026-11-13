@@ -46,34 +46,91 @@
   }
 
   // bridges/uxp/core/src/rpc.ts
-  function connectBridge(adapter, identityProvider) {
+  function connectBridge(adapter, identityProvider, onStatus) {
+    onStatus?.("starting");
     const url = globalThis.__ADOBEPY_BROKER_URL || `ws://127.0.0.1:47391/v1/bridge/${adapter.capabilities().host}/ws`;
     const token = globalThis.__ADOBEPY_TOKEN;
     if (typeof token !== "string" || token.trim() === "") {
+      onStatus?.("error");
       console.error("[adobepy] ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
       return;
     }
     const target = globalThis.__ADOBEPY_TARGET || "default";
-    const socket = new WebSocket(url);
+    onStatus?.("connecting");
+    let failed = false;
+    let socket;
+    try {
+      socket = new WebSocket(url);
+    } catch (error) {
+      onStatus?.("error");
+      throw error;
+    }
+    socket.addEventListener("error", () => {
+      failed = true;
+      onStatus?.("error");
+    });
+    socket.addEventListener("close", () => onStatus?.(failed ? "error" : "disconnected"));
     socket.addEventListener("open", async () => {
       let identity;
       try {
         identity = await identityProvider?.();
       } catch {
+        failed = true;
+        onStatus?.("error");
         console.error("[adobepy] runtime identity is unavailable; exact-instance verification will fail closed.");
       }
+      if (socket.readyState !== 1) return;
       const bootstrapNonce = boundedBootstrapNonce(globalThis.__ADOBEPY_BOOTSTRAP_NONCE);
-      socket.send(JSON.stringify({
-        type: "hello",
-        token,
-        target,
-        capabilities: adapter.capabilities(),
-        ...identity ? { identity } : {},
-        ...bootstrapNonce ? { bootstrapNonce } : {}
-      }));
+      try {
+        socket.send(JSON.stringify({
+          type: "hello",
+          token,
+          target,
+          capabilities: adapter.capabilities(),
+          ...identity ? { identity } : {},
+          ...bootstrapNonce ? { bootstrapNonce } : {}
+        }));
+      } catch (error) {
+        failed = true;
+        onStatus?.("error");
+        throw error;
+      }
+      onStatus?.(failed ? "error" : "ready");
     });
+    const reportProtocolViolation = (reason) => {
+      failed = true;
+      onStatus?.("error");
+      console.error(`[adobepy] ${reason}`);
+      try {
+        socket.send(JSON.stringify({
+          type: "error",
+          error: {
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: ERROR_CODES.ERROR_PARSE, message: "Invalid bridge frame" }
+          }
+        }));
+      } catch {
+      }
+      if (typeof socket.close === "function") socket.close();
+    };
     socket.addEventListener("message", async (event) => {
-      const message = JSON.parse(event.data);
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch {
+        reportProtocolViolation("Invalid JSON frame from broker");
+        return;
+      }
+      if (!isBridgeEnvelope(message)) {
+        reportProtocolViolation("Invalid bridge frame from broker");
+        return;
+      }
+      if (isBrokerError(message)) {
+        failed = true;
+        onStatus?.("error");
+        return;
+      }
       if (message.type !== "request") return;
       const request = message.request;
       try {
@@ -83,6 +140,12 @@
         socket.send(JSON.stringify({ type: "error", error: hostError(request.id, error) }));
       }
     });
+  }
+  function isBridgeEnvelope(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+  function isBrokerError(message) {
+    return Boolean(message.error) && (message.type === "error" || message.jsonrpc === "2.0");
   }
   function boundedBootstrapNonce(value) {
     return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : void 0;
@@ -108,17 +171,6 @@
   function isObject(value) {
     return typeof value === "object" && value !== null;
   }
-  function asArray(value) {
-    if (Array.isArray(value)) return value;
-    if (!isObject(value)) return [];
-    const iterable = value;
-    if (typeof iterable[Symbol.iterator] === "function") return Array.from(iterable);
-    const length = value.length;
-    if (typeof length === "number") {
-      return Array.from({ length }, (_, index) => value[index]).filter((item) => item !== void 0);
-    }
-    return [];
-  }
   function asString(value) {
     if (typeof value === "string" && value.length > 0) return value;
     if (typeof value === "number" || typeof value === "boolean") return String(value);
@@ -132,9 +184,18 @@
     }
     return void 0;
   }
-  function property(value, name) {
-    if (!isObject(value)) return void 0;
+  var BLOCKED_MEMBERS = /* @__PURE__ */ new Set(["__proto__", "constructor", "prototype"]);
+  function readMember(value, name) {
+    if (!isObject(value) && typeof value !== "function" || BLOCKED_MEMBERS.has(String(name))) {
+      return void 0;
+    }
+    if (typeof value === "function" && !Object.prototype.hasOwnProperty.call(value, name)) {
+      return void 0;
+    }
     return value[name];
+  }
+  function property(value, name) {
+    return readMember(value, name);
   }
   async function maybePromise(value) {
     return await value;
@@ -152,7 +213,6 @@
   // bridges/uxp/core/src/dom.ts
   var REFERENCE_KEY = "$adobepyRef";
   var TYPE_KEY = "$adobepyType";
-  var BLOCKED_MEMBERS = /* @__PURE__ */ new Set(["__proto__", "constructor", "prototype"]);
   var DomRuntime = class {
     constructor(options) {
       this.options = options;
@@ -175,7 +235,7 @@
       if (request.method === "get") {
         const receiver = this.resolve(request.args?.[0]);
         const member = requiredMember(request.args?.[1]);
-        return this.encode(await maybePromise(readMember(receiver, member)));
+        return this.encode(await maybePromise(readMember2(receiver, member)));
       }
       if (request.method === "set") {
         return this.runMutation(request, "Set official DOM property", async () => {
@@ -183,14 +243,14 @@
           const member = requiredMember(request.args?.[1]);
           const value = this.decode(request.args?.[2]);
           writeMember(receiver, member, value);
-          return this.encode(await maybePromise(readMember(receiver, member)));
+          return this.encode(await maybePromise(readMember2(receiver, member)));
         });
       }
       if (request.method === "call") {
         const operation = async () => {
           const receiver = this.resolve(request.args?.[0]);
           const member = requiredMember(request.args?.[1]);
-          const callable = readMember(receiver, member);
+          const callable = readMember2(receiver, member);
           if (typeof callable !== "function") {
             throw new BridgeRpcError(ERROR_HOST_SCRIPT, `official DOM member '${String(member)}' is not callable`);
           }
@@ -206,7 +266,7 @@
         return this.runMutation(request, "Construct official DOM object", async () => {
           const receiver = this.resolve(request.args?.[0]);
           const member = requiredMember(request.args?.[1]);
-          const constructor = readMember(receiver, member);
+          const constructor = readMember2(receiver, member);
           if (typeof constructor !== "function") {
             throw new BridgeRpcError(ERROR_HOST_SCRIPT, `official DOM member '${String(member)}' is not a constructor`);
           }
@@ -223,7 +283,7 @@
         const snapshot = {};
         for (const member of members) {
           try {
-            const value = await maybePromise(readMember(receiver, member));
+            const value = await maybePromise(readMember2(receiver, member));
             if (typeof value !== "function") snapshot[String(member)] = this.encode(value);
           } catch (error) {
             snapshot[String(member)] = {
@@ -313,11 +373,11 @@
     }
     return value;
   }
-  function readMember(receiver, member) {
+  function readMember2(receiver, member) {
     if (typeof receiver !== "object" && typeof receiver !== "function" || receiver === null) {
       throw new BridgeRpcError(ERROR_HOST_SCRIPT, `cannot read '${String(member)}' from a primitive value`);
     }
-    return receiver[member];
+    return readMember(receiver, member);
   }
   function writeMember(receiver, member, value) {
     if (typeof receiver !== "object" && typeof receiver !== "function" || receiver === null) {
@@ -328,8 +388,9 @@
   function collectKeys(value) {
     if (typeof value !== "object" && typeof value !== "function" || value === null) return [];
     const keys = /* @__PURE__ */ new Set();
+    const maxDepth = typeof value === "function" ? 1 : 8;
     let current = value;
-    for (let depth = 0; current && depth < 8; depth += 1) {
+    for (let depth = 0; current && depth < maxDepth; depth += 1) {
       try {
         for (const key of Object.getOwnPropertyNames(current)) {
           if (!BLOCKED_MEMBERS.has(key) && key !== "constructor") keys.add(key);
@@ -354,11 +415,16 @@
     if (!isObject(value)) return typeof value;
     const typename = asString(property(value, "typename")) ?? asString(property(value, "typeName"));
     if (typename) return typename;
-    const constructor = property(value, "constructor");
-    return asString(constructor?.name) ?? "Object";
+    try {
+      const prototype = Object.getPrototypeOf(value);
+      return asString(prototype?.constructor?.name) ?? "Object";
+    } catch {
+      return "Object";
+    }
   }
 
   // bridges/uxp/premiere/src/host.ts
+  var COLLECTION_LIMIT = 1e4;
   var domRuntime = new DomRuntime({
     roots(name) {
       if (name === "app" || name === "module" || name === "premierepro") return premiereModule();
@@ -403,10 +469,10 @@
       if (request.namespace === "project" && request.method === "createSequence") return createSequence(request);
       if (request.namespace === "project" && request.method === "importFiles") return importFiles(request);
       if (request.namespace === "sequence" && request.method === "getVideoTracks") {
-        return serializeTracks(sequenceTracks(await requireSequence(request.args?.[0]), "video"), "video");
+        return serializeTracks(await sequenceTracks(await requireSequence(request.args?.[0]), "video"), "video");
       }
       if (request.namespace === "sequence" && request.method === "getAudioTracks") {
-        return serializeTracks(sequenceTracks(await requireSequence(request.args?.[0]), "audio"), "audio");
+        return serializeTracks(await sequenceTracks(await requireSequence(request.args?.[0]), "audio"), "audio");
       }
       if (request.namespace === "sequence" && request.method === "insertProjectItem") return editProjectItem(request, false);
       if (request.namespace === "sequence" && request.method === "overwriteProjectItem") return editProjectItem(request, true);
@@ -451,9 +517,9 @@
   async function projectSequences(project) {
     if (!project) return [];
     const getSequences = property(project, "getSequences");
-    if (getSequences) return collectionItems(await maybePromise(getSequences.call(project)));
+    if (getSequences) return await collectionItems(await maybePromise(getSequences.call(project)), true);
     const sequences = property(project, "sequences") ?? property(project, "sequenceCollection");
-    return collectionItems(sequences);
+    return await collectionItems(sequences, true);
   }
   async function saveProject() {
     const project = await activeProject();
@@ -502,7 +568,7 @@
       const add = property(compound, "addAction") ?? property(compound, "add");
       if (add) add.call(compound, action);
     }, asString(request.options?.commandName) ?? (overwrite ? "Overwrite project item" : "Insert project item")));
-    return { edited: true, mode: overwrite ? "overwrite" : "insert", sequence: serializeSequence(sequence), projectItem: serializeProjectItem(item) };
+    return { edited: true, mode: overwrite ? "overwrite" : "insert", sequence: await serializeSequence(sequence), projectItem: await serializeProjectItem(item) };
   }
   function premiereTickTime(value) {
     if (isObject(value) && property(value, "ticks") !== void 0) return value;
@@ -537,6 +603,7 @@
   function sequenceMatches(sequence, idOrName) {
     if (!isObject(sequence)) return false;
     if (idOrName === void 0 || idOrName === null) return true;
+    const target = String(idOrName);
     const values = [
       property(sequence, "id"),
       property(sequence, "guid"),
@@ -544,13 +611,20 @@
       property(sequence, "sequenceID"),
       property(sequence, "name")
     ];
-    return values.some((value) => value !== void 0 && String(value) === String(idOrName));
+    return values.some((value) => {
+      if (value === void 0 || value === null) return false;
+      const serialized = serializeId(value);
+      return serialized !== void 0 && String(serialized) === target;
+    });
+  }
+  function isThenable(value) {
+    return (isObject(value) || typeof value === "function") && typeof value.then === "function";
   }
   function serializeProject(project) {
     if (!isObject(project)) return null;
     return {
-      id: property(project, "guid") ?? property(project, "id"),
-      guid: property(project, "guid"),
+      id: serializeId(property(project, "guid") ?? property(project, "id")),
+      guid: serializeId(property(project, "guid")),
       name: asString(property(project, "name")),
       path: asString(property(project, "path")),
       itemCount: asNumber(property(project, "itemCount")) ?? asNumber(property(project, "numItems"))
@@ -565,7 +639,7 @@
   async function requireProjectItem(idOrName) {
     const project = await activeProject();
     const root = await rootProjectItem(project);
-    const item = findProjectItem(root, idOrName);
+    const item = await findProjectItem(root, idOrName);
     if (!item) unavailable("Premiere project item");
     return item;
   }
@@ -582,22 +656,25 @@
     const suppressUI = booleanValue(property(payload, "suppressUI") ?? property(payload, "suppress_ui")) ?? true;
     const asNumberedStills = booleanValue(property(payload, "asNumberedStills") ?? property(payload, "as_numbered_stills")) ?? false;
     const result = await maybePromise(importProjectFiles.call(project, filePaths, suppressUI, targetBin, asNumberedStills));
-    const resultItems = collectionItems(result);
+    const resultItems = await collectionItems(result);
     if (resultItems.length > 0) return serializeProjectItems(resultItems);
-    return serializeProjectItems(findImportedProjectItems(filePaths, targetBin ?? await rootProjectItem(project)));
+    return serializeProjectItems(await findImportedProjectItems(filePaths, targetBin ?? await rootProjectItem(project)));
   }
   async function projectItemChildren(request) {
     const item = request.args?.[0] === void 0 || request.args?.[0] === null ? await rootProjectItem() : await requireProjectItem(request.args?.[0]);
-    return serializeProjectItems(projectItemChildObjects(item));
+    return serializeProjectItems(await projectItemChildObjects(item));
   }
   async function selectedProjectItems() {
     const premiere = premiereModule();
     const project = await activeProject();
     const projectUtils = property(premiere, "ProjectUtils") ?? property(premiere, "projectUtils");
     const getSelection = property(projectUtils, "getSelection");
-    if (getSelection) return serializeProjectItems(collectionItems(await maybePromise(getSelection.call(projectUtils, project))));
+    if (getSelection) {
+      const selection2 = await maybePromise(getSelection.call(projectUtils, project));
+      return serializeProjectItems(await collectionItems(await readValue(selection2, "getItems") ?? selection2, true));
+    }
     const selection = property(project, "selection") ?? property(premiere, "selection");
-    return serializeProjectItems(collectionItems(selection));
+    return serializeProjectItems(await collectionItems(selection, true));
   }
   async function projectItemsByMediaPath(request) {
     const root = request.args?.[0] === void 0 || request.args?.[0] === null ? await rootProjectItem() : await requireProjectItem(request.args?.[0]);
@@ -605,8 +682,9 @@
     const ignoreSubclips = booleanValue(request.args?.[2]) ?? false;
     if (!matchString) unavailable("Premiere media path match");
     const directFind = property(root, "findItemsMatchingMediaPath");
-    if (directFind) return serializeProjectItems(collectionItems(await maybePromise(directFind.call(root, matchString, ignoreSubclips))));
-    return serializeProjectItems(findProjectItemsMatchingMediaPath(root, matchString));
+    if (directFind) return serializeProjectItems(await collectionItems(await maybePromise(directFind.call(root, matchString, ignoreSubclips))));
+    if (ignoreSubclips) unavailable("Premiere media path search excluding subclips");
+    return serializeProjectItems(await findProjectItemsMatchingMediaPath(root, matchString));
   }
   async function createBin(request) {
     const project = await activeProject();
@@ -620,7 +698,7 @@
     const createDirect = property(parent, "createBin");
     if (createDirect) {
       const created = await maybePromise(createDirect.call(parent, name, makeUnique));
-      return serializeProjectItem(isObject(created) ? created : findProjectItem(parent, name));
+      return serializeProjectItem(isObject(created) ? created : await findProjectItem(parent, name));
     }
     const createAction = property(parent, "createBinAction");
     const executeTransaction = property(project, "executeTransaction");
@@ -636,90 +714,146 @@
           asString(request.options?.commandName) ?? "Create bin"
         )
       );
-      return serializeProjectItem(findProjectItem(parent, name));
+      return serializeProjectItem(await findProjectItem(parent, name));
     }
     unavailable("Premiere bin.create");
   }
-  function serializeSequences(sequences) {
-    return sequences.map(serializeSequence).filter((sequence) => sequence !== null);
+  async function serializeSequences(sequences) {
+    return (await Promise.all(sequences.map(serializeSequence))).filter((sequence) => sequence !== null);
   }
-  function serializeSequence(sequence) {
+  async function serializeSequence(sequence) {
     if (!isObject(sequence)) return null;
+    const id = sequenceId(sequence);
     return {
-      id: property(sequence, "id") ?? property(sequence, "guid") ?? property(sequence, "sequenceId") ?? property(sequence, "sequenceID"),
-      guid: property(sequence, "guid"),
-      sequenceId: property(sequence, "sequenceId") ?? property(sequence, "sequenceID"),
+      id,
+      guid: serializeId(property(sequence, "guid")),
+      sequenceId: serializeId(property(sequence, "sequenceId") ?? property(sequence, "sequenceID")) ?? id,
       name: asString(property(sequence, "name")),
-      duration: serializeTime(property(sequence, "duration") ?? property(sequence, "end")),
-      timebase: property(sequence, "timebase") ?? property(sequence, "videoDisplayFormat"),
+      duration: serializeTime(await readValue(sequence, "getEndTime", "duration", "end")),
+      timebase: await readValue(sequence, "getTimebase", "timebase", "videoDisplayFormat"),
       typename: asString(property(sequence, "typename")) ?? asString(property(sequence, "typeName"))
     };
   }
-  function sequenceTracks(sequence, mediaType) {
+  function sequenceId(sequence) {
+    return serializeId(property(sequence, "id") ?? property(sequence, "guid") ?? property(sequence, "sequenceId") ?? property(sequence, "sequenceID"));
+  }
+  async function sequenceTracks(sequence, mediaType) {
+    const prefix = mediaType === "video" ? "Video" : "Audio";
+    const getCount = property(sequence, `get${prefix}TrackCount`);
+    const getTrack = property(sequence, `get${prefix}Track`);
+    if (getCount || getTrack) {
+      if (!getCount || !getTrack) unavailable(`Premiere ${mediaType} track enumeration`);
+      const count = await maybePromise(getCount.call(sequence));
+      validateCollectionCount(count);
+      const tracks = [];
+      for (let index = 0; index < count; index += 1) {
+        const track = await maybePromise(getTrack.call(sequence, index));
+        if (!isObject(track)) unavailable(`Premiere ${mediaType} track at index ${index}`);
+        tracks.push(track);
+      }
+      return tracks;
+    }
     const propertyName = mediaType === "video" ? "videoTracks" : "audioTracks";
-    return collectionItems(property(sequence, propertyName));
+    return await collectionItems(property(sequence, propertyName), true);
   }
-  function serializeTracks(tracks, mediaType) {
-    return tracks.map((track, index) => serializeTrack(track, index, mediaType)).filter((track) => track !== null);
+  async function serializeTracks(tracks, mediaType) {
+    return Promise.all(tracks.map((track, index) => serializeTrack(track, index, mediaType)));
   }
-  function serializeTrack(track, index, mediaType) {
-    if (!isObject(track)) return null;
+  async function serializeTrack(track, index, mediaType) {
+    if (!isObject(track)) unavailable("Premiere track object");
     return {
-      id: property(track, "id") ?? property(track, "trackID") ?? property(track, "trackId") ?? index,
+      id: serializeId(property(track, "id") ?? property(track, "trackID") ?? property(track, "trackId")) ?? index,
       name: asString(property(track, "name")),
-      index: asNumber(property(track, "index")) ?? index,
+      index: asNumber(await readValue(track, "getIndex", "index")) ?? index,
       mediaType,
-      isLocked: booleanValue(property(track, "isLocked") ?? property(track, "locked")),
-      isMuted: booleanValue(property(track, "isMuted") ?? property(track, "muted")),
-      isTargeted: booleanValue(property(track, "isTargeted") ?? property(track, "targeted")),
+      isLocked: booleanValue(await readValue(track, "isLocked", "locked")),
+      isMuted: booleanValue(await readValue(track, "isMuted", "muted")),
+      isTargeted: booleanValue(await readValue(track, "isTargeted", "targeted")),
       typename: asString(property(track, "typename")) ?? asString(property(track, "typeName"))
     };
   }
   async function trackClips(request) {
     const sequence = await requireSequence(request.args?.[0]);
     const mediaType = normalizeMediaType(request.args?.[1]);
-    const track = findTrack(sequence, mediaType, request.args?.[2]);
-    if (!track) unavailable("Premiere track");
-    return collectionItems(property(track, "clips")).map(serializeClip).filter((clip) => clip !== null);
+    const found = await findTrack(sequence, mediaType, request.args?.[2]);
+    if (!found) unavailable("Premiere track");
+    const clips = await trackClipObjects(found.track);
+    return Promise.all(clips.map((clip, index) => serializeClip(clip, sequence, mediaType, found.index, index)));
   }
-  function selectedClips(sequence) {
-    const clips = [
-      ...sequenceTracks(sequence, "video").flatMap((track) => collectionItems(property(track, "clips"))),
-      ...sequenceTracks(sequence, "audio").flatMap((track) => collectionItems(property(track, "clips")))
-    ];
-    return clips.filter((clip) => booleanValue(property(clip, "isSelected") ?? property(clip, "selected")) === true).map(serializeClip).filter((clip) => clip !== null);
+  async function selectedClips(sequence) {
+    const selected = [];
+    let count = 0;
+    for (const mediaType of ["video", "audio"]) {
+      const tracks = await sequenceTracks(sequence, mediaType);
+      for (let trackIndex = 0; trackIndex < tracks.length; trackIndex += 1) {
+        const clips = await trackClipObjects(tracks[trackIndex]);
+        count += clips.length;
+        validateCollectionCount(count);
+        for (let index = 0; index < clips.length; index += 1) {
+          if (booleanValue(await readValue(clips[index], "getIsSelected", "isSelected", "selected")) === true) {
+            selected.push(await serializeClip(clips[index], sequence, mediaType, trackIndex, index));
+          }
+        }
+      }
+    }
+    return selected;
   }
-  function findTrack(sequence, mediaType, idOrIndex) {
-    const tracks = sequenceTracks(sequence, mediaType);
-    if (idOrIndex === void 0 || idOrIndex === null) return tracks[0];
-    return tracks.find((track, index) => {
-      const values = [property(track, "id"), property(track, "trackID"), property(track, "trackId"), property(track, "name"), property(track, "index"), index];
-      return values.some((value) => value !== void 0 && String(value) === String(idOrIndex));
-    });
+  async function findTrack(sequence, mediaType, idOrIndex) {
+    const tracks = await sequenceTracks(sequence, mediaType);
+    let index = 0;
+    if (idOrIndex !== void 0 && idOrIndex !== null) {
+      const matches = (value) => value !== void 0 && String(value) === String(idOrIndex);
+      index = tracks.findIndex((track) => matches(serializeId(property(track, "id") ?? property(track, "trackID") ?? property(track, "trackId"))));
+      if (index < 0) index = tracks.findIndex((track) => matches(property(track, "name")));
+      if (index < 0) {
+        const indices = await Promise.all(tracks.map((track, position) => readValue(track, "getIndex", "index").then((value) => value ?? position)));
+        index = indices.findIndex(matches);
+      }
+    }
+    return index >= 0 && tracks[index] ? { track: tracks[index], index } : void 0;
   }
-  function serializeClip(clip) {
-    if (!isObject(clip)) return null;
-    const projectItem = property(clip, "projectItem");
+  async function trackClipObjects(track) {
+    const getTrackItems = property(track, "getTrackItems");
+    if (getTrackItems) {
+      const constants = property(premiereModule(), "Constants") ?? property(premiereModule(), "constants");
+      const clipType = property(property(constants, "TrackItemType"), "CLIP");
+      if (clipType === void 0) unavailable("Premiere TrackItemType.CLIP");
+      return await collectionItems(await maybePromise(getTrackItems.call(track, clipType, false)), true);
+    }
+    return await collectionItems(property(track, "clips"), true);
+  }
+  async function serializeClip(clip, sequence, mediaType, trackIndex, clipIndex) {
+    if (!isObject(clip)) unavailable("Premiere clip object");
+    const projectItem = await readValue(clip, "getProjectItem", "projectItem");
+    const nativeId = serializeId(property(clip, "id") ?? property(clip, "nodeId") ?? property(clip, "nodeID"));
+    const parentSequenceId = sequenceId(sequence);
+    if (nativeId === void 0 && parentSequenceId === void 0) unavailable("Premiere clip sequence ID");
+    let isEnabled = booleanValue(await readValue(clip, "isEnabled", "enabled"));
+    if (isEnabled === void 0) {
+      const disabled = booleanValue(await readValue(clip, "isDisabled"));
+      if (disabled !== void 0) isEnabled = !disabled;
+    }
     return {
-      id: property(clip, "id") ?? property(clip, "nodeId") ?? property(clip, "nodeID"),
-      name: asString(property(clip, "name")) ?? asString(property(projectItem, "name")),
-      projectItemId: property(projectItem, "id") ?? property(projectItem, "nodeId") ?? property(projectItem, "nodeID"),
-      mediaPath: asString(property(clip, "mediaPath")) ?? asString(property(projectItem, "mediaPath")) ?? asString(property(projectItem, "treePath")),
-      start: serializeTime(property(clip, "start")),
-      end: serializeTime(property(clip, "end")),
-      inPoint: serializeTime(property(clip, "inPoint")),
-      outPoint: serializeTime(property(clip, "outPoint")),
-      duration: serializeTime(property(clip, "duration")),
-      isEnabled: booleanValue(property(clip, "isEnabled") ?? property(clip, "enabled")),
-      isSelected: booleanValue(property(clip, "isSelected") ?? property(clip, "selected")),
+      id: nativeId ?? `${parentSequenceId}/${mediaType}/${trackIndex}/${clipIndex}`,
+      idSource: nativeId === void 0 ? "derived" : "native",
+      name: asString(await readValue(clip, "getName", "name")) ?? asString(property(projectItem, "name")),
+      projectItemId: await projectItemId(projectItem),
+      mediaPath: asString(property(clip, "mediaPath")) ?? await projectItemMediaPath(projectItem) ?? asString(property(projectItem, "treePath")),
+      start: serializeTime(await readValue(clip, "getStartTime", "start")),
+      end: serializeTime(await readValue(clip, "getEndTime", "end")),
+      inPoint: serializeTime(await readValue(clip, "getInPoint", "inPoint")),
+      outPoint: serializeTime(await readValue(clip, "getOutPoint", "outPoint")),
+      duration: serializeTime(await readValue(clip, "getDuration", "duration")),
+      isEnabled,
+      isSelected: booleanValue(await readValue(clip, "getIsSelected", "isSelected", "selected")),
       typename: asString(property(clip, "typename")) ?? asString(property(clip, "typeName"))
     };
   }
   async function sequenceMarkers(sequence) {
     const markers = property(sequence, "markers") ?? property(sequence, "markerCollection");
     const getMarkers = property(markers, "getMarkers") ?? property(sequence, "getMarkers");
-    if (getMarkers) return collectionItems(await maybePromise(getMarkers.call(markers ?? sequence))).map(serializeMarker).filter((marker) => marker !== null);
-    return markerItems(markers).map(serializeMarker).filter((marker) => marker !== null);
+    if (getMarkers) return (await collectionItems(await maybePromise(getMarkers.call(markers ?? sequence)))).map(serializeMarker).filter((marker) => marker !== null);
+    return (await markerItems(markers)).map(serializeMarker).filter((marker) => marker !== null);
   }
   async function createMarker(request) {
     const sequence = await requireSequence(request.args?.[0]);
@@ -744,8 +878,8 @@
       if (value !== void 0) marker[key] = value;
     }
   }
-  function markerItems(markers) {
-    const direct = collectionItems(markers);
+  async function markerItems(markers) {
+    const direct = await collectionItems(markers);
     if (direct.length > 0) return direct;
     const getFirstMarker = property(markers, "getFirstMarker");
     const getNextMarker = property(markers, "getNextMarker");
@@ -803,7 +937,7 @@
     const manager = await encoderManager();
     const getPresets = property(manager, "getPresets") ?? property(manager, "getPresetList");
     const rawPresets = getPresets ? await maybePromise(getPresets.call(manager)) : property(manager, "presets");
-    return collectionItems(rawPresets).map(serializeEncoderPreset);
+    return (await collectionItems(rawPresets)).map(serializeEncoderPreset);
   }
   async function getExportFileExtension(request) {
     const payload = requestPayload(request);
@@ -929,7 +1063,7 @@
       typename: asString(property(preset, "typename")) ?? asString(property(preset, "typeName")) ?? "EncoderPreset"
     };
   }
-  function serializeExportJob(result, payload, kind, source) {
+  async function serializeExportJob(result, payload, kind, source) {
     const resultObject = isObject(result) ? result : {};
     const resultJobId = property(resultObject, "jobId") ?? property(resultObject, "jobID") ?? property(resultObject, "id");
     const jobId = resultJobId ?? (typeof result === "string" || typeof result === "number" ? result : void 0);
@@ -940,7 +1074,7 @@
       status: asString(property(resultObject, "status")) ?? (started === false ? "failed" : kind === "exportFrame" ? "exported" : "queued"),
       outputPath: asString(property(resultObject, "outputPath")) ?? asString(property(resultObject, "outputFile")) ?? asString(property(payload, "outputPath")),
       presetPath: asString(property(resultObject, "presetPath")) ?? asString(property(resultObject, "presetFile")) ?? asString(property(payload, "presetPath")),
-      sourceId: property(resultObject, "sourceId") ?? projectItemId(source) ?? property(source, "id") ?? property(payload, "sourcePath"),
+      sourceId: property(resultObject, "sourceId") ?? await projectItemId(source) ?? property(source, "id") ?? property(payload, "sourcePath"),
       sourceName: asString(property(resultObject, "sourceName")) ?? asString(property(source, "name")) ?? asString(property(payload, "sourcePath")),
       exportType: asString(property(resultObject, "exportType")) ?? asString(property(payload, "exportType")),
       removeUponCompletion: booleanValue(property(resultObject, "removeUponCompletion") ?? property(payload, "removeUponCompletion") ?? property(payload, "removeOnCompletion") ?? property(payload, "remove_on_completion")),
@@ -977,32 +1111,35 @@
     const index = Math.max(outputPath.lastIndexOf("/"), outputPath.lastIndexOf("\\"));
     return index > 0 ? outputPath.slice(0, index + 1) : "";
   }
-  function serializeProjectItems(items) {
-    return items.map(serializeProjectItem).filter((item) => item !== null);
+  async function serializeProjectItems(items) {
+    return (await Promise.all(items.map(serializeProjectItem))).filter((item) => item !== null);
   }
-  function serializeProjectItem(item) {
+  async function serializeProjectItem(item) {
     if (!isObject(item)) return null;
-    const children = projectItemChildObjects(item);
+    const children = await projectItemChildObjects(item);
     const typename = asString(property(item, "typename")) ?? asString(property(item, "typeName"));
-    const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
+    const mediaPath = await projectItemMediaPath(item);
     const treePath = asString(property(item, "treePath")) ?? asString(property(item, "path"));
-    const itemType = projectItemType(item, children, typename, mediaPath);
+    const folder = await castProjectItem(item, "FolderItem");
+    const clip = await castProjectItem(item, "ClipProjectItem");
+    const isSequence = booleanValue(await readValue(clip ?? item, "isSequence"));
+    const itemType = folder || property(item, "getItems") ? "bin" : isSequence ? "sequence" : clip ? "clip" : projectItemType(item, children, typename, mediaPath);
     return {
-      id: projectItemId(item),
+      id: await projectItemId(item),
       name: asString(property(item, "name")),
       type: property(item, "type"),
       itemType,
       path: treePath ?? mediaPath,
       mediaPath,
       treePath,
-      parentId: projectItemId(property(item, "parent")),
+      parentId: await projectItemId(await readValue(item, "getParentBin", "parent")),
       childCount: children.length,
       isBin: itemType === "bin",
       isClip: itemType === "clip",
       isSequence: itemType === "sequence",
-      canProxy: booleanValue(property(item, "canProxy")) ?? booleanValue(safeCall(item, "canProxy")),
-      hasProxy: booleanValue(property(item, "hasProxy")) ?? booleanValue(safeCall(item, "hasProxy")),
-      isOffline: booleanValue(property(item, "isOffline")) ?? booleanValue(safeCall(item, "isOffline")),
+      canProxy: booleanValue(await readValue(clip ?? item, "canProxy")),
+      hasProxy: booleanValue(await readValue(clip ?? item, "hasProxy")),
+      isOffline: booleanValue(await readValue(clip ?? item, "isOffline")),
       typename
     };
   }
@@ -1017,85 +1154,183 @@
     const type = property(item, "type");
     return type === void 0 ? void 0 : String(type);
   }
-  function projectItemId(item) {
-    return property(item, "id") ?? property(item, "guid") ?? property(item, "nodeId") ?? property(item, "nodeID");
+  async function projectItemId(item) {
+    if (!item) return void 0;
+    const direct = await readValue(item, "getId", "id", "guid", "nodeId", "nodeID");
+    if (direct !== void 0 && direct !== null) return serializeId(direct);
+    const base = await castProjectItem(item, "ProjectItem");
+    return serializeId(await readValue(base, "getId"));
   }
-  function projectItemChildObjects(item) {
-    const direct = collectionItems(property(item, "children") ?? property(item, "items"));
-    if (direct.length > 0) return direct;
-    return collectionItems(safeCall(item, "getItems") ?? safeCall(item, "getChildren"));
+  async function projectItemMediaPath(item) {
+    if (!item) return void 0;
+    const direct = await readValue(item, "getMediaFilePath", "mediaPath");
+    if (direct !== void 0) return asString(direct);
+    const clip = await castProjectItem(item, "ClipProjectItem");
+    if (!clip) return void 0;
+    const getPath = property(clip, "getMediaFilePath");
+    if (!getPath) unavailable("Premiere ClipProjectItem.getMediaFilePath");
+    return asString(await maybePromise(getPath.call(clip)));
   }
-  function findProjectItem(root, idOrName) {
+  async function castProjectItem(item, type) {
+    const api = property(premiereModule(), type);
+    const cast = property(api, "cast");
+    return cast && item ? await maybePromise(cast.call(api, item)) : void 0;
+  }
+  async function projectItemChildObjects(item) {
+    if (!isObject(item)) unavailable("Premiere project item object");
+    const direct = await readValue(item, "getItems", "getChildren", "children", "items");
+    if (direct !== void 0 && direct !== null) return await collectionItems(direct, true);
+    const folder = await castProjectItem(item, "FolderItem");
+    if (folder) {
+      const getItems = property(folder, "getItems");
+      if (!getItems) unavailable("Premiere FolderItem.getItems");
+      return await collectionItems(await maybePromise(getItems.call(folder)), true);
+    }
+    const clip = await castProjectItem(item, "ClipProjectItem");
+    if (clip || await projectItemMediaPath(item) !== void 0 || /clip|sequence/i.test(asString(property(item, "typename")) ?? asString(property(item, "itemType")) ?? "")) return [];
+    unavailable("Premiere project item children");
+  }
+  async function findProjectItem(root, idOrName) {
     if (idOrName === void 0 || idOrName === null) return root;
-    return collectProjectItems(root).find((item) => projectItemMatches(item, idOrName));
+    const items = await collectProjectItems(root);
+    const target = String(idOrName);
+    for (const item of items) {
+      const id = await projectItemId(item);
+      if (id !== void 0 && String(id) === target) return item;
+    }
+    for (const item of items) {
+      const values = [property(item, "name"), property(item, "treePath"), property(item, "path"), await projectItemMediaPath(item)];
+      if (values.some((value) => value !== void 0 && String(value) === target)) return item;
+    }
+    return void 0;
   }
-  function collectProjectItems(root) {
+  async function collectProjectItems(root) {
     const result = [];
     const queue = root ? [root] : [];
     const seen = /* @__PURE__ */ new Set();
-    while (queue.length > 0) {
-      const item = queue.shift();
+    const seenIds = /* @__PURE__ */ new Set();
+    for (let index = 0; index < queue.length; index += 1) {
+      const item = queue[index];
       if (!item || seen.has(item)) continue;
       seen.add(item);
+      const id = await projectItemId(item);
+      if (id !== void 0 && seenIds.has(id)) continue;
+      if (id !== void 0) seenIds.add(id);
       result.push(item);
-      queue.push(...projectItemChildObjects(item));
+      validateCollectionCount(result.length);
+      for (const child of await projectItemChildObjects(item)) {
+        if (seen.has(child)) continue;
+        queue.push(child);
+        validateCollectionCount(queue.length);
+      }
     }
     return result;
   }
-  function projectItemMatches(item, idOrName) {
-    if (!isObject(item)) return false;
-    const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
-    const values = [
-      projectItemId(item),
-      property(item, "name"),
-      property(item, "treePath"),
-      property(item, "path"),
-      mediaPath
-    ];
-    return values.some((value) => value !== void 0 && String(value) === String(idOrName));
+  async function findProjectItemsMatchingMediaPath(root, matchString) {
+    const matches = [];
+    for (const item of await collectProjectItems(root)) {
+      const mediaPath = await projectItemMediaPath(item);
+      if (mediaPath?.includes(matchString)) matches.push(item);
+    }
+    return matches;
   }
-  function findProjectItemsMatchingMediaPath(root, matchString) {
-    return collectProjectItems(root).filter((item) => {
-      const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
-      return mediaPath?.includes(matchString) || asString(property(item, "name"))?.includes(matchString);
-    });
-  }
-  function findImportedProjectItems(filePaths, root) {
-    const candidates = collectProjectItems(root);
-    return filePaths.map((filePath) => {
+  async function findImportedProjectItems(filePaths, root) {
+    const candidates = await collectProjectItems(root);
+    const mediaPaths = await Promise.all(candidates.map(projectItemMediaPath));
+    const matches = [];
+    for (const filePath of filePaths) {
       const fileName = filePath.split(/[\\/]/).filter(Boolean).pop() ?? filePath;
-      return candidates.find((item) => {
-        const mediaPath = asString(property(item, "mediaPath")) ?? asString(safeCall(item, "getMediaFilePath"));
-        return mediaPath === filePath || asString(property(item, "name")) === fileName;
-      });
-    }).filter((item) => item !== void 0);
+      const index = candidates.findIndex((item, position) => mediaPaths[position] === filePath || asString(property(item, "name")) === fileName);
+      if (index >= 0) matches.push(candidates[index]);
+    }
+    return matches;
   }
   function normalizeFilePaths(value) {
     const values = Array.isArray(value) ? value : [value];
     return values.map((item) => asString(item)).filter((item) => item !== void 0);
   }
-  function safeCall(receiver, method, ...args) {
-    const fn = property(receiver, method);
-    if (!fn) return void 0;
+  async function readValue(receiver, ...names) {
+    for (const name of names) {
+      const value = property(receiver, name);
+      if (value !== void 0 && value !== null) {
+        return typeof value === "function" ? await maybePromise(value.call(receiver)) : value;
+      }
+    }
+    return void 0;
+  }
+  function serializeId(value) {
+    if (typeof value === "string" || typeof value === "number") return value;
+    if (value === void 0 || value === null) return void 0;
     try {
-      return fn.apply(receiver, args);
+      const toString = property(value, "toString");
+      if (typeof toString !== "function" || toString === Object.prototype.toString) return void 0;
+      const converted = toString.call(value);
+      if (isThenable(converted)) {
+        Promise.resolve(converted).catch(() => void 0);
+        return void 0;
+      }
+      return typeof converted === "string" && converted.length > 0 && converted !== "[object Object]" ? converted : void 0;
     } catch {
       return void 0;
     }
   }
-  function collectionItems(value) {
-    const direct = asArray(value);
-    if (direct.length > 0) return direct;
-    const count = asNumber(property(value, "numItems")) ?? asNumber(property(value, "numTracks")) ?? asNumber(property(value, "numMarkers")) ?? asNumber(property(value, "length"));
-    if (count === void 0 || count <= 0) return [];
+  function validateCollectionCount(count) {
+    if (typeof count !== "number" || !Number.isInteger(count) || count < 0) unavailable("Premiere collection count");
+    if (count > COLLECTION_LIMIT) unavailable(`Premiere collection limit ${COLLECTION_LIMIT}`);
+  }
+  async function collectionItems(value, required = false) {
+    return collectItems(await maybePromise(value), required);
+  }
+  async function collectItems(value, required) {
+    if (Array.isArray(value)) {
+      validateCollectionCount(value.length);
+      return value;
+    }
+    const iterator = isObject(value) ? value[Symbol.iterator] : void 0;
+    if (typeof iterator === "function") {
+      const result2 = [];
+      for (const item of value) {
+        result2.push(item);
+        validateCollectionCount(result2.length);
+      }
+      return result2;
+    }
+    const count = await readCollectionCount(value);
+    if (count === void 0) {
+      if (required) unavailable("Premiere collection read");
+      return [];
+    }
+    validateCollectionCount(count);
     const at = property(value, "at") ?? property(value, "getAt") ?? property(value, "item");
-    if (!at) return [];
     const result = [];
     for (let index = 0; index < count; index += 1) {
-      const item = at.call(value, index);
+      const item = await maybePromise(at ? at.call(value, index) : property(value, String(index)));
+      if ((item === void 0 || item === null) && required) unavailable(`Premiere collection item ${index}`);
       if (item !== void 0 && item !== null) result.push(item);
     }
     return result;
+  }
+  async function readCollectionCount(value) {
+    const countNames = ["numItems", "numTracks", "numMarkers", "length"];
+    const methodNames = ["getNumItems", "getNumTracks", "getNumMarkers", "getItemCount", "getCount", "getLength"];
+    try {
+      for (const name of countNames) {
+        const raw = property(value, name);
+        if (raw === void 0 || raw === null) continue;
+        const resolved = typeof raw === "function" ? await maybePromise(raw.call(value)) : await maybePromise(raw);
+        const count = asNumber(resolved);
+        if (count !== void 0) return count;
+      }
+      for (const name of methodNames) {
+        const method = property(value, name);
+        if (typeof method !== "function") continue;
+        const count = asNumber(await maybePromise(method.call(value)));
+        if (count !== void 0) return count;
+      }
+    } catch {
+      return void 0;
+    }
+    return void 0;
   }
   function normalizeMediaType(value) {
     return asString(value)?.toLowerCase() === "audio" ? "audio" : "video";
@@ -1119,7 +1354,22 @@
     return asNumber(value) ?? value;
   }
 
+  // bridges/shared/status.ts
+  var statusText = {
+    starting: "Starting bridge\u2026",
+    connecting: "Connecting to broker\u2026",
+    ready: "Bridge service ready. Broker/client connection is not verified.",
+    disconnected: "Disconnected from broker. Check bridge and broker logs.",
+    error: "Bridge not ready. Check bridge configuration and broker logs."
+  };
+  function showBridgeStatus(status) {
+    const element = globalThis.document?.getElementById("adobepy-bridge-status");
+    if (element) element.textContent = statusText[status];
+  }
+
   // bridges/uxp/premiere/src/main.ts
-  connectBridge(premiereAdapter);
+  var config = globalThis;
+  config.__ADOBEPY_BROKER_URL = config.__ADOBEPY_BROKER_URL || "ws://localhost:47391/v1/bridge/premiere/ws";
+  connectBridge(premiereAdapter, void 0, showBridgeStatus);
 })();
 //# sourceMappingURL=main.js.map

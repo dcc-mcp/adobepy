@@ -12,7 +12,7 @@ function waitForMicrotasks() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-async function loadBundle(relativeBundlePath, modules, globals = {}) {
+async function loadBundle(relativeBundlePath, modules, globals = {}, generatedConfig) {
   const bundlePath = path.join(root, relativeBundlePath);
   assert.ok(fs.existsSync(bundlePath), `missing UXP bundle: ${bundlePath}`);
   const sent = [];
@@ -22,8 +22,9 @@ async function loadBundle(relativeBundlePath, modules, globals = {}) {
     constructor(url) {
       this.url = url;
       this.listeners = {};
+      this.readyState = 0;
       socketInstance = this;
-      setImmediate(() => this.emit("open", {}));
+      setImmediate(() => { this.readyState = 1; this.emit("open", {}); });
     }
     addEventListener(name, listener) {
       this.listeners[name] = this.listeners[name] || [];
@@ -46,13 +47,16 @@ async function loadBundle(relativeBundlePath, modules, globals = {}) {
       if (Object.prototype.hasOwnProperty.call(modules, name)) return modules[name];
       throw new Error(`missing test module: ${name}`);
     },
-    __ADOBEPY_TOKEN: "test-token",
+    ...(generatedConfig === undefined ? { __ADOBEPY_TOKEN: "test-token" } : {}),
     crypto: {
       randomUUID: () => "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99"
     },
     ...globals
   };
   context.globalThis = context;
+  if (generatedConfig !== undefined) {
+    vm.runInNewContext(generatedConfig, context, { filename: "adobepy.config.js", timeout: 1_000 });
+  }
   vm.runInNewContext(fs.readFileSync(bundlePath, "utf8"), context, { filename: bundlePath });
   await waitForMicrotasks();
   assert.ok(socketInstance, "bundle did not open a WebSocket");
@@ -929,6 +933,412 @@ async function testPremiereBridge() {
   assert.strictEqual(error(await rpc(unavailableEnv, "premiere", "encoder", "encodeFile", [{ sourcePath: "C:/media/source.mov", outputPath: "C:/out/source.mp4" }])).code, -32004);
 }
 
+// Mirror the asynchronous UXP 25.6 read API instead of legacy DOM properties.
+async function testPremiereNativeReadQueries() {
+  const itemIds = new WeakMap();
+  const projectItems = new WeakMap();
+  const guidValues = new WeakMap();
+  const folders = new WeakMap();
+  const mediaPaths = new WeakMap();
+  let reverseCasts = 0;
+  class Guid {
+    constructor(value) { guidValues.set(this, value); }
+    toString() { return guidValues.get(this); }
+  }
+  class ProjectItem {
+    constructor(id, name) { itemIds.set(this, id); this.name = name; }
+    static cast(item) {
+      if (item instanceof ProjectItem) return item;
+      const base = projectItems.get(item);
+      if (base) reverseCasts += 1;
+      return base || null;
+    }
+    getId() { return itemIds.get(this); }
+  }
+  class AsyncProjectItem extends ProjectItem {
+    async getId() { return super.getId(); }
+  }
+  class FolderItem {
+    constructor(name, children) {
+      this.name = name;
+      folders.set(this, { getItems: async () => children });
+    }
+    static cast(item) { return item instanceof FolderItem ? item : folders.get(item); }
+    async getItems() { return folders.get(this).getItems(); }
+  }
+  class ClipProjectItem {
+    static cast(item) { return mediaPaths.has(item) ? { getMediaFilePath: async () => mediaPaths.get(item) } : null; }
+  }
+  function folder(id, name, children) {
+    const item = new ProjectItem(id, name);
+    folders.set(item, { getItems: async () => children });
+    return item;
+  }
+  function media(id, filePath) {
+    const Item = id === "media-b" ? AsyncProjectItem : ProjectItem;
+    const item = new Item(id, "shared.mov");
+    mediaPaths.set(item, filePath);
+    return item;
+  }
+  const mediaA = media("media-a", "C:/fixture/a/shared.mov");
+  const mediaB = media("media-b", "C:/fixture/b/shared.mov");
+  const nested = folder("nested", "Nested", [mediaB]);
+  const actualBin = folder("bin-actual", "Actual", [nested]);
+  const nameCollision = folder("bin-decoy", "bin-actual", [mediaA]);
+  const emptyBin = folder("empty-bin", "shared.mov", []);
+  const rootItem = new FolderItem("Root", [nameCollision, actualBin, emptyBin]);
+  projectItems.set(rootItem, new ProjectItem("root-native", "Root"));
+  assert.strictEqual(typeof rootItem.getId, "undefined", "the native root is a FolderItem, not a ProjectItem");
+  const tickTime = (seconds, ticks) => ({ seconds, ticks });
+  const calls = [];
+  const videoClip = {
+    name: "Native video clip",
+    async getProjectItem() { return mediaB; },
+    async getStartTime() { return tickTime(1, "254016000000"); },
+    async getEndTime() { return tickTime(3, "762048000000"); },
+    async getInPoint() { return tickTime(0.5, "127008000000"); },
+    async getOutPoint() { return tickTime(2.5, "635040000000"); },
+    async getDuration() { return tickTime(2, "508032000000"); }
+  };
+  const audioClip = {
+    ...videoClip,
+    name: "Native audio clip",
+    async getProjectItem() { return mediaA; },
+    async getStartTime() { return tickTime(40000, "10160640000000001"); }
+  };
+  let videoItems = [videoClip];
+  function track(id, name, index, items) {
+    return {
+      id, name,
+      async getIndex() { return index; },
+      async isMuted() { return id === 3; },
+      async getTrackItems(type, includeEmpty) {
+        calls.push({ kind: "getTrackItems", id, type, includeEmpty });
+        assert.strictEqual(type, 1);
+        assert.strictEqual(includeEmpty, false);
+        return items();
+      }
+    };
+  }
+  const videoTracks = [track(1, "Native ID wins", 0, () => videoItems), track(9, "Index one", 1, () => [])];
+  const audioTracks = [track(3, "A1", 0, () => [audioClip])];
+  let videoTrackCount = videoTracks.length;
+  const sequence = {
+    guid: new Guid("sequence-native"), name: "Native sequence",
+    async getEndTime() { return tickTime(120, "30481920000000"); },
+    async getTimebase() { return "10160640000"; },
+    async getVideoTrackCount() { return videoTrackCount; },
+    async getAudioTrackCount() { return audioTracks.length; },
+    async getVideoTrack(index) { return videoTracks[index]; },
+    async getAudioTrack(index) { return audioTracks[index]; }
+  };
+  const nestedSequence = { ...sequence, guid: new Guid("nested-sequence-native"), name: "Nested sequence" };
+  const project = {
+    guid: new Guid("project-native"), name: "native.prproj", path: "C:/fixture/native.prproj",
+    async getSequences() { return [sequence, nestedSequence]; },
+    async getActiveSequence() { return sequence; },
+    async getRootItem() { return rootItem; }
+  };
+  let activeProjectCalls = 0;
+  class Project {
+    static async getActiveProject() { activeProjectCalls += 1; return project; }
+  }
+  const modules = {
+    premierepro: { version: "25.6.0", Project, ProjectItem, FolderItem, ClipProjectItem, Constants: { TrackItemType: { CLIP: 1 } } }
+  };
+  const env = await loadBundle("bridges/uxp/premiere/dist/main.js", modules);
+  assert.strictEqual(env.socket.url, "ws://localhost:47391/v1/bridge/premiere/ws");
+  const active = result(await rpc(env, "premiere", "project", "getActive"));
+  assert.strictEqual(active.id, "project-native");
+  assert.strictEqual(active.guid, "project-native");
+  assert.ok(activeProjectCalls > 0, "the static class getter must be invoked");
+  const sequences = result(await rpc(env, "premiere", "project", "getSequences"));
+  assert.deepStrictEqual(sequences.map((value) => value.id), ["sequence-native", "nested-sequence-native"]);
+  assert.strictEqual(sequences[0].duration.ticks, "30481920000000");
+  assert.strictEqual(sequences[0].timebase, "10160640000");
+  assert.strictEqual(result(await rpc(env, "premiere", "project", "getActiveSequence")).id, "sequence-native");
+  assert.strictEqual(result(await rpc(env, "premiere", "sequence", "getVideoTracks", ["nested-sequence-native"])).length, 2);
+  const serializedAudioTracks = result(await rpc(env, "premiere", "sequence", "getAudioTracks", ["sequence-native"]));
+  assert.strictEqual(serializedAudioTracks.length, 1);
+  assert.strictEqual(serializedAudioTracks[0].isMuted, true);
+  const video = result(await rpc(env, "premiere", "track", "getClips", ["sequence-native", "video", 1]));
+  assert.strictEqual(video.length, 1, "native track ID must take precedence over another track's index");
+  assert.strictEqual(video[0].projectItemId, "media-b");
+  assert.strictEqual(video[0].mediaPath, "C:/fixture/b/shared.mov");
+  assert.deepStrictEqual(video[0].start, { seconds: 1, ticks: "254016000000" });
+  assert.deepStrictEqual(video[0].end, { seconds: 3, ticks: "762048000000" });
+  assert.deepStrictEqual(video[0].inPoint, { seconds: 0.5, ticks: "127008000000" });
+  assert.deepStrictEqual(video[0].outPoint, { seconds: 2.5, ticks: "635040000000" });
+  assert.deepStrictEqual(video[0].duration, { seconds: 2, ticks: "508032000000" });
+  assert.ok(typeof video[0].id === "string" && video[0].id.length > 0);
+  assert.strictEqual(video[0].idSource, "derived");
+  assert.deepStrictEqual(result(await rpc(env, "premiere", "track", "getClips", ["sequence-native", "video", 9])), []);
+  const audio = result(await rpc(env, "premiere", "track", "getClips", ["sequence-native", "audio", 3]));
+  assert.strictEqual(audio[0].start.ticks, "10160640000000001", "ticks must never round through a JS number");
+  assert.notStrictEqual(audio[0].id, video[0].id);
+  assert.ok(calls.some((call) => call.id === 1 && call.type === 1 && call.includeEmpty === false));
+  const serializedRoot = result(await rpc(env, "premiere", "project", "getRootItem"));
+  assert.strictEqual(serializedRoot.id, "root-native");
+  assert.strictEqual(serializedRoot.childCount, 3);
+  assert.ok(reverseCasts > 0, "FolderItem IDs must be read through ProjectItem.cast");
+  const children = result(await rpc(env, "premiere", "projectItem", "getChildren", ["bin-actual"]));
+  assert.deepStrictEqual(children.map((item) => item.id), ["nested"], "native item ID must beat a colliding name");
+  assert.deepStrictEqual(result(await rpc(env, "premiere", "projectItem", "getChildren", ["empty-bin"])), []);
+  const nestedChildren = result(await rpc(env, "premiere", "projectItem", "getChildren", ["nested"]));
+  assert.strictEqual(nestedChildren[0].id, "media-b");
+  assert.strictEqual(nestedChildren[0].mediaPath, "C:/fixture/b/shared.mov");
+  const matches = result(await rpc(env, "premiere", "projectItem", "findByMediaPath", ["root-native", "shared.mov", false]));
+  assert.deepStrictEqual(matches.map((item) => item.id).sort(), ["media-a", "media-b"]);
+  assert.strictEqual(error(await rpc(env, "premiere", "projectItem", "findByMediaPath", ["root-native", "shared.mov", true])).code, -32004,
+    "a fallback without a native subclip filter must reject ignoreSubclips=true");
+
+  videoTrackCount = 10001;
+  const tooManyTracks = error(await rpc(env, "premiere", "sequence", "getVideoTracks", ["sequence-native"]));
+  assert.strictEqual(tooManyTracks.code, -32004);
+  assert.match(tooManyTracks.message, /limit/i);
+  videoTrackCount = videoTracks.length;
+  videoItems = Array(10001).fill(videoClip);
+  const tooManyClips = error(await rpc(env, "premiere", "track", "getClips", ["sequence-native", "video", 1]));
+  assert.strictEqual(tooManyClips.code, -32004);
+  assert.match(tooManyClips.message, /limit/i);
+  videoItems = [videoClip];
+  const getTrackItems = videoTracks[0].getTrackItems;
+  delete videoTracks[0].getTrackItems;
+  assert.strictEqual(error(await rpc(env, "premiere", "track", "getClips", ["sequence-native", "video", 1])).code, -32004);
+  videoTracks[0].getTrackItems = async () => { throw new Error("native clip read failed"); };
+  const failedRead = error(await rpc(env, "premiere", "track", "getClips", ["sequence-native", "video", 1]));
+  assert.strictEqual(failedRead.code, -32004);
+  assert.match(failedRead.message, /native clip read failed/);
+  videoTracks[0].getTrackItems = getTrackItems;
+  folders.set(emptyBin, {});
+  assert.strictEqual(error(await rpc(env, "premiere", "projectItem", "getChildren", ["empty-bin"])).code, -32004);
+  folders.set(emptyBin, { getItems: async () => [] });
+  folders.set(rootItem, { getItems: async () => Array(10001).fill(mediaA) });
+  const tooManyItems = error(await rpc(env, "premiere", "projectItem", "getChildren", ["root-native"]));
+  assert.strictEqual(tooManyItems.code, -32004);
+  assert.match(tooManyItems.message, /limit/i);
+  folders.set(rootItem, { getItems: async () => [nameCollision, actualBin, emptyBin] });
+
+  const overridden = await loadBundle("bridges/uxp/premiere/dist/main.js", modules, {
+    __ADOBEPY_BROKER_URL: "wss://fixture.invalid/v1/bridge/premiere/ws"
+  });
+  assert.strictEqual(overridden.socket.url, "wss://fixture.invalid/v1/bridge/premiere/ws");
+}
+
+// Native Premiere 25.6 collections are objects rather than arrays: the value can
+// be a Promise, its count can be asynchronous, and item access can be asynchronous.
+// Fixtures that only return arrays would make the "Premiere collection read" path
+// self-fulfilling and would not catch the reported regression.
+async function testPremiereAsyncNativeCollections() {
+  const guidValues = new WeakMap();
+  class Guid {
+    constructor(value) { guidValues.set(this, value); }
+    toString() { return guidValues.get(this); }
+  }
+  class ProjectItem {
+    constructor(id, name) { this.id = id; this.name = name; this.typename = "Clip"; }
+    getId() { return this.id; }
+    static cast(item) { return item instanceof ProjectItem ? item : undefined; }
+  }
+  class FolderItem {
+    static cast(item) { return item instanceof FolderItem ? item : undefined; }
+  }
+  class ClipProjectItem {
+    static cast() { return undefined; }
+  }
+
+  // Four native shapes: async count method with async at(), async count method
+  // with async getAt(), a Promise-valued count property, and a Promise-valued
+  // collection object. None is an array or a plain Promise<Array>.
+  function nativeCollection(items, shape) {
+    if (shape === "promise-value") {
+      return Promise.resolve({
+        async getNumItems() { return items.length; },
+        async at(index) { return items[index]; }
+      });
+    }
+    if (shape === "promise-count") {
+      return {
+        get numItems() { return Promise.resolve(items.length); },
+        async item(index) { return items[index]; }
+      };
+    }
+    if (shape === "count-method") {
+      return {
+        async getItemCount() { return items.length; },
+        async getAt(index) { return items[index]; }
+      };
+    }
+    return {
+      async getNumItems() { return items.length; },
+      async at(index) { return items[index]; }
+    };
+  }
+
+  for (const shape of ["async-count", "count-method", "promise-count", "promise-value"]) {
+    const clip = { id: "clip-native", name: "Native clip" };
+    const track = { id: "track-native", name: "V1", clips: nativeCollection([clip], shape) };
+    const sequence = {
+      guid: new Guid("sequence-async"), name: "Async sequence",
+      videoTracks: nativeCollection([track], shape),
+      audioTracks: nativeCollection([], shape)
+    };
+    const children = [new ProjectItem("child-a", "A"), new ProjectItem("child-b", "B")];
+    const rootItem = { name: "Root", getItems: async () => nativeCollection(children, shape) };
+    const project = {
+      guid: new Guid("project-async"), name: "async.prproj",
+      sequences: nativeCollection([sequence], shape),
+      getActiveSequence: async () => sequence,
+      getRootItem: async () => rootItem
+    };
+    class Project {
+      static async getActiveProject() { return project; }
+    }
+    const env = await loadBundle("bridges/uxp/premiere/dist/main.js", {
+      premierepro: { version: "25.6.0", Project, ProjectItem, FolderItem, ClipProjectItem }
+    });
+    const sequences = result(await rpc(env, "premiere", "project", "getSequences"));
+    assert.deepStrictEqual(sequences.map((value) => value.id), ["sequence-async"], `shape ${shape}: project sequences`);
+    const tracks = result(await rpc(env, "premiere", "sequence", "getVideoTracks", ["sequence-async"]));
+    assert.strictEqual(tracks.length, 1, `shape ${shape}: video tracks`);
+    assert.strictEqual(tracks[0].id, "track-native");
+    const clips = result(await rpc(env, "premiere", "track", "getClips", ["sequence-async", "video"]));
+    assert.strictEqual(clips.length, 1, `shape ${shape}: track clips`);
+    assert.strictEqual(clips[0].id, "clip-native");
+    const childItems = result(await rpc(env, "premiere", "projectItem", "getChildren"));
+    assert.deepStrictEqual(childItems.map((value) => value.id).sort(), ["child-a", "child-b"], `shape ${shape}: project item children`);
+  }
+}
+
+// serializeId() must isolate broken native IDs and never let an unserializable
+// value become the literal string "undefined" during sequence matching.
+async function testPremiereIdSerializationBoundaries() {
+  const throwingToString = { toString() { throw new Error("native toString failed"); } };
+  const asyncToString = { toString() { return Promise.resolve("async-id"); } };
+  const throwingGetter = {};
+  Object.defineProperty(throwingGetter, "toString", { get() { throw new Error("native getter failed"); } });
+  const plainObject = {};
+  for (const badId of [throwingToString, asyncToString, throwingGetter, plainObject]) {
+    const project = { guid: badId, name: "boundary.prproj" };
+    class Project { static async getActiveProject() { return project; } }
+    const env = await loadBundle("bridges/uxp/premiere/dist/main.js", {
+      premierepro: { version: "25.6.0", Project }
+    });
+    const active = result(await rpc(env, "premiere", "project", "getActive"));
+    assert.strictEqual(active.id, undefined, "a broken native ID must be isolated from the RPC boundary");
+    assert.strictEqual(active.guid, undefined);
+    assert.strictEqual(active.name, "boundary.prproj");
+  }
+
+  const badGuid = { toString() { return "[object Object]"; } };
+  const sequence = { guid: badGuid, name: "Real sequence", videoTracks: [], audioTracks: [] };
+  const project = { getActiveSequence: async () => sequence, sequences: [sequence] };
+  class Project { static async getActiveProject() { return project; } }
+  const env = await loadBundle("bridges/uxp/premiere/dist/main.js", {
+    premierepro: { version: "25.6.0", Project }
+  });
+  const rejected = error(await rpc(env, "premiere", "sequence", "getVideoTracks", ["undefined"]));
+  assert.strictEqual(rejected.code, -32004, "the string 'undefined' must not match an unserializable ID");
+}
+
+// End-to-end regression through the real RPC/DOM dispatch. A function receiver
+// reached via dom.root/dom.get must not expose Function.prototype members, while
+// ordinary own properties and host DOM prototype methods remain reachable.
+async function testDomDispatchMemberBoundary() {
+  function HostConstructor() {
+    this.tag = "instance";
+  }
+  HostConstructor.nativeStatic = 7;
+  HostConstructor.prototype.hostMethod = function (suffix) {
+    return `host:${suffix}:${this.tag}`;
+  };
+
+  const env = await loadBundle("bridges/uxp/premiere/dist/main.js", {
+    premierepro: { version: "25.6.0", HostConstructor }
+  });
+  assert.strictEqual(env.sent[0].capabilities.host, "premiere");
+
+  const moduleRef = result(await rpc(env, "premiere", "dom", "root", ["module"]));
+  assert.ok(moduleRef && typeof moduleRef.$adobepyRef === "string");
+  const fnRef = result(await rpc(env, "premiere", "dom", "get", [moduleRef, "HostConstructor"]));
+  assert.ok(fnRef && typeof fnRef.$adobepyRef === "string");
+
+  // Own properties of a function receiver are legitimate host capabilities.
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "get", [fnRef, "nativeStatic"])), 7);
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "get", [fnRef, "name"])), "HostConstructor");
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "set", [fnRef, "dynamicOwn", 42])), 42);
+
+  // Prototype-chain escape hatches are denied at every dispatch read path.
+  for (const blocked of ["__proto__", "constructor", "prototype"]) {
+    assert.match(
+      error(await rpc(env, "premiere", "dom", "get", [fnRef, blocked])).message,
+      /not accessible/i,
+      `dom.get must reject ${blocked}`
+    );
+  }
+  for (const member of ["call", "apply", "bind"]) {
+    assert.strictEqual(
+      result(await rpc(env, "premiere", "dom", "get", [fnRef, member])),
+      null,
+      `dom.get must not expose Function.prototype.${member}`
+    );
+    assert.match(
+      error(await rpc(env, "premiere", "dom", "call", [fnRef, member, []])).message,
+      /not callable/i,
+      `dom.call must reject Function.prototype.${member}`
+    );
+    assert.match(
+      error(await rpc(env, "premiere", "dom", "construct", [fnRef, member, []])).message,
+      /not a constructor/i,
+      `dom.construct must reject Function.prototype.${member}`
+    );
+  }
+  assert.deepStrictEqual(
+    result(await rpc(env, "premiere", "dom", "snapshot", [fnRef, ["nativeStatic", "call", "apply", "bind"]])),
+    { nativeStatic: 7, call: null, apply: null, bind: null }
+  );
+  const fnKeys = result(await rpc(env, "premiere", "dom", "keys", [fnRef]));
+  assert.ok(fnKeys.includes("nativeStatic"));
+  for (const member of ["call", "apply", "bind"]) {
+    assert.ok(!fnKeys.includes(member), `dom.keys must not enumerate Function.prototype.${member}`);
+  }
+
+  // Object receivers still reach their host DOM prototype methods.
+  const instanceRef = result(await rpc(env, "premiere", "dom", "construct", [moduleRef, "HostConstructor", []]));
+  assert.strictEqual(result(await rpc(env, "premiere", "dom", "get", [instanceRef, "tag"])), "instance");
+  assert.strictEqual(
+    result(await rpc(env, "premiere", "dom", "call", [instanceRef, "hostMethod", ["ok"]])),
+    "host:ok:instance"
+  );
+}
+
+// Own-property boundary for the shared runtime member reader. Function receivers
+// must never expose the Function/Object prototype chain escapes.
+function testRuntimeMemberBoundary() {
+  const source = fs.readFileSync(path.join(root, "bridges/uxp/core/src/runtime.ts"), "utf8");
+  const { code } = require("esbuild").transformSync(source, { loader: "ts", format: "cjs", target: "es2020" });
+  const module = { exports: {} };
+  vm.runInNewContext(code, { module, exports: module.exports, require, console, globalThis: {} }, { filename: "runtime.ts" });
+  const { property, readMember, BLOCKED_MEMBERS } = module.exports;
+  assert.strictEqual(typeof readMember, "function", "a bounded readMember helper must be exported");
+  for (const blocked of ["__proto__", "constructor", "prototype"]) {
+    assert.ok(BLOCKED_MEMBERS.has(blocked), `${blocked} must be in the denylist`);
+    assert.strictEqual(property({}, blocked), undefined, `${blocked} must not be readable on objects`);
+  }
+  assert.strictEqual(property({ own: 1 }, "own"), 1);
+  const inherited = Object.create({ sharedMethod: 5 });
+  assert.strictEqual(property(inherited, "sharedMethod"), 5, "object receivers still reach prototype methods");
+  function hostConstructor() {}
+  hostConstructor.nativeStatic = 7;
+  assert.strictEqual(property(hostConstructor, "nativeStatic"), 7);
+  for (const blocked of ["constructor", "__proto__", "prototype", "call", "apply", "bind"]) {
+    assert.strictEqual(property(hostConstructor, blocked), undefined,
+      `function receiver must not expose ${blocked} from the prototype chain`);
+  }
+  assert.strictEqual(property(null, "x"), undefined);
+  assert.strictEqual(property("scalar", "length"), undefined);
+}
+
 function testManifestPermissions() {
   for (const host of ["photoshop", "indesign", "premiere"]) {
     const manifest = JSON.parse(fs.readFileSync(path.join(root, "bridges", "uxp", host, "manifest.json"), "utf8"));
@@ -938,14 +1348,46 @@ function testManifestPermissions() {
       `${host} manifest must allow broker WebSocket`
     );
     if (host === "photoshop") assert.strictEqual(manifest.requiredPermissions.localFileSystem, "fullAccess");
+    if (host === "premiere") assert.strictEqual(manifest.host.app, "premierepro");
   }
 }
 
+// The Rust cross-layer regression supplies the production-generated config on
+// stdin. Only UXP APIs are mocked here: do not inject __ADOBEPY_HOST_IDENTITY or
+// fill identity fields from the bootstrap request.
+async function emitPhotoshopGeneratedConfigHello() {
+  const generatedConfig = fs.readFileSync(0, "utf8");
+  assert.ok(generatedConfig.length > 0 && generatedConfig.length <= 64 * 1024);
+  const env = await loadBundle("bridges/uxp/photoshop/dist/main.js", {
+    photoshop: { app: { version: "26.5.1" } },
+    uxp: {
+      host: { name: "Adobe Photoshop", version: "26.5.1" },
+      storage: {
+        localFileSystem: {
+          getPluginFolder: async () => ({ nativePath: "C:/UXP/External/com.adobepy.bridge.photoshop" })
+        }
+      }
+    }
+  }, {}, generatedConfig);
+  assert.strictEqual(env.sent.length, 1);
+  assert.strictEqual(env.sent[0].type, "hello");
+  process.stdout.write(JSON.stringify({ url: env.socket.url, hello: env.sent[0] }));
+}
+
 async function main() {
+  if (process.argv[2] === "--photoshop-generated-config-hello") {
+    await emitPhotoshopGeneratedConfigHello();
+    return;
+  }
   testManifestPermissions();
   await testPhotoshopBridge();
   await testInDesignBridge();
   await testPremiereBridge();
+  await testPremiereNativeReadQueries();
+  await testPremiereAsyncNativeCollections();
+  await testPremiereIdSerializationBoundaries();
+  await testDomDispatchMemberBoundary();
+  testRuntimeMemberBoundary();
   console.log("UXP bridge protocol test passed");
 }
 

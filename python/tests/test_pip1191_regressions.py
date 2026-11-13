@@ -68,7 +68,7 @@ DISTRIBUTION_COMMANDS = (
 # command followed by the passing final checker was reported as a green step.
 RELEASE_STANDALONE_JOB = "windows-standalone-package"
 ACTIVE_WINDOWS_PWSH_JOBS = ("windows-package", "windows-standalone-package")
-DISABLED_STANDALONE_JOBS = ("macos-standalone-package", "linux-standalone-package")
+RETIRED_STANDALONE_JOBS = ("macos-standalone-package", "linux-standalone-package")
 RELEASE_WHEEL_COMMANDS = (
     "python -m pip install --upgrade build wheel",
     "npm ci",
@@ -350,15 +350,11 @@ class ReleasePathFailPropagationTests(unittest.TestCase):
                         f"{job_name}: native exits are shared without a guard",
                     )
 
-    def test_disabled_standalone_jobs_keep_their_if_false_gate(self) -> None:
+    def test_manual_release_does_not_duplicate_standalone_publishers(self) -> None:
         text = RELEASE_FILE.read_text(encoding="utf-8")
-        for job_name in DISABLED_STANDALONE_JOBS:
+        for job_name in RETIRED_STANDALONE_JOBS:
             job = _job_block(text, job_name)
-            self.assertTrue(job, job_name)
-            self.assertIsNotNone(_JOB_DISABLED.search(job), job_name)
-            self.assertIn(
-                "shell: bash", job, f"{job_name} must keep its bash fail-fast shell"
-            )
+            self.assertFalse(job, f"{job_name} belongs only to release-please.yml")
 
     @unittest.skipUnless(_find_pwsh(), "pwsh is not available")
     def test_real_native_fail_then_succeed_is_false_green_only_when_unguarded(

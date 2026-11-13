@@ -236,7 +236,8 @@ def websocket_url(host: str, broker_url: Optional[str]) -> str:
     """Convert a broker HTTP URL into the host bridge websocket URL."""
 
     if not broker_url or not broker_url.strip():
-        return f"ws://127.0.0.1:47391/v1/bridge/{host}/ws"
+        hostname = "localhost" if host == "premiere" else "127.0.0.1"
+        return f"ws://{hostname}:47391/v1/bridge/{host}/ws"
     url = broker_url.strip()
     if url.startswith("http://"):
         converted = f"ws://{url[len('http://') :]}"

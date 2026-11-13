@@ -46,34 +46,91 @@
   }
 
   // bridges/uxp/core/src/rpc.ts
-  function connectBridge(adapter, identityProvider) {
+  function connectBridge(adapter, identityProvider, onStatus) {
+    onStatus?.("starting");
     const url = globalThis.__ADOBEPY_BROKER_URL || `ws://127.0.0.1:47391/v1/bridge/${adapter.capabilities().host}/ws`;
     const token = globalThis.__ADOBEPY_TOKEN;
     if (typeof token !== "string" || token.trim() === "") {
+      onStatus?.("error");
       console.error("[adobepy] ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
       return;
     }
     const target = globalThis.__ADOBEPY_TARGET || "default";
-    const socket = new WebSocket(url);
+    onStatus?.("connecting");
+    let failed = false;
+    let socket;
+    try {
+      socket = new WebSocket(url);
+    } catch (error) {
+      onStatus?.("error");
+      throw error;
+    }
+    socket.addEventListener("error", () => {
+      failed = true;
+      onStatus?.("error");
+    });
+    socket.addEventListener("close", () => onStatus?.(failed ? "error" : "disconnected"));
     socket.addEventListener("open", async () => {
       let identity;
       try {
         identity = await identityProvider?.();
       } catch {
+        failed = true;
+        onStatus?.("error");
         console.error("[adobepy] runtime identity is unavailable; exact-instance verification will fail closed.");
       }
+      if (socket.readyState !== 1) return;
       const bootstrapNonce = boundedBootstrapNonce(globalThis.__ADOBEPY_BOOTSTRAP_NONCE);
-      socket.send(JSON.stringify({
-        type: "hello",
-        token,
-        target,
-        capabilities: adapter.capabilities(),
-        ...identity ? { identity } : {},
-        ...bootstrapNonce ? { bootstrapNonce } : {}
-      }));
+      try {
+        socket.send(JSON.stringify({
+          type: "hello",
+          token,
+          target,
+          capabilities: adapter.capabilities(),
+          ...identity ? { identity } : {},
+          ...bootstrapNonce ? { bootstrapNonce } : {}
+        }));
+      } catch (error) {
+        failed = true;
+        onStatus?.("error");
+        throw error;
+      }
+      onStatus?.(failed ? "error" : "ready");
     });
+    const reportProtocolViolation = (reason) => {
+      failed = true;
+      onStatus?.("error");
+      console.error(`[adobepy] ${reason}`);
+      try {
+        socket.send(JSON.stringify({
+          type: "error",
+          error: {
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: ERROR_CODES.ERROR_PARSE, message: "Invalid bridge frame" }
+          }
+        }));
+      } catch {
+      }
+      if (typeof socket.close === "function") socket.close();
+    };
     socket.addEventListener("message", async (event) => {
-      const message = JSON.parse(event.data);
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch {
+        reportProtocolViolation("Invalid JSON frame from broker");
+        return;
+      }
+      if (!isBridgeEnvelope(message)) {
+        reportProtocolViolation("Invalid bridge frame from broker");
+        return;
+      }
+      if (isBrokerError(message)) {
+        failed = true;
+        onStatus?.("error");
+        return;
+      }
       if (message.type !== "request") return;
       const request = message.request;
       try {
@@ -83,6 +140,12 @@
         socket.send(JSON.stringify({ type: "error", error: hostError(request.id, error) }));
       }
     });
+  }
+  function isBridgeEnvelope(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+  function isBrokerError(message) {
+    return Boolean(message.error) && (message.type === "error" || message.jsonrpc === "2.0");
   }
   function boundedBootstrapNonce(value) {
     return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : void 0;
@@ -132,9 +195,18 @@
     }
     return void 0;
   }
-  function property(value, name) {
-    if (!isObject(value)) return void 0;
+  var BLOCKED_MEMBERS = /* @__PURE__ */ new Set(["__proto__", "constructor", "prototype"]);
+  function readMember(value, name) {
+    if (!isObject(value) && typeof value !== "function" || BLOCKED_MEMBERS.has(String(name))) {
+      return void 0;
+    }
+    if (typeof value === "function" && !Object.prototype.hasOwnProperty.call(value, name)) {
+      return void 0;
+    }
     return value[name];
+  }
+  function property(value, name) {
+    return readMember(value, name);
   }
   async function maybePromise(value) {
     return await value;

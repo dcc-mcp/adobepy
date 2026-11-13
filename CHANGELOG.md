@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.13.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.12.0...adobepy-v0.13.0) (2026-11-05)
+
+
+### Features
+
+* **broker:** attest After Effects CEP runtime identity through the shared contract ([#107](https://github.com/dcc-mcp/adobepy/issues/107)) ([681ea37](https://github.com/dcc-mcp/adobepy/commit/681ea3783a263d6cee2afbc72f5bb2d86438ab8e))
+
+## [0.12.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.3...adobepy-v0.12.0) (2026-10-18)
+
+
+### Features
+
+* expose authenticated broker runtime identity ([3ed73b7](https://github.com/dcc-mcp/adobepy/commit/3ed73b7067c465a1b3dd329e74dbf4ed3c593364))
+
+## [0.11.3](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.2...adobepy-v0.11.3) (2026-10-17)
+
+
+### Bug Fixes
+
+* handle ineligible release auto-merge ([#101](https://github.com/dcc-mcp/adobepy/issues/101)) ([08ba89a](https://github.com/dcc-mcp/adobepy/commit/08ba89a29a75d36afffc2f07ab99becb4b437ad3))
+
+## [0.11.2](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.1...adobepy-v0.11.2) (2026-10-17)
+
+
+### Documentation
+
+* preserve patch order in review fingerprints ([#98](https://github.com/dcc-mcp/adobepy/issues/98)) ([022b437](https://github.com/dcc-mcp/adobepy/commit/022b437882797faad80d9b54b7396997c5724666))
+
+## [0.11.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.11.0...adobepy-v0.11.1) (2026-10-17)
+
+
+### Bug Fixes
+
+* **broker:** settle the blocking boundary before a forward result is observable ([#94](https://github.com/dcc-mcp/adobepy/issues/94)) ([a35c498](https://github.com/dcc-mcp/adobepy/commit/a35c49864a2af1271903fedc575986f422400c0c))
+
 ## [0.11.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.10.1...adobepy-v0.11.0) (2026-09-28)
 
 

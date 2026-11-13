@@ -101,6 +101,71 @@ enum BlockingBoundaryError {
     Panicked,
 }
 
+/// Test-only observation of the order in which a forward settles the boundary
+/// relative to the moment its outcome becomes observable to the caller.
+///
+/// The invariant under test: a forward must settle the boundary (releasing its
+/// accounting and letting a pending recovery quiesce) *before* the outcome is
+/// handed to the oneshot channel that the awaiter reads. Without a hook like
+/// this, a regression in that ordering is only observable as a
+/// scheduling-dependent flake rather than a deterministic failure.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SettleOrderProbe {
+    /// Set once the outcome has been handed to the oneshot channel, i.e. the
+    /// moment the forward becomes observable to its awaiter.
+    result_sent: AtomicBool,
+    /// Latched when `settle_forward` finds the outcome already published.
+    settle_after_send: AtomicBool,
+    /// Snapshot of `poisoned` at the instant settle released the accounting.
+    poisoned_while_settling: AtomicBool,
+    /// Snapshot of `active_workers` at that same instant.
+    active_while_settling: AtomicUsize,
+    /// Latched on the first settle; guards which settle is judged.
+    settled: AtomicBool,
+}
+
+#[cfg(test)]
+impl SettleOrderProbe {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks the outcome as published. Must be called immediately before the
+    /// outcome is handed to the oneshot channel.
+    fn mark_result_sent(&self) {
+        self.result_sent.store(true, Ordering::SeqCst);
+    }
+
+    /// Records the boundary state at the moment `settle_forward` ran, together
+    /// with whether the outcome had already been published by then.
+    ///
+    /// Only the *first* settle is judged. A boundary may run several forwards,
+    /// and a later forward legitimately settles after an earlier one has
+    /// already published; what must never happen is the first settle arriving
+    /// after a publish, which is the regression under test.
+    fn observe_settle(&self, poisoned: bool, active_workers: usize) {
+        let first_settle = !self.settled.swap(true, Ordering::SeqCst);
+        if first_settle && self.result_sent.load(Ordering::SeqCst) {
+            self.settle_after_send.store(true, Ordering::SeqCst);
+        }
+        self.poisoned_while_settling
+            .store(poisoned, Ordering::SeqCst);
+        self.active_while_settling
+            .store(active_workers, Ordering::SeqCst);
+    }
+
+    /// True when `settle_forward` ran only after the result was published --
+    /// exactly the regression this probe exists to catch.
+    fn observed_settle_after_send(&self) -> bool {
+        self.settle_after_send.load(Ordering::SeqCst)
+    }
+
+    fn settled(&self) -> bool {
+        self.settled.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Clone)]
 struct BootstrapBlockingBoundary {
     admission: Arc<Semaphore>,
@@ -110,6 +175,9 @@ struct BootstrapBlockingBoundary {
     poisoned: Arc<AtomicBool>,
     quiesced: Arc<Notify>,
     state: Arc<StdMutex<BootstrapBlockingState>>,
+    /// Test-only hook recording the settle/publish ordering of a forward.
+    #[cfg(test)]
+    settle_probe: Option<Arc<SettleOrderProbe>>,
 }
 
 #[derive(Debug, Default)]
@@ -153,6 +221,21 @@ impl Default for BootstrapBlockingBoundary {
             poisoned: Arc::new(AtomicBool::new(false)),
             quiesced: Arc::new(Notify::new()),
             state: Arc::new(StdMutex::new(BootstrapBlockingState::default())),
+            #[cfg(test)]
+            settle_probe: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl BootstrapBlockingBoundary {
+    /// Installs a probe that records whether `settle_forward` runs before the
+    /// forward's outcome is published, so a test can assert the ordering
+    /// deterministically instead of relying on scheduling.
+    fn with_settle_probe(self, probe: Arc<SettleOrderProbe>) -> Self {
+        Self {
+            settle_probe: Some(probe),
+            ..self
         }
     }
 }
@@ -197,10 +280,11 @@ impl BootstrapBlockingBoundary {
         Ok(epoch)
     }
 
-    fn finish_forward(&self, epoch: u64, failed_or_abandoned: bool) {
-        if failed_or_abandoned {
-            self.poison(epoch);
-        }
+    /// Releases this forward's share of the boundary accounting and lets a
+    /// pending recovery quiesce. Callers must run this *before* the forward's
+    /// result becomes observable, so that observing a completed forward implies
+    /// a finalized boundary rather than a still-poisoned one.
+    fn settle_forward(&self) {
         let Ok(mut state) = self.state.lock() else {
             self.poisoned.store(true, Ordering::SeqCst);
             return;
@@ -208,6 +292,13 @@ impl BootstrapBlockingBoundary {
         state.active_forward = state.active_forward.saturating_sub(1);
         self.active_workers.fetch_sub(1, Ordering::SeqCst);
         self.try_finish_recovery(&mut state);
+        #[cfg(test)]
+        if let Some(probe) = self.settle_probe.as_deref() {
+            probe.observe_settle(
+                self.poisoned.load(Ordering::SeqCst),
+                self.active_workers.load(Ordering::SeqCst),
+            );
+        }
     }
 
     fn finish_cleanup(&self, epoch: u64, succeeded: bool) {
@@ -331,8 +422,20 @@ impl BootstrapBlockingBoundary {
                 if failed {
                     boundary.poison(epoch);
                 }
-                let abandoned = sender.send(outcome).is_err();
-                boundary.finish_forward(epoch, abandoned);
+                // Settle the boundary before the result is observable, mirroring
+                // the cleanup branch: a caller that sees a completed forward must
+                // already see the recovery it may have just completed.
+                boundary.settle_forward();
+                #[cfg(test)]
+                if let Some(probe) = boundary.settle_probe.as_deref() {
+                    probe.mark_result_sent();
+                }
+                if sender.send(outcome).is_err() {
+                    // Nobody observed this mutating forward, so its effect is
+                    // unverifiable; fail closed. This is a no-op once the epoch
+                    // already advanced past a completed recovery.
+                    boundary.poison(epoch);
+                }
             }
         });
         match tokio::time::timeout_at(deadline, receiver).await {
@@ -772,9 +875,28 @@ impl BrokerState {
         }
     }
 
-    async fn runtime_identity(
+    /// Builds a runtime identity attestation from one consistent connection
+    /// snapshot.
+    ///
+    /// Connect (`bridge_socket`) and disconnect (`disconnect_session`) replace
+    /// `sessions` and `session_identities` while holding the `bridge_senders`
+    /// **write** lock. Holding that same lock for reading here, across both map
+    /// reads, guarantees the session and its identity claim belong to the same
+    /// connection generation: a reconnect cannot interleave and produce a mixed
+    /// attestation (an old claim spliced onto a new epoch, or vice versa).
+    ///
+    /// `expected_connection`, when supplied, is checked (both the sender's
+    /// `connection_id` and the session's `connected_at_epoch_ms`) inside the
+    /// same guard, so the staleness checks and the returned attestation refer
+    /// to one snapshot. Everything runs in a single method that acquires
+    /// `bridge_senders.read()` exactly once; the previous two-method shape made
+    /// `runtime_identity_for_connection` hold a read guard across a call into
+    /// `runtime_identity`, which would re-enter the same write-preferring
+    /// `RwLock` and could deadlock with a queued writer.
+    async fn runtime_identity_snapshot(
         &self,
         query: RuntimeIdentityQuery,
+        expected_connection: Option<BridgeConnectionIdentity>,
     ) -> Result<RuntimeIdentityAttestation, Box<RpcErrorResponse>> {
         if query
             .target
@@ -790,10 +912,32 @@ impl BrokerState {
         if let Some(expected) = query.expected.as_ref() {
             validate_runtime_identity_shape(expected)?;
         }
-        let candidates = self
-            .sessions
-            .read()
-            .await
+
+        // One read guard is held for the entire snapshot. The connect/disconnect
+        // paths hold the matching write guard while swapping `sessions` and
+        // `session_identities`, so neither can interleave here.
+        let senders = self.bridge_senders.read().await;
+
+        if let Some(expected) = expected_connection.as_ref() {
+            let key = session_key(
+                query.host,
+                query.target.as_deref().unwrap_or(DEFAULT_TARGET),
+            );
+            if !senders
+                .get(&key)
+                .is_some_and(|sender| sender.connection_id == expected.connection_id)
+            {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "bridge connection identity is stale",
+                    json!({"field": "bridge.connectionId"}),
+                ));
+            }
+        }
+
+        let sessions = self.sessions.read().await;
+        let session_identities = self.session_identities.read().await;
+        let candidates = sessions
             .iter()
             .filter(|(_, session)| {
                 session.capabilities.host == query.host
@@ -819,7 +963,7 @@ impl BrokerState {
             ));
         }
         let (key, session) = candidates.into_iter().next().expect("one candidate");
-        let claim = self.session_identities.read().await.get(&key).cloned();
+        let claim = session_identities.get(&key).cloned();
         let actual = complete_runtime_identity(
             self.broker_identity.as_ref().clone(),
             &session,
@@ -828,7 +972,23 @@ impl BrokerState {
         if let Some(expected) = query.expected.as_ref() {
             validate_expected_identity(&actual, expected)?;
         }
+        if let Some(expected) = expected_connection.as_ref() {
+            if actual.bridge.connected_at_epoch_ms != expected.connected_at_epoch_ms {
+                return Err(identity_error(
+                    ERROR_IDENTITY_STALE,
+                    "bridge connection identity is stale",
+                    json!({"field": "bridge.connectedAtEpochMs"}),
+                ));
+            }
+        }
         Ok(actual)
+    }
+
+    async fn runtime_identity(
+        &self,
+        query: RuntimeIdentityQuery,
+    ) -> Result<RuntimeIdentityAttestation, Box<RpcErrorResponse>> {
+        self.runtime_identity_snapshot(query, None).await
     }
 
     async fn active_connection_identity(&self, key: &str) -> Option<BridgeConnectionIdentity> {
@@ -847,30 +1007,7 @@ impl BrokerState {
         query: RuntimeIdentityQuery,
         expected: BridgeConnectionIdentity,
     ) -> Result<RuntimeIdentityAttestation, Box<RpcErrorResponse>> {
-        let key = session_key(
-            query.host,
-            query.target.as_deref().unwrap_or(DEFAULT_TARGET),
-        );
-        let senders = self.bridge_senders.read().await;
-        if !senders
-            .get(&key)
-            .is_some_and(|sender| sender.connection_id == expected.connection_id)
-        {
-            return Err(identity_error(
-                ERROR_IDENTITY_STALE,
-                "bridge connection identity is stale",
-                json!({"field": "bridge.connectionId"}),
-            ));
-        }
-        let actual = self.runtime_identity(query).await?;
-        if actual.bridge.connected_at_epoch_ms != expected.connected_at_epoch_ms {
-            return Err(identity_error(
-                ERROR_IDENTITY_STALE,
-                "bridge connection identity is stale",
-                json!({"field": "bridge.connectedAtEpochMs"}),
-            ));
-        }
-        Ok(actual)
+        self.runtime_identity_snapshot(query, Some(expected)).await
     }
 
     async fn bootstrap_photoshop(&self, request: PhotoshopBootstrapRequest) -> BootstrapResult {
@@ -2806,6 +2943,43 @@ impl BrokerState {
         Ok(receipt.result)
     }
 
+    /// Resolves an inbound hello's identity claim using the host-specific
+    /// bootstrap binding. Only Photoshop and Illustrator have a broker-owned
+    /// bootstrap; every other host (including After Effects CEP) must never
+    /// present a `bootstrapNonce`. Doing so fails closed instead of being
+    /// treated as a host-specific bootstrap field, keeping AE on the shared
+    /// #64 typed identity contract with no AE-only broker bypass.
+    async fn bind_bridge_bootstrap_claim(
+        &self,
+        expected_host: HostKind,
+        target: &str,
+        capabilities: &adobepy_protocol::Capabilities,
+        identity: Option<BridgeIdentityClaim>,
+        bootstrap_nonce: Option<&str>,
+    ) -> Result<Option<BridgeIdentityClaim>, Box<RpcErrorResponse>> {
+        match expected_host {
+            HostKind::Photoshop => {
+                self.bind_photoshop_bootstrap_claim(target, capabilities, identity, bootstrap_nonce)
+                    .await
+            }
+            HostKind::Illustrator => {
+                self.bind_illustrator_bootstrap_claim(
+                    target,
+                    capabilities,
+                    identity,
+                    bootstrap_nonce,
+                )
+                .await
+            }
+            _ if bootstrap_nonce.is_some() => Err(identity_error(
+                ERROR_IDENTITY_MISMATCH,
+                "bootstrap nonce was presented by an unsupported host",
+                json!({"field": "host"}),
+            )),
+            _ => Ok(identity),
+        }
+    }
+
     async fn bind_photoshop_bootstrap_claim(
         &self,
         target: &str,
@@ -2897,9 +3071,11 @@ impl BrokerState {
             ));
         };
         let Some(profile_id) = identity.host.profile_id.as_ref() else {
+            // The authenticated request and one-time nonce do not independently
+            // observe the host profile. Never substitute request.host.profile_id.
             return Err(identity_error(
                 ERROR_IDENTITY_UNAVAILABLE,
-                "Photoshop bootstrap connection omitted its host profile identity",
+                "Independently observed Photoshop host profile identity is unavailable",
                 json!({"missingFields": ["identity.host.profileId"]}),
             ));
         };
@@ -3179,6 +3355,7 @@ fn broker_router(state: BrokerState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/capabilities", get(list_capabilities))
+        .route("/v1/broker-identity", get(broker_identity))
         .route("/v1/runtime-identity", post(runtime_identity))
         .route("/v1/photoshop/bootstrap", post(photoshop_bootstrap))
         .route(
@@ -3230,6 +3407,24 @@ async fn runtime_identity(
         Ok(identity) => Json(identity).into_response(),
         Err(error) => Json(*error).into_response(),
     }
+}
+
+/// Return the broker's own runtime identity over an authenticated endpoint that
+/// does not depend on a live host/bridge session.
+///
+/// `/health` stays a token-less liveness probe and intentionally carries no
+/// identity. Listing broker process facts (pid, executable path, process-start
+/// identity, version, instance id) on an unauthenticated loopback endpoint would
+/// disclose them to any local process, so this data is exposed only to a caller
+/// holding `x-adobepy-token`. Because broker self-identity is knowable the
+/// instant the process starts, an adapter can verify "is this the broker I
+/// installed?" before or independently of any Photoshop session connecting,
+/// which the session-scoped `/v1/runtime-identity` attestation cannot provide.
+async fn broker_identity(State(state): State<BrokerState>, headers: HeaderMap) -> Response {
+    if !state.authorized(&headers) {
+        return unauthorized_response();
+    }
+    Json(state.broker_identity.as_ref().clone()).into_response()
 }
 
 async fn photoshop_bootstrap(
@@ -3397,34 +3592,15 @@ async fn bridge_socket(mut socket: WebSocket, state: BrokerState, expected_host:
         return;
     }
     let target = target.unwrap_or_else(|| DEFAULT_TARGET.to_owned());
-    let bound_identity = match expected_host {
-        HostKind::Photoshop => {
-            state
-                .bind_photoshop_bootstrap_claim(
-                    &target,
-                    &capabilities,
-                    identity,
-                    bootstrap_nonce.as_deref(),
-                )
-                .await
-        }
-        HostKind::Illustrator => {
-            state
-                .bind_illustrator_bootstrap_claim(
-                    &target,
-                    &capabilities,
-                    identity,
-                    bootstrap_nonce.as_deref(),
-                )
-                .await
-        }
-        _ if bootstrap_nonce.is_some() => Err(identity_error(
-            ERROR_IDENTITY_MISMATCH,
-            "bootstrap nonce was presented by an unsupported host",
-            json!({"field": "host"}),
-        )),
-        _ => Ok(identity),
-    };
+    let bound_identity = state
+        .bind_bridge_bootstrap_claim(
+            expected_host,
+            &target,
+            &capabilities,
+            identity,
+            bootstrap_nonce.as_deref(),
+        )
+        .await;
     let identity = match bound_identity {
         Ok(identity) => identity,
         Err(error) => {
@@ -3839,17 +4015,6 @@ fn validate_bridge_identity_claim(
             json!({"field": "target"}),
         ));
     }
-    if capabilities.host == HostKind::AfterEffects {
-        return Err(identity_error(
-            ERROR_IDENTITY_UNAVAILABLE,
-            "After Effects runtime identity requires an adapter-owned launch receipt",
-            json!({
-                "host": capabilities.host.as_str(),
-                "target": target,
-                "missingFields": ["adapterOwnedLaunchReceipt"]
-            }),
-        ));
-    }
     if !is_bounded_text(&capabilities.bridge_version, 64)
         || capabilities
             .host_version
@@ -3983,6 +4148,15 @@ fn complete_runtime_identity(
         return Err(identity_error(
             ERROR_IDENTITY_MISMATCH,
             "Photoshop runtime identity requires the UXP bridge",
+            json!({"field": "bridge.bridgeKind"}),
+        ));
+    }
+    if session.capabilities.host == HostKind::AfterEffects
+        && session.capabilities.bridge_kind != adobepy_protocol::BridgeKind::Cep
+    {
+        return Err(identity_error(
+            ERROR_IDENTITY_MISMATCH,
+            "After Effects runtime identity requires the CEP bridge",
             json!({"field": "bridge.bridgeKind"}),
         ));
     }
@@ -4213,7 +4387,10 @@ fn capture_broker_identity() -> anyhow::Result<BrokerRuntimeIdentity> {
         pid: std::process::id(),
         process_start_identity: current_process_start_identity()?,
         executable_path,
-        runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
+        // Report the release-managed adobepy product version, not the pinned
+        // Rust crate version, so an adapter can match this identity against its
+        // owned install receipt. See crates/adobepy-broker/build.rs.
+        runtime_version: env!("ADOBEPY_PRODUCT_VERSION").to_owned(),
         instance_id: Uuid::new_v4().hyphenated().to_string(),
     })
 }
@@ -4274,7 +4451,7 @@ fn current_process_start_identity() -> anyhow::Result<String> {
         return Err(std::io::Error::last_os_error().into());
     }
     let creation_ticks = (u64::from(creation.high) << 32) | u64::from(creation.low);
-    Ok(format!("windows:{creation_ticks}"))
+    Ok(format!("windows-filetime:{creation_ticks}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -4910,21 +5087,23 @@ mod tests {
                     .block_on(state.bootstrap_photoshop(request))
             }
         });
-        // The injected delay in the owner's phase can be several hundred
-        // milliseconds, so a 2 s ceiling on phase entry was close enough to the
-        // work that a loaded runner could exhaust it. Wait generously for the
-        // state the test needs, and give the follower a margin scaled to the
-        // injected delay rather than a fixed 100 ms that a slow host can spend
-        // entirely on scheduling.
+        // The injected delay in the owner's phase is several seconds, so a
+        // short ceiling on phase entry could be exhausted on a loaded runner.
+        // Wait generously for the state the test needs, polling with a real
+        // sleep rather than a yield-loop. The follower is then staggered by a
+        // margin that is large relative to host scheduling jitter but small
+        // relative to the shared request deadline: that keeps the owner's grant
+        // joinable when the follower arrives while letting the follower's own
+        // deadline outlive the owner's recovery broadcast.
         let owner_deadline = std::time::Instant::now() + Duration::from_secs(30);
         while owner_phase_entries.load(Ordering::SeqCst) == 0 {
             assert!(
                 std::time::Instant::now() < owner_deadline,
                 "the bootstrap owner must enter the delayed phase"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(400));
         let follower = std::thread::spawn({
             let state = state.clone();
             let request = request.clone();
@@ -4937,6 +5116,31 @@ mod tests {
             }
         });
         [owner.join().unwrap(), follower.join().unwrap()]
+    }
+
+    // A timed-out forward call and its recovery run on blocking threads after
+    // the request has already returned. Sample their completion by state, not
+    // by a fixed wall-clock wait, so a loaded runner cannot leave a worker
+    // outstanding at the instant the assertions run. The ceiling is only a
+    // hang detector.
+    fn wait_for_bootstrap_quiescence(state: &BrokerState) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let grants_empty = state.bootstrap_grants.blocking_lock().is_empty();
+            let workers_idle = state
+                .bootstrap_blocking
+                .active_workers
+                .load(Ordering::SeqCst)
+                == 0;
+            if grants_empty && workers_idle {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bootstrap recovery must quiesce"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn request() -> RpcRequest {
@@ -5574,6 +5778,175 @@ mod tests {
         assert!(!boundary.poisoned.load(Ordering::SeqCst));
     }
 
+    /// Pins the ordering that the flaky
+    /// `panicking_mutating_worker_rejects_queued_forward_until_recovery_quiesces`
+    /// test could only catch by luck: a forward must settle the boundary before
+    /// its outcome is handed to the awaiter.
+    ///
+    /// The worker is parked inside its blocking operation by a barrier. Its
+    /// ordinary operation error does not poison the boundary. `settle_forward`
+    /// must release the forward's accounting before publishing that error, so
+    /// the awaiter observes a completed forward that no longer owns a slot.
+    ///
+    /// Moving `settle_forward` to after `sender.send(outcome)` makes this fail
+    /// every time rather than intermittently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_settles_boundary_before_result_is_observable() {
+        let probe = Arc::new(SettleOrderProbe::new());
+        let boundary = BootstrapBlockingBoundary::default().with_settle_probe(probe.clone());
+        // Park the worker inside its operation so the schedule is fixed.
+        let (gate, mut entered) = FakePhaseGate::new();
+
+        let forward = tokio::spawn({
+            let boundary = boundary.clone();
+            let gate = gate.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || -> anyhow::Result<()> {
+                            gate.enter_and_wait();
+                            anyhow::bail!("deterministic mutating worker failure");
+                        },
+                    )
+                    .await
+            }
+        });
+        while !*entered.borrow() {
+            entered.changed().await.unwrap();
+        }
+        assert_eq!(boundary.active_workers.load(Ordering::SeqCst), 1);
+        assert!(
+            !boundary.poisoned.load(Ordering::SeqCst),
+            "the boundary must be clean before the worker fails"
+        );
+
+        gate.release().await;
+        let outcome = forward.await.expect("forward task must not panic");
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "the failing forward must surface its error, got {outcome:?}"
+        );
+
+        // The awaiter has now observed a completed forward. The settle snapshot
+        // must show the boundary already finalized at publish time.
+        assert!(
+            probe.settled(),
+            "settle_forward never ran; the ordering probe is not wired up"
+        );
+        assert!(
+            !probe.observed_settle_after_send(),
+            "settle_forward ran after the forward result was already published;              the boundary must be settled before a caller can observe the outcome"
+        );
+        assert_eq!(
+            probe.active_while_settling.load(Ordering::SeqCst),
+            0,
+            "settle_forward released the accounting only after the result was observable"
+        );
+        assert!(
+            !probe.poisoned_while_settling.load(Ordering::SeqCst),
+            "an ordinary operation error must not poison the boundary at settlement"
+        );
+        assert!(
+            !boundary.poisoned.load(Ordering::SeqCst),
+            "a completed ordinary operation error must leave the boundary unpoisoned"
+        );
+    }
+
+    /// Same invariant as the test above, asserted from the awaiter's side.
+    ///
+    /// A second worker holds the remaining slot, so the awaiter's active-worker
+    /// count checks that only the completed forward's accounting was released
+    /// before publication. Its ordinary operation error leaves the boundary clean.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observed_forward_completion_implies_finalized_boundary() {
+        let probe = Arc::new(SettleOrderProbe::new());
+        let boundary = BootstrapBlockingBoundary::default().with_settle_probe(probe.clone());
+        let (failing_gate, mut failing_entered) = FakePhaseGate::new();
+        let (holder_gate, mut holder_entered) = FakePhaseGate::new();
+
+        let observed_poisoned = Arc::new(AtomicBool::new(false));
+        let observed_active = Arc::new(AtomicUsize::new(usize::MAX));
+
+        let failing = tokio::spawn({
+            let boundary = boundary.clone();
+            let observed_poisoned = observed_poisoned.clone();
+            let observed_active = observed_active.clone();
+            let gate = failing_gate.clone();
+            async move {
+                let outcome = boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || -> anyhow::Result<()> {
+                            gate.enter_and_wait();
+                            anyhow::bail!("deterministic mutating worker failure");
+                        },
+                    )
+                    .await;
+                // Sampled the moment the awaiter resumes: the first instant the
+                // completed forward is observable to a caller.
+                observed_poisoned.store(boundary.poisoned.load(Ordering::SeqCst), Ordering::SeqCst);
+                observed_active.store(
+                    boundary.active_workers.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                outcome
+            }
+        });
+        let holder = tokio::spawn({
+            let boundary = boundary.clone();
+            let gate = holder_gate.clone();
+            async move {
+                boundary
+                    .execute(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        move || {
+                            gate.enter_and_wait();
+                            Ok(())
+                        },
+                    )
+                    .await
+            }
+        });
+        while !*failing_entered.borrow() {
+            failing_entered.changed().await.unwrap();
+        }
+        while !*holder_entered.borrow() {
+            holder_entered.changed().await.unwrap();
+        }
+        assert_eq!(boundary.active_workers.load(Ordering::SeqCst), 2);
+
+        failing_gate.release().await;
+        let outcome = failing.await.expect("failing forward task must not panic");
+        // Released before the assertions below so that a failure here cannot
+        // leave the holder parked and hang the test.
+        holder_gate.release().await;
+        assert!(matches!(holder.await.unwrap(), Ok(Ok(()))));
+
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "the failing forward must surface its error, got {outcome:?}"
+        );
+
+        assert!(
+            probe.settled(),
+            "settle_forward never ran; the ordering probe is not wired up"
+        );
+        assert!(
+            !probe.observed_settle_after_send(),
+            "settle_forward ran after the forward result was already published;              the boundary must be settled before a caller can observe the outcome"
+        );
+        assert!(
+            !observed_poisoned.load(Ordering::SeqCst),
+            "an ordinary operation error must leave the boundary unpoisoned when observed"
+        );
+        assert_eq!(
+            observed_active.load(Ordering::SeqCst),
+            1,
+            "observed a completed forward while it still held a worker slot"
+        );
+    }
+
     fn identity_query(target: Option<&str>) -> RuntimeIdentityQuery {
         RuntimeIdentityQuery {
             host: HostKind::Photoshop,
@@ -5614,6 +5987,84 @@ mod tests {
         invalid.jsonrpc = "1.0".into();
         let error = state.dispatch_request(invalid).await.unwrap_err();
         assert_eq!(error.error.code, ERROR_INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn broker_identity_endpoint_is_authenticated_and_session_independent() {
+        // No host/bridge session is registered; broker self-identity must still
+        // resolve from the authenticated endpoint.
+        let app = broker_router(state());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/broker-identity")
+                    .header("x-adobepy-token", "t")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            payload["runtimeVersion"].as_str(),
+            Some(env!("ADOBEPY_PRODUCT_VERSION"))
+        );
+        assert!(payload["pid"].as_u64().is_some_and(|pid| pid > 0));
+        assert!(payload["processStartIdentity"].as_str().is_some());
+        assert!(payload["executablePath"].as_str().is_some());
+        assert!(payload["instanceId"].as_str().is_some());
+        // The token is never echoed back on any identity surface.
+        assert!(!String::from_utf8_lossy(&bytes).contains("token"));
+
+        // Unauthenticated callers are rejected: identity is never on /health and
+        // never on the broker identity endpoint without the bearer token.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/broker-identity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn broker_runtime_version_reports_the_product_release_version() {
+        let identity = capture_broker_identity().expect("capture broker identity");
+        assert_eq!(identity.runtime_version, env!("ADOBEPY_PRODUCT_VERSION"));
+        // The Rust crate version is pinned and release-independent; it must not be
+        // what an adapter compares against its owned install receipt.
+        assert_ne!(identity.runtime_version, env!("CARGO_PKG_VERSION"));
+        assert!(is_bounded_text(&identity.runtime_version, 64));
+    }
+
+    #[test]
+    fn broker_start_identity_uses_the_canonical_platform_prefix() {
+        let identity = capture_broker_identity().expect("capture broker identity");
+        let start = identity.process_start_identity;
+        #[cfg(windows)]
+        assert!(
+            start.starts_with("windows-filetime:"),
+            "unexpected start identity {start}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            start.starts_with("macos:"),
+            "unexpected start identity {start}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            start.starts_with("linux:"),
+            "unexpected start identity {start}"
+        );
+        assert!(is_bounded_start_identity(&start));
     }
 
     #[tokio::test]
@@ -5870,20 +6321,295 @@ mod tests {
         assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
     }
 
-    #[test]
-    fn after_effects_identity_is_host_specific_and_entrypoint_bound() {
-        let caps = after_effects_caps();
-        let valid = after_effects_identity_claim();
-        let error = validate_bridge_identity_claim("default", &caps, Some(&valid)).unwrap_err();
-        assert_eq!(error.error.code, ERROR_IDENTITY_UNAVAILABLE);
-        assert_eq!(
-            error
-                .error
-                .data
-                .as_ref()
-                .and_then(|data| data["missingFields"][0].as_str()),
-            Some("adapterOwnedLaunchReceipt")
+    async fn insert_after_effects_session(
+        state: &BrokerState,
+        target: &str,
+        capabilities: Capabilities,
+        connected_at_epoch_ms: u128,
+        identity: Option<BridgeIdentityClaim>,
+    ) {
+        let key = session_key(HostKind::AfterEffects, target);
+        state.sessions.write().await.insert(
+            key.clone(),
+            BridgeSessionInfo {
+                target: target.into(),
+                capabilities,
+                connected_at_epoch_ms,
+            },
         );
+        if let Some(identity) = identity {
+            state.session_identities.write().await.insert(key, identity);
+        }
+    }
+
+    fn after_effects_identity_query(target: Option<&str>) -> RuntimeIdentityQuery {
+        RuntimeIdentityQuery {
+            host: HostKind::AfterEffects,
+            target: target.map(str::to_owned),
+            expected: None,
+        }
+    }
+
+    #[test]
+    fn after_effects_connect_uses_the_shared_identity_contract() {
+        let caps = after_effects_caps();
+        // Backward-compatible connectivity stays optional at connect time: a
+        // standalone handshake is no longer rejected by a fake AE-only field.
+        validate_bridge_identity_claim("default", &caps, None)
+            .expect("an AE CEP connect without a claim must not require an AE-only field");
+        let valid = after_effects_identity_claim();
+        validate_bridge_identity_claim("default", &caps, Some(&valid))
+            .expect("a complete AE CEP claim validates under the shared typed identity contract");
+    }
+
+    #[tokio::test]
+    async fn after_effects_runtime_identity_is_attested_and_cross_checked() {
+        let state = state();
+        insert_after_effects_session(
+            &state,
+            "default",
+            after_effects_caps(),
+            1_720_000_000_000,
+            Some(after_effects_identity_claim()),
+        )
+        .await;
+
+        // The adapter-owned launch receipt is cross-checked by passing an
+        // `expected` attestation built from independent OS observations and the
+        // owned install receipt. AE uses the same typed endpoint as other hosts.
+        let actual = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .expect("a complete AE CEP claim produces a typed runtime attestation");
+        assert_eq!(actual.host.pid, 4200);
+        assert_eq!(actual.host.profile_id, "after-effects-production");
+        assert_eq!(actual.bridge.target, "default");
+        assert_eq!(actual.bridge.bridge_kind, BridgeKind::Cep);
+        let wire = serde_json::to_string(&actual).unwrap();
+        assert!(!wire.contains("token"));
+        assert!(!wire.contains("adapterOwnedLaunchReceipt"));
+
+        let mut exact_query = after_effects_identity_query(Some("default"));
+        exact_query.expected = Some(actual.clone());
+        assert_eq!(state.runtime_identity(exact_query).await.unwrap(), actual);
+
+        let mut stale = actual.clone();
+        stale.host.process_start_identity = "windows:133700000000000101".into();
+        let mut stale_query = after_effects_identity_query(Some("default"));
+        stale_query.expected = Some(stale);
+        let error = state.runtime_identity(stale_query).await.unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+
+        let mut foreign = actual.clone();
+        foreign.host.executable_path = "C:/Foreign/AfterFX.exe".into();
+        let mut foreign_query = after_effects_identity_query(Some("default"));
+        foreign_query.expected = Some(foreign);
+        let error = state.runtime_identity(foreign_query).await.unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
+    }
+
+    #[tokio::test]
+    async fn after_effects_runtime_identity_fails_closed_with_distinguishable_reasons() {
+        let state = state();
+        let missing = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.error.code, ERROR_IDENTITY_UNAVAILABLE);
+        assert_eq!(
+            missing.error.data.unwrap()["missingFields"][0],
+            "bridge.session"
+        );
+
+        let mut incomplete = after_effects_identity_claim();
+        incomplete.host.pid = None;
+        insert_after_effects_session(
+            &state,
+            "default",
+            after_effects_caps(),
+            1_720_000_000_000,
+            Some(incomplete),
+        )
+        .await;
+        let incomplete_error = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .unwrap_err();
+        assert_eq!(incomplete_error.error.code, ERROR_IDENTITY_UNAVAILABLE);
+        let missing_fields = &incomplete_error.error.data.unwrap()["missingFields"];
+        assert_eq!(missing_fields[0], "host.pid");
+        assert!(!missing_fields
+            .to_string()
+            .contains("adapterOwnedLaunchReceipt"));
+
+        // A foreign bridge kind cannot claim an AE CEP identity.
+        let mut foreign_kind = after_effects_caps();
+        foreign_kind.bridge_kind = BridgeKind::Uxp;
+        insert_after_effects_session(
+            &state,
+            "default",
+            foreign_kind,
+            1_720_000_000_000,
+            Some(after_effects_identity_claim()),
+        )
+        .await;
+        let kind_error = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .unwrap_err();
+        assert_eq!(kind_error.error.code, ERROR_IDENTITY_MISMATCH);
+        assert_eq!(kind_error.error.data.unwrap()["field"], "bridge.bridgeKind");
+
+        // Module shadowing and host-version mismatch still fail closed under
+        // the shared claim validator.
+        let mut shadowed = after_effects_identity_claim();
+        shadowed.bridge.module_origin = Some("C:/Foreign/dist/main.js".into());
+        assert_eq!(
+            validate_bridge_identity_claim("default", &after_effects_caps(), Some(&shadowed))
+                .unwrap_err()
+                .error
+                .code,
+            ERROR_IDENTITY_MISMATCH
+        );
+        let mut version_mismatch = after_effects_identity_claim();
+        version_mismatch.host.host_version = Some("25.1.0".into());
+        assert_eq!(
+            validate_bridge_identity_claim(
+                "default",
+                &after_effects_caps(),
+                Some(&version_mismatch)
+            )
+            .unwrap_err()
+            .error
+            .code,
+            ERROR_IDENTITY_MISMATCH
+        );
+    }
+
+    #[tokio::test]
+    async fn after_effects_cep_bootstrap_nonce_is_rejected_fail_closed() {
+        let state = state();
+        // AE CEP has no broker-owned bootstrap: its generated config does not
+        // inject a nonce, and presenting one must be refused rather than being
+        // silently treated as an AE-specific bootstrap field.
+        let nonce = "f".repeat(64);
+        let error = state
+            .bind_bridge_bootstrap_claim(
+                HostKind::AfterEffects,
+                "default",
+                &after_effects_caps(),
+                Some(after_effects_identity_claim()),
+                Some(&nonce),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_MISMATCH);
+        assert_eq!(error.error.data.as_ref().unwrap()["field"], "host");
+        let public = serde_json::to_string(&error).unwrap();
+        assert!(!public.contains(&nonce));
+
+        // Without a nonce the shared typed identity contract accepts the AE
+        // hello unchanged, with no AE-only field required.
+        let bound = state
+            .bind_bridge_bootstrap_claim(
+                HostKind::AfterEffects,
+                "default",
+                &after_effects_caps(),
+                Some(after_effects_identity_claim()),
+                None,
+            )
+            .await
+            .expect("an AE CEP hello without a nonce uses the shared contract");
+        assert_eq!(bound.expect("claim is retained").host.pid, Some(4200));
+    }
+
+    async fn install_runtime_identity_generation(
+        state: &BrokerState,
+        key: &str,
+        pid: u32,
+        connected_at_epoch_ms: u128,
+        connection_id: u64,
+    ) {
+        // Mirror the connect path: hold the bridge_senders write lock across the
+        // swap of sessions and session_identities, so a concurrent reader can
+        // only ever observe one complete connection generation.
+        let mut senders = state.bridge_senders.write().await;
+        state.sessions.write().await.insert(
+            key.to_owned(),
+            BridgeSessionInfo {
+                target: "default".into(),
+                capabilities: after_effects_caps(),
+                connected_at_epoch_ms,
+            },
+        );
+        let mut claim = after_effects_identity_claim();
+        claim.host.pid = Some(pid);
+        state
+            .session_identities
+            .write()
+            .await
+            .insert(key.to_owned(), claim);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        senders.insert(
+            key.to_owned(),
+            BridgeSender {
+                connection_id,
+                sender: tx,
+            },
+        );
+    }
+
+    /// Regression for the two-read-lock race: a reconnect that swaps
+    /// `sessions` and `session_identities` under the `bridge_senders` write
+    /// lock must never be observed half-applied by a bare `runtime_identity()`.
+    /// `host.pid` comes from the identity claim and
+    /// `bridge.connectedAtEpochMs` comes from the session, so a torn read would
+    /// pair them across generations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_identity_uses_one_consistent_snapshot_across_reconnect() {
+        let state = state();
+        let key = session_key(HostKind::AfterEffects, "default");
+        install_runtime_identity_generation(&state, &key, 4200, 1111, 1).await;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reconnector = tokio::spawn({
+            let state = state.clone();
+            let key = key.clone();
+            let stop = stop.clone();
+            async move {
+                let mut generation_b = false;
+                while !stop.load(Ordering::SeqCst) {
+                    let (pid, epoch, connection_id) = if generation_b {
+                        (7300, 2222, 2)
+                    } else {
+                        (4200, 1111, 1)
+                    };
+                    install_runtime_identity_generation(&state, &key, pid, epoch, connection_id)
+                        .await;
+                    generation_b = !generation_b;
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        for _ in 0..2_000 {
+            let attestation = state
+                .runtime_identity(after_effects_identity_query(Some("default")))
+                .await
+                .expect("a fully-installed generation always attests");
+            let pair = (
+                attestation.host.pid,
+                attestation.bridge.connected_at_epoch_ms,
+            );
+            assert!(
+                pair == (4200, 1111) || pair == (7300, 2222),
+                "runtime identity mixed two connection generations: {pair:?}"
+            );
+        }
+        stop.store(true, Ordering::SeqCst);
+        reconnector
+            .await
+            .expect("reconnect loop must finish cleanly");
     }
 
     #[tokio::test]
@@ -6297,7 +7023,28 @@ mod tests {
         assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 0);
         assert!(state.bootstrap_grants.lock().await.is_empty());
-        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        // The non-cooperative prepare (1 s) and the cleanup of its abandoned
+        // forward call run on blocking threads after the 50 ms deadline has
+        // already returned. A fixed 1 s wait sampled `active_workers` while
+        // that work could still be outstanding on a loaded runner. Wait on the
+        // state actually being reached, with a ceiling far clear of the injected
+        // delay so only a genuine hang fails; the assertions below keep the
+        // deadline and fail-closed semantics intact.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if state
+                    .bootstrap_blocking
+                    .active_workers
+                    .load(Ordering::SeqCst)
+                    == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the abandoned prepare and its cleanup must quiesce");
         assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -7314,13 +8061,174 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.error.code, ERROR_IDENTITY_UNAVAILABLE);
-        assert!(error
-            .error
-            .data
-            .as_ref()
-            .is_some_and(|data| data.to_string().contains("identity.host.profileId")));
+        assert_eq!(
+            error.error.data,
+            Some(json!({"missingFields": ["identity.host.profileId"]}))
+        );
+        assert_eq!(
+            error.error.message,
+            "Independently observed Photoshop host profile identity is unavailable"
+        );
+        assert!(
+            !state.bootstrap_grants.lock().await[&session_key(HostKind::Photoshop, "retouch")]
+                .nonce_claimed
+        );
         assert_eq!(task.await.unwrap().unwrap_err().error.code, ERROR_TIMEOUT);
         assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+    }
+
+    // Explicit npm gate: ordinary cargo tests must not require Node or built
+    // bridge assets. test:all runs this after building the real Photoshop bundle.
+    #[tokio::test]
+    #[ignore = "requires Node and built UXP bundle; run npm run test:photoshop-bootstrap-contract"]
+    async fn photoshop_generated_config_hello_fails_closed_without_observed_profile() {
+        use tokio::io::AsyncWriteExt;
+
+        let backend = FakeBootstrapBackend::ready();
+        let mut state = bootstrap_state(backend.clone());
+        state.token = "PRIVATE_TEST_TOKEN".into();
+        // Allow cold Node startup on Windows; the narrow Rust-only deadline
+        // tests cover scheduling precision without an external process.
+        let request = bootstrap_request(10_000);
+        let target = request.target.clone();
+        let key = session_key(HostKind::Photoshop, &target);
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let request_started = tokio::time::Instant::now();
+                let result = state.bootstrap_photoshop(request).await;
+                (result, request_started.elapsed())
+            }
+        });
+        let nonce = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let value = state
+                    .bootstrap_grants
+                    .lock()
+                    .await
+                    .get(&key)
+                    .and_then(|grant| grant.observed.as_ref().map(|_| grant.nonce.clone()));
+                if let Some(value) = value {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("bootstrap must observe its launched process within the test bound");
+
+        let url = "ws://127.0.0.1:47391/v1/bridge/photoshop/ws";
+        let config = photoshop_bootstrap::photoshop_bootstrap_config_for_test(
+            url,
+            &state.token,
+            &target,
+            &nonce,
+        )
+        .unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut child = tokio::process::Command::new("node")
+            .arg(root.join("scripts/test-uxp-bridge.js"))
+            .arg("--photoshop-generated-config-hello")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("Node is required; run npm run test:photoshop-bootstrap-contract");
+        let output = tokio::time::timeout(Duration::from_secs(5), async move {
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(config.as_bytes()).await.unwrap();
+            drop(stdin);
+            child.wait_with_output().await.unwrap()
+        })
+        .await
+        .expect("generated-config bridge harness must finish within the test bound");
+        assert!(
+            output.status.success(),
+            "bridge harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.len() <= 64 * 1024);
+        let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output["url"], url);
+        let BridgeInbound::Hello {
+            token,
+            target: hello_target,
+            capabilities,
+            identity,
+            bootstrap_nonce,
+        } = serde_json::from_value(output["hello"].clone()).unwrap()
+        else {
+            panic!("real Photoshop bundle must emit a hello");
+        };
+        assert_eq!(token, state.token);
+        assert_eq!(hello_target.as_deref(), Some(target.as_str()));
+        assert_eq!(bootstrap_nonce.as_deref(), Some(nonce.as_str()));
+        assert_eq!(capabilities.host, HostKind::Photoshop);
+        let claim = identity.as_ref().expect("UXP must supply plugin identity");
+        assert_eq!(claim.bridge, identity_claim().bridge);
+        assert_eq!(claim.host.host_version.as_deref(), Some("26.5.1"));
+        assert_eq!(claim.host.pid, None);
+        assert_eq!(claim.host.process_start_identity, None);
+        assert_eq!(claim.host.executable_path, None);
+        assert_eq!(claim.host.profile_id, None);
+
+        let error = state
+            .bind_photoshop_bootstrap_claim(
+                &target,
+                &capabilities,
+                identity,
+                bootstrap_nonce.as_deref(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_UNAVAILABLE);
+        assert_eq!(
+            error.error.data,
+            Some(json!({"missingFields": ["identity.host.profileId"]}))
+        );
+        let public = serde_json::to_string(&error).unwrap();
+        assert!(!public.contains(&nonce));
+        assert!(!public.contains("PRIVATE_TEST_TOKEN"));
+        assert!(!public.contains("profile-production"));
+        assert!(!public.contains("C:/"));
+        assert!(!state.bootstrap_grants.lock().await[&key].nonce_claimed);
+        assert!(state.sessions.read().await.is_empty());
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
+
+        // Keep the outer bound as a hung-task guard, separate from the request
+        // deadline assertion. Allow one second for the two bounded 175-ms cleanup
+        // phases, 20-ms verification polling, and CI scheduling. Measure inside
+        // the task so initial scheduling and join collection do not count.
+        let (result, elapsed) = tokio::time::timeout_at(started + Duration::from_secs(13), task)
+            .await
+            .expect("bootstrap task must finish within the outer test bound")
+            .unwrap();
+        assert!(
+            elapsed <= Duration::from_secs(11),
+            "10-second bootstrap request took {elapsed:?}, exceeding its one-second cleanup/scheduling allowance"
+        );
+        let timeout = result.unwrap_err();
+        assert_eq!(timeout.error.code, ERROR_TIMEOUT);
+        assert_eq!(
+            timeout.error.data,
+            Some(json!({"stage": "verify", "timeoutMs": 10_000}))
+        );
+        assert_eq!(backend.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.finalizes.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
+        assert!(!backend.launch_live.load(Ordering::SeqCst));
+        assert!(state.bootstrap_grants.lock().await.is_empty());
+        assert!(state.bootstrap_receipts.lock().await.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7426,7 +8334,26 @@ mod tests {
         );
         assert_eq!(backend.config_state.load(Ordering::SeqCst), 1);
         assert!(state.bootstrap_grants.lock().await.is_empty());
-        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        // The abandoned 1 s prepare and the cleanup of its forward worker keep
+        // `active_workers` non-zero until they finish on a blocking thread. A
+        // fixed 1 s wait sampled that counter while a loaded runner could still
+        // have the cleanup outstanding; poll the state instead, with a ceiling
+        // far clear of the injected delay so only a genuine hang fails.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if state
+                    .bootstrap_blocking
+                    .active_workers
+                    .load(Ordering::SeqCst)
+                    == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the abandoned prepare and its cleanup must quiesce");
         assert_eq!(
             backend.config_state.load(Ordering::SeqCst),
             1,
@@ -7847,16 +8774,27 @@ mod tests {
 
     #[test]
     fn late_prepare_and_launch_failures_share_timeout_after_exact_recovery() {
+        // The deadline must stay below the injected phase delay so the owner
+        // still times out (and both callers share that ERROR_TIMEOUT at the
+        // same stage). A 200 ms deadline against a 250 ms delay left only
+        // 50 ms of slack: on a loaded runner the follower's fixed stagger and
+        // thread scheduling could consume it, so the follower arrived after
+        // the owner's grant had been released and started a competing
+        // bootstrap (a second launch) instead of joining. Scale both values
+        // by an order of magnitude: the deadline still fires first, but every
+        // window the test synchronizes on is now far larger than scheduling
+        // jitter. The shared request (including its timeout) is unchanged
+        // between owner and follower, so the grant stays joinable.
         for (stage, backend) in [
             ("prepare", {
                 let backend = FakeBootstrapBackend::ready();
-                backend.prepare_delay_ms.store(250, Ordering::SeqCst);
+                backend.prepare_delay_ms.store(2_500, Ordering::SeqCst);
                 backend.prepare_fails.store(true, Ordering::SeqCst);
                 backend
             }),
             ("launch", {
                 let backend = FakeBootstrapBackend::ready();
-                backend.launch_delay_ms.store(250, Ordering::SeqCst);
+                backend.launch_delay_ms.store(2_500, Ordering::SeqCst);
                 backend.launch_fails.store(true, Ordering::SeqCst);
                 backend
             }),
@@ -7869,9 +8807,10 @@ mod tests {
             };
             let outcomes = run_owner_then_follower_without_session(
                 &state,
-                &bootstrap_request(200),
+                &bootstrap_request(2_000),
                 phase_entries,
             );
+            wait_for_bootstrap_quiescence(&state);
             let errors = outcomes
                 .into_iter()
                 .map(Result::unwrap_err)
@@ -7915,11 +8854,21 @@ mod tests {
 
     #[test]
     fn recovery_failure_reaches_a_waiter_that_is_still_within_its_own_deadline() {
+        // The owner must time out inside launch (deadline < injected delay) so
+        // a failed rollback is published as a shared recovery error. A 200 ms
+        // deadline against a 250 ms launch gave the waiter only its 80 ms
+        // stagger of extra budget; on a loaded runner the waiter's own
+        // deadline expired before the recovery error was broadcast and it saw
+        // its private timeout instead. Scaling the deadline/delay by an order
+        // of magnitude, plus a generous stagger, keeps the waiter both
+        // joinable and comfortably "still within its own deadline" when the
+        // shared ERROR_IDENTITY_STALE arrives. The request is identical for
+        // both callers, so the grant stays joinable.
         let backend = FakeBootstrapBackend::ready();
-        backend.launch_delay_ms.store(250, Ordering::SeqCst);
+        backend.launch_delay_ms.store(2_500, Ordering::SeqCst);
         backend.rollback_fails.store(true, Ordering::SeqCst);
         let state = bootstrap_state(backend.clone());
-        let request = bootstrap_request(200);
+        let request = bootstrap_request(2_000);
         let owner = std::thread::spawn({
             let state = state.clone();
             let request = request.clone();
@@ -7931,15 +8880,15 @@ mod tests {
                     .block_on(state.bootstrap_photoshop(request))
             }
         });
-        let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(30);
         while backend.launches.load(Ordering::SeqCst) == 0 {
             assert!(
                 std::time::Instant::now() < wait_deadline,
                 "the owner must enter launch"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
-        std::thread::sleep(Duration::from_millis(80));
+        std::thread::sleep(Duration::from_millis(400));
         let waiter = std::thread::spawn({
             let state = state.clone();
             move || {
@@ -7951,6 +8900,7 @@ mod tests {
             }
         });
         let outcomes = [owner.join().unwrap(), waiter.join().unwrap()];
+        wait_for_bootstrap_quiescence(&state);
         let errors = outcomes
             .into_iter()
             .map(Result::unwrap_err)
