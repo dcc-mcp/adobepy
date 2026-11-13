@@ -1,39 +1,107 @@
 import type { HostAdapter } from "./host-adapter";
-import type { BridgeIdentityClaim, BridgeRequest, RpcRequest } from "./protocol";
+import type { BridgeIdentityClaim, RpcRequest } from "./protocol";
+import { ERROR_CODES } from "./protocol";
 import { BridgeRpcError, ERROR_HOST_SCRIPT } from "./errors";
+import type { BridgeStatus } from "../../../shared/status";
 
 declare const WebSocket: any;
 
 export type BridgeIdentityProvider = () => Promise<BridgeIdentityClaim | undefined>;
 
-export function connectBridge(adapter: HostAdapter, identityProvider?: BridgeIdentityProvider): void {
+export function connectBridge(
+  adapter: HostAdapter,
+  identityProvider?: BridgeIdentityProvider,
+  onStatus?: (status: BridgeStatus) => void
+): void {
+  onStatus?.("starting");
   const url = (globalThis as any).__ADOBEPY_BROKER_URL || `ws://127.0.0.1:47391/v1/bridge/${adapter.capabilities().host}/ws`;
   const token = (globalThis as any).__ADOBEPY_TOKEN;
   if (typeof token !== "string" || token.trim() === "") {
+    onStatus?.("error");
     console.error("[adobepy] ADOBEPY_TOKEN is missing; install the bridge with --token or configure adobepy.config.js.");
     return;
   }
   const target = (globalThis as any).__ADOBEPY_TARGET || "default";
-  const socket = new WebSocket(url);
+  onStatus?.("connecting");
+  let failed = false;
+  let socket: any;
+  try {
+    socket = new WebSocket(url);
+  } catch (error) {
+    onStatus?.("error");
+    throw error;
+  }
+  socket.addEventListener("error", () => {
+    failed = true;
+    onStatus?.("error");
+  });
+  socket.addEventListener("close", () => onStatus?.(failed ? "error" : "disconnected"));
   socket.addEventListener("open", async () => {
     let identity: BridgeIdentityClaim | undefined;
     try {
       identity = await identityProvider?.();
     } catch {
+      failed = true;
+      onStatus?.("error");
       console.error("[adobepy] runtime identity is unavailable; exact-instance verification will fail closed.");
     }
+    if (socket.readyState !== 1) return;
     const bootstrapNonce = boundedBootstrapNonce((globalThis as any).__ADOBEPY_BOOTSTRAP_NONCE);
-    socket.send(JSON.stringify({
-      type: "hello",
-      token,
-      target,
-      capabilities: adapter.capabilities(),
-      ...(identity ? { identity } : {}),
-      ...(bootstrapNonce ? { bootstrapNonce } : {})
-    }));
+    try {
+      socket.send(JSON.stringify({
+        type: "hello",
+        token,
+        target,
+        capabilities: adapter.capabilities(),
+        ...(identity ? { identity } : {}),
+        ...(bootstrapNonce ? { bootstrapNonce } : {})
+      }));
+    } catch (error) {
+      failed = true;
+      onStatus?.("error");
+      throw error;
+    }
+    onStatus?.(failed ? "error" : "ready");
   });
+  const reportProtocolViolation = (reason: string): void => {
+    failed = true;
+    onStatus?.("error");
+    console.error(`[adobepy] ${reason}`);
+    try {
+      // Answer a bad frame through the shared BridgeError envelope instead of
+      // letting an uncaught exception escape the message handler.
+      socket.send(JSON.stringify({
+        type: "error",
+        error: {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: ERROR_CODES.ERROR_PARSE, message: "Invalid bridge frame" }
+        }
+      }));
+    } catch {
+      // The transport may already be gone; the status is already failed.
+    }
+    if (typeof socket.close === "function") socket.close();
+  };
   socket.addEventListener("message", async (event: { data: string }) => {
-    const message = JSON.parse(event.data) as BridgeRequest;
+    let message: unknown;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      reportProtocolViolation("Invalid JSON frame from broker");
+      return;
+    }
+    if (!isBridgeEnvelope(message)) {
+      reportProtocolViolation("Invalid bridge frame from broker");
+      return;
+    }
+    // Broker rejections arrive either as a bare JSON-RPC error object or as the
+    // shared BridgeError envelope (type: "error"). Both must fail closed.
+    if (isBrokerError(message)) {
+      failed = true;
+      onStatus?.("error");
+      return;
+    }
     if (message.type !== "request") return;
     const request = message.request as RpcRequest;
     try {
@@ -43,6 +111,14 @@ export function connectBridge(adapter: HostAdapter, identityProvider?: BridgeIde
       socket.send(JSON.stringify({ type: "error", error: hostError(request.id, error) }));
     }
   });
+}
+
+function isBridgeEnvelope(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isBrokerError(message: Record<string, unknown>): boolean {
+  return Boolean(message.error) && (message.type === "error" || message.jsonrpc === "2.0");
 }
 
 function boundedBootstrapNonce(value: unknown): string | undefined {
