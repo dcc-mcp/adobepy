@@ -318,6 +318,23 @@ token disables auth only for local development tests.
 
 ## Modal And Timeout Behavior
 
+Photoshop layer snapshots include `documentId` from the native layer's owning
+document; text snapshots include the same owning `documentId`. Layer-child,
+text-by-layer, filter and smart-object methods require
+`{ "layerId": 7, "documentId": 9 }` as their first argument; later arguments
+retain their positions. The Python facade carries this context through document,
+nested-layer, text, style and mutation proxies, including document references in
+layer `hide` descriptors. Use the matching bundled bridge with the SDK.
+ID-only raw calls and missing document/layer identities now fail explicitly,
+even if a layer ID is unique. They never fall back to the active document or
+layer. Explicit `getActive` read methods still return the current selection.
+
+Smart-object creation methods return the unique new layer in the owning
+document, including nested groups; conversion may retain the source layer ID.
+In-place edits return the requested source layer. Missing or ambiguous created
+identity reports an error rather than returning the source or a selected layer;
+the native action may already have completed when this identity check fails.
+
 Mutating methods should expose `options.modal = true` or use a facade method
 that sets it internally. UXP hosts should route those calls through
 `executeAsModal`; CEP hosts should keep the behavior explicit in their

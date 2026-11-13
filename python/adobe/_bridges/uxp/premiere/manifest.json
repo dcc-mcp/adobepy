@@ -1,0 +1,29 @@
+{
+  "manifestVersion": 5,
+  "id": "com.adobepy.bridge.premiere",
+  "name": "Adobe Python Bridge for Premiere",
+  "version": "0.1.0",
+  "host": { "app": "premierepro", "minVersion": "25.6.0" },
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "adobepyBridgePanel",
+      "label": { "default": "DCC-MCP / AdobePy Bridge" },
+      "minimumSize": { "width": 220, "height": 120 },
+      "maximumSize": { "width": 640, "height": 480 },
+      "preferredDockedSize": { "width": 320, "height": 220 },
+      "preferredFloatingSize": { "width": 360, "height": 220 }
+    }
+  ],
+  "requiredPermissions": {
+    "network": {
+      "domains": [
+        "ws://127.0.0.1:47391",
+        "ws://localhost:47391",
+        "http://127.0.0.1:47391",
+        "http://localhost:47391"
+      ]
+    }
+  },
+  "main": "index.html"
+}

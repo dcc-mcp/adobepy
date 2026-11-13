@@ -64,14 +64,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade build twine
+      # The wheel bundles the bridge templates from python/adobe/_bridges, so the
+      # npm bridge builds have to run before python -m build.
+      - run: npm ci
+      - name: Build and stage bridge templates
+        run: |
+          npm run uxp:build
+          npm run cep:build
+          python scripts/stage_wheel_bridges.py
       - run: python -m build
       - run: python -m twine check dist/*
       - run: python scripts/check_native_abi3_config.py
       - run: python scripts/check_wheel_compat.py dist
+      - run: python scripts/check_wheel_bridges.py dist
       - run: python scripts/smoke_wheel_install.py dist
       - uses: actions/upload-artifact@v4
         with:
@@ -107,6 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
@@ -154,6 +170,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
@@ -163,18 +180,36 @@ jobs:
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build adobepy wheel
+      # Each native command is its own step. On windows-latest the generated
+      # pwsh wrapper inspects $LASTEXITCODE only after the final command of a
+      # `run:` block, so an earlier failing command followed by a passing
+      # checker used to be reported as a green step. Separate steps make
+      # every exit decisive; ci.yml's Windows package job uses this layout.
+      - run: python -m pip install --upgrade build wheel
         shell: pwsh
-        run: |
-          python -m pip install --upgrade build wheel
-          python -m build --wheel --outdir dist
+      - run: npm ci
+        shell: pwsh
+      - run: npm run uxp:build
+        shell: pwsh
+      - run: npm run cep:build
+        shell: pwsh
+      - run: python scripts/stage_wheel_bridges.py
+        shell: pwsh
+      - run: python -m build --wheel --outdir dist
+        shell: pwsh
+      - run: python scripts/check_wheel_bridges.py dist
+        shell: pwsh
+      # PyOxidizer resolves the freshly built wheel in the same pwsh session,
+      # so keep this step together and check each native exit immediately.
       - name: Build standalone interpreter with PyOxidizer
         shell: pwsh
         run: |
           python -m pip install pyoxidizer
+          if ($LASTEXITCODE -ne 0) { throw "pyoxidizer installation failed ($LASTEXITCODE)" }
           $wheel = (Get-ChildItem dist -Filter "adobepy-*.whl" | Select-Object -First 1).FullName
           if (-not $wheel) { throw "adobepy wheel was not built" }
           pyoxidizer build --release --path pyadobe --var ADOBEPY_WHEEL "$wheel"
+          if ($LASTEXITCODE -ne 0) { throw "pyoxidizer build failed ($LASTEXITCODE)" }
       - name: Locate build output and package
         shell: pwsh
         run: |

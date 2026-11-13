@@ -61,6 +61,8 @@ class CapturingClient:
                 "target": target,
             }
         )
+        if namespace in {"layer", "text", "filter"} and args and isinstance(args[0], dict):
+            args = [args[0]["layerId"], *args[1:]]
         if namespace == "app" and method == "getDocuments":
             return [{"id": 7, "name": "hero.psd"}]
         if namespace == "document" and method == "getActive":
@@ -72,15 +74,15 @@ class CapturingClient:
         if namespace == "export" and method == "exportWithPreset":
             return {"id": args[0]["id"], "path": args[0]["path"], "preset": args[0]["preset"]}
         if namespace == "layer" and method == "getActive":
-            return {"id": 11, "name": "Hero", "kind": "text", "visible": True}
+            return {"id": 11, "documentId": 7, "name": "Hero", "kind": "text", "visible": True}
         if namespace == "text" and method in {"getByLayerId", "getActive"}:
-            return {"layerId": 11, "contents": "Old", "characterStyle": {}, "paragraphStyle": {}}
+            return {"layerId": 11, "documentId": 7, "contents": "Old", "characterStyle": {}, "paragraphStyle": {}}
         if namespace == "text" and method in {"setContents", "setCharacterStyle", "setParagraphStyle"}:
             return {"layerId": args[0], "contents": args[1] if method == "setContents" else "Old", "characterStyle": {}, "paragraphStyle": {}}
         if namespace == "filter":
             return {"id": args[0], "name": "Hero", "lastFilter": method}
         if namespace == "smartObject":
-            return {"id": args[0], "name": "Hero", "isSmartObject": True}
+            return {"id": args[0]["layerId"], "documentId": args[0]["documentId"], "name": "Hero", "isSmartObject": True}
         if namespace == "raw":
             return {"path": list(args[0]) if args else [], "args": list(args[1]) if len(args or []) > 1 and isinstance(args[1], list) else []}
         if namespace == "action":

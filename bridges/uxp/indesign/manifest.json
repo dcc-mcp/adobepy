@@ -4,6 +4,9 @@
   "name": "Adobe Python Bridge for InDesign",
   "version": "0.1.0",
   "host": { "app": "ID", "minVersion": "19.0.0" },
+  "entrypoints": [
+    { "type": "panel", "id": "adobepyBridgePanel", "label": { "default": "Adobe Python Bridge" } }
+  ],
   "requiredPermissions": {
     "network": {
       "domains": [

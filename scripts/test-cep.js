@@ -18,6 +18,7 @@ function waitForMicrotasks() {
 }
 
 async function main() {
+  testCepSystemPaths();
   assert.ok(fs.existsSync(bundlePath), `missing CEP bundle: ${bundlePath}`);
   const sent = [];
   const evalScripts = [];
@@ -47,7 +48,7 @@ async function main() {
   }
 
   const fakeCep = {
-    getSystemPath() { return "C:/extension"; },
+    getSystemPath() { return "file:///C:/extension"; },
     evalScript(script, callback) {
       if (script.startsWith("$.evalFile(")) { loadedScripts.push(script); callback("true"); return; }
       if (script.includes("typeof adobepyDispatch")) { runtimeChecks.push(script); callback("ready"); return; }
@@ -87,8 +88,9 @@ async function main() {
     __ADOBEPY_TOKEN: "test-token",
     __ADOBEPY_BROKER_URL: "ws://127.0.0.1:47391/v1/bridge/after-effects/ws",
   };
-  context.globalThis = context;
-  vm.runInNewContext(fs.readFileSync(bundlePath, "utf8"), context, { filename: bundlePath });
+  context.globalThis = undefined;
+  context.window = context;
+  runCepPanel(bundlePath, context);
   await waitForMicrotasks();
   await waitForMicrotasks();
 
@@ -156,7 +158,7 @@ async function testIllustratorIdentityHello() {
   const fakeCep = {
     getSystemPath(name) {
       assert.strictEqual(name, "extension");
-      return "C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.illustrator";
+      return "file:///C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.illustrator";
     },
     evalScript(script, callback) {
       if (script.startsWith("$.evalFile(")) {
@@ -192,10 +194,9 @@ async function testIllustratorIdentityHello() {
     },
     crypto: { randomUUID: () => "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99" }
   };
-  context.globalThis = context;
-  vm.runInNewContext(fs.readFileSync(illustratorBundlePath, "utf8"), context, {
-    filename: illustratorBundlePath
-  });
+  context.globalThis = undefined;
+  context.window = context;
+  runCepPanel(illustratorBundlePath, context);
   await waitForMicrotasks();
   await waitForMicrotasks();
 
@@ -240,7 +241,7 @@ async function testAfterEffectsIdentityHello() {
   const fakeCep = {
     getSystemPath(name) {
       assert.strictEqual(name, "extension");
-      return "C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.after-effects";
+      return "file:///C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.after-effects";
     },
     evalScript(script, callback) {
       if (script.startsWith("$.evalFile(")) {
@@ -342,6 +343,10 @@ function testExtendScriptDispatchers() {
     fontSize: 48,
     fillColor: [1, 1, 1],
     strokeColor: [0, 0, 0],
+    applyFill: false,
+    applyStroke: false,
+    strokeWidth: 6,
+    strokeOverFill: false,
     tracking: 10,
     justification: "center",
   };
@@ -627,8 +632,25 @@ function testExtendScriptDispatchers() {
     ImportOptions: function ImportOptions(file) {
       this.file = file;
     },
+    TextDocument: function TextDocument(text) {
+      this.text = text;
+      this.applyFill = true;
+      this.applyStroke = true;
+      for (const [color, flag] of [["fillColor", "applyFill"], ["strokeColor", "applyStroke"]]) {
+        Object.defineProperty(this, color, {
+          get() { return this[`_${color}`]; },
+          set(value) { this[`_${color}`] = value; this[flag] = true; }
+        });
+      }
+    },
     GetSettingsFormat: { STRING: "STRING", STRING_SETTABLE: "STRING_SETTABLE", NUMBER: "NUMBER", NUMBER_SETTABLE: "NUMBER_SETTABLE" },
   });
+  const collidingLayers = [{ id: 10, index: 1 }, { id: 11, index: 2 }, { id: 2, index: 3 }];
+  assert.strictEqual(ae.adobepyAfterEffectsFindLayer({ numLayers: 3, layer: (i) => collidingLayers[i - 1] }, 2), collidingLayers[2]);
+  ae.adobepyAfterEffectsSetSourceText(aeTextLayer, { text: "Hello" });
+  for (const key of ["applyFill", "applyStroke", "strokeWidth", "strokeOverFill"]) {
+    assert.strictEqual(aeTextProperty.value[key], aeTextDocument[key], `text update lost ${key}`);
+  }
   assert.deepStrictEqual(dispatch(ae, "ae_app", "app", "getVersion").result, "24.4.1");
   assert.strictEqual(dispatch(ae, "ae_open", "app", "openProject", ["C:/templates/intro.aep"]).result.path, "C:/templates/intro.aep");
   assert.deepStrictEqual(dispatch(ae, "ae_project", "project", "getActive").result, { name: "intro.aep", path: "C:/templates/intro.aep", itemCount: 3 });
@@ -982,6 +1004,9 @@ function testExtendScriptDispatchers() {
   assert.strictEqual(dispatch(ai, "ai_text_frames", "textFrame", "getTextFrames").result[0].contents, "Hello Illustrator");
   assert.strictEqual(dispatch(ai, "ai_selected_text_frames", "textFrame", "getSelected").result[0].characterCount, 17);
   assert.strictEqual(dispatch(ai, "ai_text_frame_by_name", "textFrame", "getByName", ["Headline"]).result.kind, "PointText");
+  aiDocument.textFrames.push({ ...aiTextFrame, uuid: "numeric-name", name: "0" });
+  assert.strictEqual(dispatch(ai, "ai_numeric_frame_name", "textFrame", "getByName", ["0"]).result.name, "0");
+  aiDocument.textFrames.pop();
   assert.strictEqual(dispatch(ai, "ai_set_text_frame", "textFrame", "setContents", ["Headline", "Updated"]).result.contents, "Updated");
   assert.strictEqual(aiTextFrame.contents, "Updated");
   assert.strictEqual(dispatch(ai, "ai_stories", "story", "getStories").result[0].textFrameCount, 1);
@@ -1037,6 +1062,29 @@ function loadDispatcher(file, globals) {
   vm.runInNewContext(fs.readFileSync(file, "utf8"), context, { filename: file });
   assert.strictEqual(typeof context.adobepyDispatch, "function");
   return context;
+}
+
+function runCepPanel(bundle, context) {
+  const panelRoot = path.dirname(path.dirname(bundle));
+  const html = fs.readFileSync(path.join(panelRoot, "index.html"), "utf8");
+  for (const script of html.matchAll(/<script(?: src="([^"]+)")?>([\s\S]*?)<\/script>/g)) {
+    const filename = script[1] ? path.join(panelRoot, script[1]) : "inline CEP bootstrap";
+    vm.runInNewContext(script[1] ? fs.readFileSync(filename, "utf8") : script[2], context, { filename });
+  }
+}
+
+function testCepSystemPaths() {
+  const source = fs.readFileSync(path.join(root, "bridges/cep/core/src/system-path.ts"), "utf8");
+  const compiled = require("esbuild").transformSync(source, { loader: "ts", format: "cjs" }).code;
+  const module = { exports: {} };
+  vm.runInNewContext(compiled, { module });
+  const normalize = module.exports.cepSystemPath;
+  assert.strictEqual(normalize("file:///C:/Adobe%20CEP/bridge"), "C:/Adobe CEP/bridge");
+  assert.strictEqual(normalize("file:///Users/test/Adobe%20CEP/bridge"), "/Users/test/Adobe CEP/bridge");
+  assert.strictEqual(normalize("C:\\Adobe\\bridge\\"), "C:/Adobe/bridge");
+  for (const value of [undefined, "relative/path", "file:///C:/bad%zz", "file:///C:/%2e%2e/bridge", "C:/bad\npath"]) {
+    assert.strictEqual(normalize(value), undefined);
+  }
 }
 
 function dispatch(context, id, namespace, method, args = [], options = undefined) {

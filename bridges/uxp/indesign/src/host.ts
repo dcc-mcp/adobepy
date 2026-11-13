@@ -319,6 +319,16 @@ function activeSpread(documentId: unknown) {
   return asArray(property(document, "spreads"))[0];
 }
 
+// InDesign's `itemByName` returns a live object for a missing item rather than
+// null, so truthiness alone would return it and never reach the manual
+// id/name fallback. A returned object is only usable when it reports
+// `isValid` as true (or does not report the flag at all).
+function isResolvableItem(value: unknown): boolean {
+  if (!value) return false;
+  const isValid = property(value, "isValid");
+  return isValid === undefined ? true : isValid === true;
+}
+
 function findPage(documentId: unknown, idOrName: unknown) {
   if (idOrName === undefined || idOrName === null) return activePage(documentId);
   const document = findDocument(documentId);
@@ -327,7 +337,7 @@ function findPage(documentId: unknown, idOrName: unknown) {
   if (byName && typeof idOrName === "string") {
     try {
       const page = byName.call(pages, idOrName);
-      if (page) return page;
+      if (isResolvableItem(page)) return page;
     } catch {
       // Continue with manual matching when the host throws for a missing page.
     }
@@ -343,7 +353,7 @@ function findSpread(documentId: unknown, idOrName: unknown) {
   if (byName && typeof idOrName === "string") {
     try {
       const spread = byName.call(spreads, idOrName);
-      if (spread) return spread;
+      if (isResolvableItem(spread)) return spread;
     } catch {
       // Continue with manual matching when the host throws for a missing spread.
     }
@@ -402,7 +412,7 @@ function findTextFrame(documentId: unknown, idOrName: unknown) {
   if (byName && typeof idOrName === "string") {
     try {
       const frame = byName.call(frames, idOrName);
-      if (frame) return frame;
+      if (isResolvableItem(frame)) return frame;
     } catch {
       // Continue with manual matching when the host throws for a missing frame.
     }
@@ -447,7 +457,7 @@ function findStyle(documentId: unknown, collectionName: string, name: unknown) {
   if (byName && typeof name === "string") {
     try {
       const style = byName.call(collection, name);
-      if (style) return style;
+      if (isResolvableItem(style)) return style;
     } catch {
       // Continue with manual matching when the host throws for a missing style.
     }
@@ -463,7 +473,7 @@ function findSwatch(documentId: unknown, idOrName: unknown) {
   if (byName && typeof idOrName === "string") {
     try {
       const swatch = byName.call(swatches, idOrName);
-      if (swatch) return swatch;
+      if (isResolvableItem(swatch)) return swatch;
     } catch {
       // Continue with manual matching when the host throws for a missing swatch.
     }
@@ -479,7 +489,7 @@ function findLink(documentId: unknown, idOrName: unknown) {
   if (byName && typeof idOrName === "string") {
     try {
       const link = byName.call(links, idOrName);
-      if (link) return link;
+      if (isResolvableItem(link)) return link;
     } catch {
       // Continue with manual matching when the host throws for a missing link.
     }
@@ -503,10 +513,10 @@ async function swatchAddColor(request: RpcRequest) {
     const colors = property(document, "colors") ?? property(document, "swatches");
     const add = property<Callable>(colors, "add");
     if (add) return serializeSwatch(await maybePromise(add.call(colors, properties)));
-    const swatches = asArray(property(document, "swatches"));
-    const swatch = { ...properties, id: name, isValid: true, typename: "Color" };
-    swatches.push(swatch);
-    return serializeSwatch(swatch);
+    // Without `add` there is no way to create a real swatch, and `asArray`
+    // hands back a copy for InDesign's array-like collections, so pushing onto
+    // it would report success for a swatch the document never received.
+    unavailable("InDesign color swatch creation");
   });
 }
 

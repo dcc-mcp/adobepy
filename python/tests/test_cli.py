@@ -26,11 +26,24 @@ def _make_bridge_tree(root: pathlib.Path, kind: str, host: str) -> pathlib.Path:
     (source / "index.html").write_text("<html></html>\n", encoding="utf-8")
     if kind == "cep":
         (source / "dist" / "dom.jsx").write_text("// dom\n", encoding="utf-8")
-    (source / "manifest.json").write_text("{}\n", encoding="utf-8")
+    (source / "manifest.json").write_text(json.dumps({"requiredPermissions": {"network": {"domains": [
+        "ws://127.0.0.1:47391", "ws://localhost:47391", "ws://127.0.0.1:5000"
+    ]}}}), encoding="utf-8")
     return source
 
 
 class WebsocketUrlTests(unittest.TestCase):
+    def test_uxp_install_rejects_an_undeclared_origin_before_copying(self):
+        for host in ("photoshop", "premiere", "indesign"):
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                source = _make_bridge_tree(root, "uxp", host)
+                (source / "manifest.json").write_text(json.dumps({"requiredPermissions": {"network": {"domains": ["ws://localhost:47391"]}}}))
+                destination = root / "staged"
+                with self.assertRaisesRegex(cli.CliError, "broker origin"):
+                    cli.stage_bridge(host, destination, "fixture-token", broker_url="ws://unlisted.invalid:47391", bridge_root=root)
+                self.assertFalse(destination.exists())
+
     def test_premiere_default_uses_manifest_localhost_permission(self):
         for broker_url in (None, "", "  "):
             self.assertEqual(
@@ -338,6 +351,38 @@ class BridgeRootResolutionTests(unittest.TestCase):
     def test_sdk_version_falls_back_to_unknown(self):
         with mock.patch("adobe.cli._distribution_version", side_effect=cli.PackageNotFoundError("adobepy")):
             self.assertEqual(cli.sdk_version(), "unknown")
+
+    def test_bundled_bridge_root_is_probed_before_the_source_checkout(self):
+        # A wheel-only install has no repository root, so `adobe/_bridges` is the
+        # only source that can resolve bridge templates for it.
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled = pathlib.Path(tmp)
+            _make_bridge_tree(bundled, "uxp", "photoshop")
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                cli, "_bundled_bridge_root", return_value=bundled
+            ), mock.patch.object(cli, "_find_repo_root", return_value=None):
+                locations = cli.bridge_probe_locations()
+                resolved, _ = cli.resolve_bridge_root()
+            self.assertEqual(resolved, bundled)
+            self.assertNotIn("not bundled", " ".join(locations))
+
+    def test_doctor_reports_bundled_bridge_templates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Mirror the installed layout: the tree lives under `adobe/_bridges`,
+            # which is what the doctor output is asserted to name.
+            bundled = pathlib.Path(tmp) / "adobe" / "_bridges"
+            _make_bridge_tree(bundled, "uxp", "photoshop")
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                cli, "_bundled_bridge_root", return_value=bundled
+            ), mock.patch.object(cli, "_find_repo_root", return_value=None), mock.patch.object(
+                cli, "resolve_broker_executable", return_value=("adobepy", [])
+            ):
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    cli.doctor(json_output=True)
+                checks = {item["name"]: item for item in json.loads(buffer.getvalue())}
+            self.assertTrue(checks["bridge_templates"]["ok"])
+            self.assertIn("_bridges", checks["bridge_templates"]["detail"])
 
 
 class BrokerResolutionTests(unittest.TestCase):

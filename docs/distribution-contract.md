@@ -12,9 +12,9 @@
 | `adobepy-standalone-<version>-linux-x64.zip` | GitHub Release | Linux x86_64 standalone interpreter |
 | `adobepy-standalone-<version>-linux-x64.zip.sha256` | GitHub Release | Integrity verification |
 
-PyPI provides the Python SDK without a native broker. The Windows GitHub Release
-bundle carries the broker/runtime and an SDK wheel; the standalone archives
-embed the SDK in their interpreter.
+PyPI provides the Python SDK and built bridge templates (`adobe/_bridges`),
+without a native broker. The Windows GitHub Release bundle carries the
+broker/runtime and an SDK wheel; the standalone archives embed the SDK.
 
 The Windows bundle and the two standalone archives are different artifacts, not
 the same bundle built three times. The standalone archives ship a PyOxidizer
@@ -27,8 +27,8 @@ and no native broker CLI. See [section 2b](#2b-github-release--standalone-interp
 
 ### What is published
 
-Only `adobepy` pure-Python wheel (`py3-none-any`). No native extensions, no Rust
-binaries, no bridge bundles.
+The `adobepy` pure-Python wheel (`py3-none-any`) includes built bridge templates
+as package data. It contains no native extensions or Rust binaries.
 
 The wheel does ship a pure-Python command line entry point, `python -m adobe`,
 so a wheel-only install can be diagnosed (`doctor`), can stage a bridge from any
@@ -262,7 +262,7 @@ Python SDK version is bumped to match.
 | --- | --- | --- |
 | Install Python SDK only | Yes | No |
 | Run broker + CLI | No | Yes |
-| Install bridge templates | No | Yes (manual copy from archive) |
+| Install bridge templates | Yes (bundled in `adobe/_bridges`) | Yes (manual copy from archive) |
 | CI dependency (`adobepy>=0.1.0`) | Yes | No |
 | Manual Windows install | Recommend both | Yes |
 | macOS arm64 / Linux x86_64 SDK import | Yes (requires Python) | Yes (standalone archive) |

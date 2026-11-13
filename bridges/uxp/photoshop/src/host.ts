@@ -151,8 +151,8 @@ export const photoshopAdapter: HostAdapter = {
     if (request.namespace === "channel" && request.method === "getByName") return channelByName(request);
     if (request.namespace === "channel" && request.method === "add") return channelAdd(request);
     if (request.namespace === "channel" && request.method === "remove") return channelRemove(request);
-    if (request.namespace === "text" && request.method === "getActive") return serializeTextItem(textItemForLayer(undefined));
-    if (request.namespace === "text" && request.method === "getByLayerId") return serializeTextItem(textItemForLayer(request.args?.[0]));
+    if (request.namespace === "text" && request.method === "getActive") return serializeTextItem(textItemForLayer(activeLayer()));
+    if (request.namespace === "text" && request.method === "getByLayerId") return serializeTextItem(textItemForLayer(findLayer(request.args?.[0])));
     if (request.namespace === "text" && request.method === "setContents") return textSetProperty(request, "contents", request.args?.[1], "Set text contents");
     if (request.namespace === "text" && request.method === "setTextClickPoint") {
       return textSetProperty(request, "textClickPoint", request.args?.[1], "Set text click point");
@@ -252,6 +252,7 @@ function serializeLayer(layer: unknown) {
   if (!isObject(layer)) return null;
   return {
     id: property(layer, "id"),
+    documentId: property(property(layer, "document"), "id"),
     name: asString(property(layer, "name")),
     kind: asString(property(layer, "kind")),
     opacity: asNumber(property(layer, "opacity")) ?? property(layer, "opacity"),
@@ -316,8 +317,10 @@ function safeProperty(target: unknown, name: string): unknown {
 
 function serializeTextItem(textItem: unknown, layer?: unknown) {
   if (!isObject(textItem)) return null;
+  const owner = layer ?? property(textItem, "parent");
   return {
-    layerId: property(layer, "id") ?? property(property(textItem, "parent"), "id"),
+    layerId: property(owner, "id"),
+    documentId: property(property(owner, "document"), "id"),
     contents: asString(property(textItem, "contents")),
     isParagraphText: property(textItem, "isParagraphText"),
     isPointText: property(textItem, "isPointText"),
@@ -581,7 +584,8 @@ async function smartObjectConvert(request: RpcRequest) {
 async function smartObjectReplaceContents(request: RpcRequest) {
   const path = asString(request.args?.[1]);
   if (!path) unavailable("Photoshop smart object replacement path");
-  const layerId = request.args?.[0];
+  const layerTarget = request.args?.[0];
+  const layerId = isObject(layerTarget) ? property(layerTarget, "layerId") : layerTarget;
   const descriptor: Record<string, unknown> = {
     _obj: "placedLayerReplaceContents",
     null: await actionFileReference(path)
@@ -592,12 +596,27 @@ async function smartObjectReplaceContents(request: RpcRequest) {
 }
 
 async function smartObjectBatchPlay(request: RpcRequest, descriptors: Record<string, unknown>[], defaultCommandName: string) {
-  const layer = findLayer(request.args?.[0]);
-  if (!layer) unavailable("Photoshop layer");
-  const layerId = property(layer, "id") ?? request.args?.[0];
-  const commands = [selectLayerDescriptor(layerId), ...descriptors];
+  const target = findLayerTarget(request.args?.[0]);
+  if (!target?.layer) unavailable("Photoshop layer");
+  const { layer, document } = target;
+  const layerId = property(layer, "id");
+  const ownerId = asNumber(property(document, "id"));
+  if (ownerId === undefined) unavailable("Photoshop layer owning document");
+  const beforeIds = request.method === "newSmartObjectViaCopy" || request.method === "convertToSmartObject"
+    ? new Set(layerIdsInTree(property(document, "layers")))
+    : undefined;
+  const selection = selectLayerDescriptor(layerId);
+  const references = [layerReference(layerId), { _ref: "document", _id: ownerId }];
+  const commands = [{ ...selection, _target: references }, ...descriptors.map((descriptor) => ({ ...descriptor, _target: references }))];
   await runBatchPlay(request, commands, {}, defaultCommandName);
-  return serializeLayer(activeLayer() ?? layer);
+  if (beforeIds) {
+    const createdIds = [...new Set(layerIdsInTree(property(document, "layers")))].filter((id) => !beforeIds.has(id));
+    if (createdIds.length === 1) return serializeLayer(findLayer({ layerId: createdIds[0], documentId: ownerId }));
+    const converted = findLayerInTree(property(document, "layers"), layerId);
+    if (request.method === "convertToSmartObject" && createdIds.length === 0 && converted) return serializeLayer(converted);
+    unavailable("Photoshop created layer identity is missing or ambiguous");
+  }
+  return serializeLayer(findLayerInTree(property(document, "layers"), layerId) ?? layer);
 }
 
 async function exportWithPreset(request: RpcRequest) {
@@ -628,12 +647,20 @@ function exportPreset(name: string) {
 }
 
 function findLayer(id: unknown) {
-  if (id === undefined || id === null) return activeLayer();
-  for (const document of openDocuments()) {
-    const match = findLayerInTree(property(document, "layers"), id) ?? findLayerInTree(property(document, "activeLayers"), id);
-    if (match) return match;
+  const target = findLayerTarget(id);
+  if (!target?.layer) unavailable("Photoshop layer in owning document");
+  return target.layer;
+}
+
+function findLayerTarget(argument: unknown) {
+  const id = property(argument, "layerId");
+  const documentId = property(argument, "documentId");
+  if ((typeof id !== "number" && typeof id !== "string") || (typeof documentId !== "number" && typeof documentId !== "string")) {
+    unavailable("Photoshop layer target requires layerId and owning documentId");
   }
-  return undefined;
+  const document = findDocument(documentId);
+  const layer = findLayerInTree(property(document, "layers"), id) ?? findLayerInTree(property(document, "activeLayers"), id);
+  return layer ? { document, layer } : undefined;
 }
 
 function isSmartObjectLayer(layer: unknown): boolean {
@@ -646,8 +673,7 @@ function isSmartObjectLayer(layer: unknown): boolean {
   }
 }
 
-function textItemForLayer(layerId: unknown) {
-  const layer = findLayer(layerId);
+function textItemForLayer(layer: unknown) {
   if (!layer) return undefined;
   try {
     return property(layer, "textItem");
@@ -657,7 +683,7 @@ function textItemForLayer(layerId: unknown) {
 }
 
 function requiredTextItem(layerId: unknown) {
-  const textItem = textItemForLayer(layerId);
+  const textItem = textItemForLayer(findLayer(layerId));
   if (!textItem) unavailable("Photoshop layer.textItem");
   return textItem;
 }
@@ -681,6 +707,16 @@ function findChannel(document: unknown, idOrName: unknown) {
     if (match) return match;
   }
   return undefined;
+}
+
+function layerIdsInTree(layers: unknown): string[] {
+  const ids: string[] = [];
+  for (const layer of asArray(layers)) {
+    const id = property(layer, "id");
+    if (id !== undefined && id !== null) ids.push(String(id));
+    ids.push(...layerIdsInTree(property(layer, "layers")));
+  }
+  return ids;
 }
 
 function findLayerInTree(layers: unknown, id: unknown): unknown {
@@ -904,16 +940,8 @@ async function actionFileReference(path: string) {
 async function fileEntryForOpening(path: string) {
   const localFileSystem = property(property(uxpModule(), "storage"), "localFileSystem");
   const getEntryWithUrl = property<Callable>(localFileSystem, "getEntryWithUrl");
-  if (getEntryWithUrl) {
-    try {
-      return await maybePromise(getEntryWithUrl.call(localFileSystem, toFileUrl(path)));
-    } catch {
-      // If direct URL access is unavailable, fall through to Photoshop's picker-backed opening API.
-    }
-  }
-  const getFileForOpening = property<Callable>(localFileSystem, "getFileForOpening");
-  if (getFileForOpening) return await maybePromise(getFileForOpening.call(localFileSystem));
-  return path;
+  if (!getEntryWithUrl) unavailable("UXP localFileSystem.getEntryWithUrl");
+  return await maybePromise(getEntryWithUrl.call(localFileSystem, toFileUrl(path)));
 }
 
 async function withModal(request: RpcRequest, defaultCommandName: string, work: () => Promise<unknown>) {

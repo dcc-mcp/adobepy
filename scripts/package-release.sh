@@ -146,6 +146,8 @@ external cargo build --release -p adobepy-cli --bin adobepy -p adobepy-broker --
 step "Build bridge bundles"
 external npm run uxp:build
 external npm run cep:build
+external python3 scripts/stage_wheel_bridges.py --check
+external python3 scripts/stage_wheel_bridges.py
 
 step "Clean transient Python build artifacts"
 remove_transient_build_artifacts "$ROOT"
@@ -169,6 +171,7 @@ step "Build Python wheel"
 external python3 scripts/check_native_abi3_config.py
 external python3 -m pip wheel --no-deps --no-build-isolation --wheel-dir "$STAGE_ROOT/wheels" .
 external python3 scripts/check_wheel_compat.py "$STAGE_ROOT/wheels"
+external python3 scripts/check_wheel_bridges.py "$STAGE_ROOT/wheels"
 remove_transient_build_artifacts "$ROOT"
 
 step "Write package docs and manifest"

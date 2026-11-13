@@ -73,7 +73,7 @@ async function rpc(env, host, namespace, method, args = [], options = {}) {
 }
 
 function result(message) {
-  assert.strictEqual(message.type, "response");
+  assert.strictEqual(message.type, "response", JSON.stringify(message));
   return message.response.result;
 }
 
@@ -230,6 +230,10 @@ async function testPhotoshopBridge() {
       jpg: async (entry, options, asCopy) => events.push({ kind: "saveAs", url: entry.url, options, asCopy })
     }
   };
+  for (const layer of document.layers) {
+    layer.document = document;
+    for (const child of layer.layers ?? []) child.document = document;
+  }
   const env = await loadBundle("bridges/uxp/photoshop/dist/main.js", {
     photoshop: {
       app: { version: "26.5.1", activeDocument: document, documents: [document], SolidColor },
@@ -240,6 +244,7 @@ async function testPhotoshopBridge() {
         batchPlay: async (descriptors, options) => {
           events.push({ kind: "batchPlay", descriptors, options });
           if (descriptors.some((descriptor) => descriptor._obj === "newPlacedLayer")) textLayer.kind = "smartObject";
+          if (descriptors.some((descriptor) => descriptor._obj === "placedLayerMakeCopy")) document.layers.push({ ...textLayer, id: 17 });
           if (descriptors.some((descriptor) => descriptor._obj === "fail")) {
             return [{ _obj: "error", message: "Forced batchPlay failure", result: -1 }];
           }
@@ -304,7 +309,7 @@ async function testPhotoshopBridge() {
   assert.strictEqual(result(await rpc(env, "photoshop", "document", "getLayers", [9]))[1].hasChildren, true);
   assert.strictEqual(result(await rpc(env, "photoshop", "document", "getActiveLayers", [9]))[0].opacity, 80);
   assert.strictEqual(result(await rpc(env, "photoshop", "layer", "getActive")).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "layer", "getChildren", [8]))[0].name, "Child");
+  assert.strictEqual(result(await rpc(env, "photoshop", "layer", "getChildren", [{ layerId: 8, documentId: 9 }]))[0].name, "Child");
   assert.strictEqual(result(await rpc(env, "photoshop", "selection", "get", [9])).bounds.right, 100);
   assert.strictEqual(
     result(await rpc(env, "photoshop", "selection", "selectRectangle", [9, { top: 4, left: 5, bottom: 9, right: 10 }, null, 0, true], { modal: true })).bounds.left,
@@ -319,28 +324,28 @@ async function testPhotoshopBridge() {
   assert.strictEqual(result(await rpc(env, "photoshop", "channel", "add", [9, "Mask"], { modal: true })).name, "Mask");
   assert.strictEqual(result(await rpc(env, "photoshop", "channel", "remove", [9, 21], { modal: true })).id, 21);
   assert.strictEqual(result(await rpc(env, "photoshop", "text", "getActive")).contents, "Hello");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "getByLayerId", [7])).characterStyle.size, 24);
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setContents", [7, "World"], { modal: true })).contents, "World");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setCharacterStyle", [7, { size: 36, tracking: 20 }], { modal: true })).characterStyle.size, 36);
-  await rpc(env, "photoshop", "text", "setCharacterStyle", [7, { color: { rgb: { red: 77, green: 232, blue: 255 } } }], { modal: true });
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "getByLayerId", [{ layerId: 7, documentId: 9 }])).characterStyle.size, 24);
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setContents", [{ layerId: 7, documentId: 9 }, "World"], { modal: true })).contents, "World");
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setCharacterStyle", [{ layerId: 7, documentId: 9 }, { size: 36, tracking: 20 }], { modal: true })).characterStyle.size, 36);
+  await rpc(env, "photoshop", "text", "setCharacterStyle", [{ layerId: 7, documentId: 9 }, { color: { rgb: { red: 77, green: 232, blue: 255 } } }], { modal: true });
   assert.ok(textItem.characterStyle.color instanceof SolidColor);
   assert.deepStrictEqual(textItem.characterStyle.color.rgb, { red: 77, green: 232, blue: 255 });
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setParagraphStyle", [7, { justification: "center" }], { modal: true })).paragraphStyle.justification, "center");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setTextClickPoint", [7, { x: 4, y: 5 }], { modal: true })).textClickPoint.x, 4);
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setOrientation", [7, "vertical"], { modal: true })).orientation, "vertical");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "resetCharacterStyle", [7], { modal: true })).typename, "TextItem");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToParagraphText", [7], { modal: true })).isParagraphText, true);
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToPointText", [7], { modal: true })).isPointText, true);
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToShape", [7], { modal: true })).typename, "TextItem");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "createWorkPath", [7], { modal: true })).typename, "TextItem");
-  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applyGaussianBlur", [7, 2], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "apply", [7, "applyHighPass", 4], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySharpen", [7], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySmartBlur", [7, 3, 12, "high"], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "convertToSmartObject", [7], { modal: true })).isSmartObject, true);
-  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "newSmartObjectViaCopy", [7], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "editContents", [7], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "replaceContents", [7, "C:/replacement.psb"], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setParagraphStyle", [{ layerId: 7, documentId: 9 }, { justification: "center" }], { modal: true })).paragraphStyle.justification, "center");
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setTextClickPoint", [{ layerId: 7, documentId: 9 }, { x: 4, y: 5 }], { modal: true })).textClickPoint.x, 4);
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setOrientation", [{ layerId: 7, documentId: 9 }, "vertical"], { modal: true })).orientation, "vertical");
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "resetCharacterStyle", [{ layerId: 7, documentId: 9 }], { modal: true })).typename, "TextItem");
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToParagraphText", [{ layerId: 7, documentId: 9 }], { modal: true })).isParagraphText, true);
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToPointText", [{ layerId: 7, documentId: 9 }], { modal: true })).isPointText, true);
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToShape", [{ layerId: 7, documentId: 9 }], { modal: true })).typename, "TextItem");
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "createWorkPath", [{ layerId: 7, documentId: 9 }], { modal: true })).typename, "TextItem");
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applyGaussianBlur", [{ layerId: 7, documentId: 9 }, 2], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "apply", [{ layerId: 7, documentId: 9 }, "applyHighPass", 4], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySharpen", [{ layerId: 7, documentId: 9 }], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySmartBlur", [{ layerId: 7, documentId: 9 }, 3, 12, "high"], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "convertToSmartObject", [{ layerId: 7, documentId: 9 }], { modal: true })).isSmartObject, true);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "newSmartObjectViaCopy", [{ layerId: 7, documentId: 9 }], { modal: true })).id, 17);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "editContents", [{ layerId: 7, documentId: 9 }], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "replaceContents", [{ layerId: 7, documentId: 9 }, "C:/replacement.psb"], { modal: true })).id, 7);
   assert.strictEqual(result(await rpc(env, "photoshop", "export", "getPresets"))[0].name, "png");
   const exportResult = result(await rpc(env, "photoshop", "export", "exportWithPreset", [{ id: 9, path: "C:/out.jpg", preset: "jpg_high", options: { quality: 10 } }], { modal: true }));
   assert.strictEqual(exportResult.id, 9);
@@ -791,7 +796,9 @@ async function testPremiereBridge() {
         }
       },
       Exporter: exporter,
+      ClipProjectItem: { cast: (item) => item.typename === "ClipProjectItem" ? item : undefined },
       TickTime: {
+        TIME_INVALID: { seconds: -1 },
         createWithSeconds(seconds) {
           return { seconds };
         },
@@ -1349,6 +1356,7 @@ function testManifestPermissions() {
     );
     if (host === "photoshop") assert.strictEqual(manifest.requiredPermissions.localFileSystem, "fullAccess");
     if (host === "premiere") assert.strictEqual(manifest.host.app, "premierepro");
+    assert.ok(manifest.entrypoints.some((entry) => entry.type === "panel"), `${host} must declare an invokable panel`);
   }
 }
 
@@ -1375,11 +1383,16 @@ async function emitPhotoshopGeneratedConfigHello() {
 }
 
 async function main() {
+  if (process.argv[2] === "--review-regressions") {
+    await testNativeReviewRegressions();
+    return;
+  }
   if (process.argv[2] === "--photoshop-generated-config-hello") {
     await emitPhotoshopGeneratedConfigHello();
     return;
   }
   testManifestPermissions();
+  await testNativeReviewRegressions();
   await testPhotoshopBridge();
   await testInDesignBridge();
   await testPremiereBridge();
@@ -1389,6 +1402,252 @@ async function main() {
   await testDomDispatchMemberBoundary();
   testRuntimeMemberBoundary();
   console.log("UXP bridge protocol test passed");
+}
+
+async function testNativeReviewRegressions() {
+  class TickTime {
+    constructor(seconds, ticks) { this.seconds = seconds; this.ticks = ticks; }
+    static createWithSeconds(seconds) { return new TickTime(seconds); }
+    static createWithTicks(ticks) { return new TickTime(undefined, ticks); }
+    subtract(other) { return TickTime.createWithSeconds(this.seconds - other.seconds); }
+  }
+  TickTime.TIME_INVALID = new TickTime(-1);
+  const media = { id: "media", name: "shot.mov" };
+  const parent = { id: "parent", name: "Dailies" };
+  const rootItem = { id: "root", name: "Root" };
+  const clip = { getMediaFilePath: () => "C:/a/shot.mov" };
+  const folderChildren = new Map([[rootItem, [parent]], [parent, [media]]]);
+  const clips = new Map([[media, clip]]);
+  let mutationsSucceed = true;
+  let projectLocked = false;
+  const markerList = [];
+  const nativeMarker = (name, markerType, start, duration, comments) => ({
+    getName: () => name, getType: () => markerType, getStart: () => start,
+    getDuration: () => duration, getComments: () => comments
+  });
+  const markers = {
+    getMarkers: () => markerList,
+    createAddMarkerAction(name, type, start, duration, comments) {
+      assert.ok(projectLocked, "marker action requires locked project access");
+      assert.ok(start instanceof TickTime && duration instanceof TickTime);
+      return () => markerList.push(nativeMarker(name, type, start, duration, comments));
+    }
+  };
+  const folders = new Map(Array.from(folderChildren, ([item, children]) => [item, {
+    getItems: () => children,
+    createBinAction: (name) => {
+      assert.ok(projectLocked, "bin action requires locked project access");
+      return () => {
+        const created = { id: `new-${children.length}`, name };
+        children.push(created);
+        folders.set(created, { getItems: () => [] });
+      };
+    }
+  }]));
+  const sequence = { id: "seq", name: "Sequence" };
+  const project = {
+    getRootItem: () => rootItem, getActiveSequence: () => sequence,
+    getSequences: () => [sequence], save: () => mutationsSucceed, saveAs: () => mutationsSucceed,
+    lockedAccess(callback) {
+      projectLocked = true;
+      try { callback(); } finally { projectLocked = false; }
+    },
+    executeTransaction(callback) {
+      if (!mutationsSucceed) return false;
+      const actions = [];
+      callback({ addAction: (action) => actions.push(action) });
+      actions.forEach((action) => action());
+      return true;
+    },
+    importFiles(paths) {
+      if (!mutationsSucceed) return false;
+      for (const path of paths) {
+        const item = { id: `import-${path}`, name: path.split("/").pop() };
+        folderChildren.get(parent).push(item);
+        clips.set(item, { getMediaFilePath: () => path });
+      }
+      return true;
+    }
+  };
+  const encoded = [];
+  const modules = {
+    premierepro: {
+      version: "25.6.0", Project: { getActiveProject: () => project }, TickTime,
+      FolderItem: { cast: (item) => folders.get(item) },
+      ClipProjectItem: { cast: (item) => clips.get(item) },
+      Markers: { getMarkers: (owner) => { assert.strictEqual(owner, sequence); return markers; } },
+      Marker: { MARKER_TYPE_COMMENT: "Comment" },
+      SequenceEditor: { getEditor: () => ({
+        createInsertProjectItemAction: (item, time) => { assert.ok(projectLocked, "insert action requires locked project access"); assert.ok(time instanceof TickTime); return () => {}; },
+        createOverwriteItemAction: () => { assert.ok(projectLocked, "overwrite action requires locked project access"); return () => {}; }
+      }) },
+      EncoderManager: { getManager: () => ({
+        encodeFile: (...args) => { encoded.push(args); assert.ok(args[3] instanceof TickTime && args[4] instanceof TickTime); return true; },
+        encodeProjectItem: (item) => { assert.strictEqual(item, clip); return true; }
+      }) },
+      Exporter: { exportSequenceFrame: (seq, time) => { assert.ok(time instanceof TickTime); return true; } }
+    },
+    uxp: { host: { version: "25.6.0" } }
+  };
+  const env = await loadBundle("bridges/uxp/premiere/dist/main.js", modules);
+  const failures = [];
+  async function check(name, callback) {
+    try { await callback(); } catch (err) { failures.push(`${name}: ${err.message}`); }
+  }
+  for (const [namespace, method, args] of [
+    ["project", "save", []], ["project", "saveAs", ["C:/out.prproj"]],
+    ["project", "importFiles", [{ filePaths: ["C:/a/shot.mov"] }]],
+    ["sequence", "insertProjectItem", ["seq", { projectItem: "media", time: 1 }]],
+    ["sequence", "overwriteProjectItem", ["seq", { projectItem: "media", time: 1 }]],
+    ["bin", "create", [{ parentId: "parent", name: "Rejected" }]],
+    ["marker", "create", ["seq", { name: "Rejected" }]]
+  ]) {
+    await check(`${namespace}.${method} false result`, async () => {
+      mutationsSucceed = false;
+      assert.strictEqual(error(await rpc(env, "premiere", namespace, method, args)).code, -32004);
+      mutationsSucceed = true;
+    });
+    mutationsSucceed = true;
+  }
+  await check("native time factories", async () => {
+    result(await rpc(env, "premiere", "sequence", "insertProjectItem", ["seq", { projectItem: "media", time: { ticks: "254016000000" } }]));
+    result(await rpc(env, "premiere", "sequence", "overwriteProjectItem", ["seq", { projectItem: "media", time: 1 }]));
+    result(await rpc(env, "premiere", "export", "exportFrame", [{ sequence: "seq", outputPath: "C:/out.png", time: 1 }]));
+    result(await rpc(env, "premiere", "encoder", "encodeFile", [{ sourcePath: "C:/in.mov", outputPath: "C:/out.mov" }]));
+    assert.strictEqual(encoded[0][4], TickTime.TIME_INVALID);
+  });
+  await check("FolderItem and new direct child", async () => {
+    const created = result(await rpc(env, "premiere", "bin", "create", [{ parentId: "parent", name: "Dailies" }]));
+    assert.strictEqual(created.name, "Dailies");
+    assert.notStrictEqual(created.id, parent.id);
+  });
+  await check("exact imported path", async () => {
+    const imported = result(await rpc(env, "premiere", "project", "importFiles", [{ filePaths: ["C:/b/shot.mov"], targetBin: "parent" }]));
+    assert.strictEqual(imported[0].mediaPath, "C:/b/shot.mov");
+    const importFiles = project.importFiles;
+    project.importFiles = () => true;
+    const unknown = { id: "unknown-path", name: "unknown.mov", typename: "ClipProjectItem" };
+    folderChildren.get(parent).push(unknown);
+    clips.set(unknown, { getMediaFilePath: () => undefined });
+    assert.deepStrictEqual(result(await rpc(env, "premiere", "project", "importFiles", [{ filePaths: ["C:/b/unknown.mov"], targetBin: "parent" }])), []);
+    project.importFiles = importFiles;
+  });
+  await check("ClipProjectItem encoder cast", async () => {
+    result(await rpc(env, "premiere", "encoder", "encodeProjectItem", [{ projectItemId: "media", outputPath: "C:/out.mov" }]));
+    assert.strictEqual(error(await rpc(env, "premiere", "encoder", "encodeProjectItem", [{ projectItemId: "parent", outputPath: "C:/out.mov" }])).code, -32004);
+  });
+  await check("native marker transaction and reads", async () => {
+    const created = result(await rpc(env, "premiere", "marker", "create", ["seq", { name: "Review", start: 2, duration: 1, comments: "check" }]));
+    assert.strictEqual(created.name, "Review");
+    const listed = result(await rpc(env, "premiere", "marker", "getMarkers", ["seq"]));
+    assert.strictEqual(listed[0].comments, "check");
+    assert.strictEqual(listed[0].start, 2);
+    const second = result(await rpc(env, "premiere", "marker", "create", ["seq", { name: "Until", start: 2, end: 5 }]));
+    assert.strictEqual(second.duration, 3);
+  });
+  const activeLayer = { id: 1, name: "User layer" };
+  const requestedLayer = { id: 7, name: "Requested" };
+  const ownerSelectedLayer = { id: 8, name: "Another selected layer" };
+  const group = { id: 90, name: "Owner group", layers: [requestedLayer] };
+  const owner = { id: 9, layers: [group, ownerSelectedLayer], activeLayers: [ownerSelectedLayer] };
+  group.document = owner;
+  const app = { activeDocument: { id: 2, layers: [activeLayer], activeLayers: [activeLayer] }, documents: [owner] };
+  const collidingLayer = { id: 7, name: "Same ID in another document", document: app.activeDocument };
+  app.activeDocument.layers.push(collidingLayer);
+  requestedLayer.document = owner;
+  const layerCalls = [];
+  requestedLayer.textItem = { parent: requestedLayer, contents: "Owner" };
+  requestedLayer.applyGaussianBlur = async () => { layerCalls.push(9); };
+  requestedLayer.layers = [{ id: 77, name: "Nested", document: owner }];
+  collidingLayer.textItem = { parent: collidingLayer, contents: "User" };
+  collidingLayer.applyGaussianBlur = async () => { layerCalls.push(2); };
+  app.documents.unshift(app.activeDocument);
+  let pickerCalls = 0;
+  const commands = [];
+  let nextCopyIds = [27];
+  const ps = await loadBundle("bridges/uxp/photoshop/dist/main.js", {
+    photoshop: { app, action: { batchPlay: async (descriptors) => {
+      commands.push(...descriptors);
+      if (descriptors.some((descriptor) => descriptor._obj === "placedLayerMakeCopy")) {
+        group.layers.push(...nextCopyIds.map((id) => ({ id, name: "Copy", kind: "smartObject", document: owner })));
+      }
+      if (descriptors.some((descriptor) => descriptor._obj === "newPlacedLayer")) {
+        group.layers.splice(group.layers.indexOf(requestedLayer), 1, { id: 37, name: "Converted", kind: "smartObject", document: owner });
+      }
+      return [];
+    } } },
+    uxp: { storage: { localFileSystem: {
+      getEntryWithUrl: async (url) => { if (url.endsWith("/replacement.psb")) return { isFile: true, url }; throw new Error("requested path missing"); },
+      getFileForOpening: async () => { pickerCalls++; return {}; }, createSessionToken: () => "replacement-token"
+    } } }
+  });
+  await check("smart object owning document", async () => {
+    const snapshot = result(await rpc(ps, "photoshop", "document", "getLayers", [9]));
+    assert.strictEqual(snapshot[0].documentId, 9);
+    const returned = result(await rpc(ps, "photoshop", "smartObject", "editContents", [{ layerId: 7, documentId: 9 }]));
+    assert.strictEqual(returned.id, 7);
+    assert.strictEqual(returned.documentId, 9);
+    for (const command of commands) assert.ok(command._target.some((target) => target._ref === "document" && target._id === owner.id));
+  });
+  await check("all layer handlers bind the owning document", async () => {
+    const target = { layerId: 7, documentId: 9 };
+    assert.strictEqual(result(await rpc(ps, "photoshop", "layer", "getChildren", [target]))[0].documentId, 9);
+    assert.strictEqual(result(await rpc(ps, "photoshop", "filter", "applyGaussianBlur", [target, 2])).documentId, 9);
+    assert.deepStrictEqual(layerCalls, [9]);
+    assert.strictEqual(result(await rpc(ps, "photoshop", "text", "getByLayerId", [target])).documentId, 9);
+    assert.strictEqual(result(await rpc(ps, "photoshop", "text", "setContents", [target, "Changed"])).documentId, 9);
+    assert.strictEqual(collidingLayer.textItem.contents, "User");
+    for (const [namespace, method] of [["layer", "getChildren"], ["text", "getByLayerId"], ["text", "setContents"], ["filter", "applyGaussianBlur"], ["smartObject", "editContents"]]) {
+      for (const argument of [7, 1, undefined, { layerId: 7 }, { documentId: 9 }, { layerId: 7, documentId: 999 }]) {
+        assert.strictEqual(error(await rpc(ps, "photoshop", namespace, method, [argument])).code, -32004);
+      }
+    }
+    assert.deepStrictEqual(layerCalls, [9]);
+  });
+  await check("legacy layer IDs refuse to mutate", async () => {
+    commands.length = 0;
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [7])).code, -32004);
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [1])).code, -32004);
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [])).code, -32004);
+    assert.strictEqual(commands.length, 0);
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [{ layerId: 7, documentId: 999 }])).code, -32004);
+    assert.strictEqual(commands.length, 0);
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [{ layerId: 1, documentId: 9 }])).code, -32004);
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [{ layerId: 7 }])).code, -32004);
+    assert.strictEqual(commands.length, 0);
+    assert.strictEqual(result(await rpc(ps, "photoshop", "smartObject", "editContents", [{ layerId: 7, documentId: 2 }])).documentId, 2);
+    assert.ok(commands.every((command) => command._target.some((target) => target._ref === "document" && target._id === 2)));
+  });
+  await check("explicit path must never invoke picker", async () => {
+    assert.match(error(await rpc(ps, "photoshop", "smartObject", "replaceContents", [{ layerId: 7, documentId: 9 }, "C:/missing.psb"])).message, /requested path missing/);
+    assert.strictEqual(pickerCalls, 0);
+  });
+  await check("smart object copy returns its newly created nested layer", async () => {
+    commands.length = 0;
+    const copied = result(await rpc(ps, "photoshop", "smartObject", "newSmartObjectViaCopy", [{ layerId: 7, documentId: 9 }]));
+    assert.strictEqual(copied.id, 27);
+    assert.strictEqual(copied.documentId, 9);
+    assert.ok(group.layers.includes(requestedLayer));
+    assert.strictEqual(owner.activeLayers[0].id, 8);
+    commands.length = 0;
+    const replaced = result(await rpc(ps, "photoshop", "smartObject", "replaceContents", [{ layerId: copied.id, documentId: copied.documentId }, "C:/replacement.psb"]));
+    assert.strictEqual(replaced.id, 27);
+    assert.ok(commands.every((command) => command._target.some((target) => target._ref === "layer" && target._id === 27)));
+    assert.ok(commands.every((command) => command._target.some((target) => target._ref === "document" && target._id === 9)));
+  });
+  await check("missing or ambiguous copy identity never returns the source", async () => {
+    for (const ids of [[], [28, 29]]) {
+      nextCopyIds = ids;
+      assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "newSmartObjectViaCopy", [{ layerId: 7, documentId: 9 }])).code, -32004);
+    }
+  });
+  await check("conversion returns its replacement layer", async () => {
+    const converted = result(await rpc(ps, "photoshop", "smartObject", "convertToSmartObject", [{ layerId: 7, documentId: 9 }]));
+    assert.strictEqual(converted.id, 37);
+    assert.strictEqual(converted.documentId, 9);
+  });
+  assert.deepStrictEqual(failures, [], failures.join("\n"));
+  console.log("Native contract review regressions passed");
 }
 
 main().catch((error) => {

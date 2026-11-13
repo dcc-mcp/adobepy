@@ -20,7 +20,7 @@ async function buildTarget(name) {
     bundle: true,
     platform: "browser",
     format: "iife",
-    target: "es2018",
+    target: "chrome61",
     sourcemap: true,
     logLevel: "silent",
   });

@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -362,6 +363,8 @@ def stage_bridge(
     canonical_destination = _canonical_destination_root(destination)
     if canonical_destination == source_root or source_root in canonical_destination.parents:
         raise CliError(f"bridge install destination must not be inside the source template: {dest}")
+    if resolved_kind == "uxp":
+        validate_uxp_broker_origin(source_root, websocket_url(host, broker_url))
     _copy_tree(source_root, destination)
     config_path = destination / "adobepy.config.js"
     # Write bytes with an explicit LF newline: the Rust CLI emits the same file
@@ -375,6 +378,25 @@ def stage_bridge(
         "config": str(config_path),
         "token_configured": True,
     }
+
+
+def validate_uxp_broker_origin(source: Path, endpoint: str) -> None:
+    """Reject a configuration that the template's network permissions block."""
+    try:
+        manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+        domains = manifest["requiredPermissions"]["network"]["domains"]
+        parsed = urllib.parse.urlsplit(endpoint)
+        parsed.port  # Validate an explicit port before writing any files.
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        allowed = (
+            parsed.scheme in ("ws", "wss") and parsed.hostname
+            and not parsed.username and not parsed.password
+            and isinstance(domains, list) and origin in domains
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        allowed = False
+    if not allowed:
+        raise CliError("UXP manifest does not permit this broker origin; use a declared network origin")
 
 
 def _broker_health(url: str) -> Tuple[bool, str]:
@@ -415,8 +437,8 @@ def doctor(*, json_output: bool, broker_url: Optional[str] = None) -> int:
             print(f"{status}  {check['name']:<18} {check['detail']}")
         if not all(check["ok"] for check in checks):
             print(
-                "\nSome checks need attention. The PyPI wheel ships the Python SDK only;\n"
-                f"the broker and bridge templates ship in the runtime bundle at {RELEASES_URL}."
+                "\nSome checks need attention. The PyPI wheel ships the Python SDK and\n"
+                f"the bridge templates; only the broker ships in the runtime bundle at {RELEASES_URL}."
             )
     return EXIT_OK if all(check["ok"] for check in checks) else EXIT_FAILURE
 

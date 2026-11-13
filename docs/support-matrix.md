@@ -9,7 +9,7 @@ in scope and will not be validated in CI.
 
 | Channel | Content | Constraints |
 | --- | --- | --- |
-| **PyPI** (`adobepy`) | Python SDK wheel only (`py3-none-any`) | Pure Python. No native extensions in Phase 1. |
+| **PyPI** (`adobepy`) | Python SDK wheel plus built bridge templates (`py3-none-any`) | Pure Python. No native extensions in Phase 1. Bundles `adobe/_bridges`, so `python -m adobe install-bridge` works without any other install. |
 | **GitHub Release** | Broker + runtime bundle (`adobepy-<version>-windows-x64.zip` + `.sha256`) | Windows x86-64 only. Includes Rust CLI, bridge templates, Python SDK, installer. |
 
 ## Supported Hosts

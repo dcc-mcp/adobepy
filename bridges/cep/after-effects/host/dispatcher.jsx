@@ -475,8 +475,12 @@ function adobepyAfterEffectsFindLayer(comp, idOrName) {
   if (!comp) return null;
   var count = Number(adobepySafeValue(comp, "numLayers") || 0);
   for (var index = 1; index <= count; index += 1) {
+    var candidate = comp.layer(index);
+    if (String(adobepySafeValue(candidate, "id")) === String(idOrName)) return candidate;
+  }
+  for (var index = 1; index <= count; index += 1) {
     var layer = comp.layer(index);
-    var values = [adobepySafeValue(layer, "id"), adobepySafeValue(layer, "index"), adobepySafeValue(layer, "name"), index];
+    var values = [adobepySafeValue(layer, "index"), adobepySafeValue(layer, "name"), index];
     for (var valueIndex = 0; valueIndex < values.length; valueIndex += 1) {
       if (String(values[valueIndex]) === String(idOrName)) return layer;
     }
@@ -606,6 +610,10 @@ function adobepyAfterEffectsSetSourceText(layer, payload) {
   adobepyCopyTextDocumentField(doc, current, "fontSize");
   adobepyCopyTextDocumentField(doc, current, "fillColor");
   adobepyCopyTextDocumentField(doc, current, "strokeColor");
+  adobepyCopyTextDocumentField(doc, current, "applyFill");
+  adobepyCopyTextDocumentField(doc, current, "applyStroke");
+  adobepyCopyTextDocumentField(doc, current, "strokeWidth");
+  adobepyCopyTextDocumentField(doc, current, "strokeOverFill");
   adobepyCopyTextDocumentField(doc, current, "tracking");
   adobepyCopyTextDocumentField(doc, current, "justification");
   adobepyAssignTextDocumentField(doc, payload, "font");

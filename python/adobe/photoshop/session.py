@@ -435,12 +435,12 @@ class DocumentProxy:
     @property
     def layers(self) -> list["LayerProxy"]:
         payload = self._session.invoke("document", "getLayers", self.id)
-        return [LayerProxy(self._session, layer) for layer in payload or []]
+        return [LayerProxy(self._session, {"documentId": self.id, **layer}) for layer in payload or []]
 
     @property
     def active_layers(self) -> list["LayerProxy"]:
         payload = self._session.invoke("document", "getActiveLayers", self.id)
-        return [LayerProxy(self._session, layer) for layer in payload or []]
+        return [LayerProxy(self._session, {"documentId": self.id, **layer}) for layer in payload or []]
 
     @property
     def activeLayers(self) -> list["LayerProxy"]:
@@ -867,6 +867,12 @@ class ChannelProxy:
         return self
 
 
+def _layer_target(layer_id: int | str | None, document_id: int | str | None) -> dict[str, Any]:
+    if layer_id is None or document_id is None:
+        raise ValueError("layer operations require layer and document identity; reload the matching bridge")
+    return {"layerId": layer_id, "documentId": document_id}
+
+
 @dataclass
 class TextItemProxy:
     _session: PhotoshopSession
@@ -938,8 +944,9 @@ class TextItemProxy:
         return self.paragraph_style
 
     def refresh(self) -> "TextItemProxy":
-        payload = self._session.invoke("text", "getByLayerId", self.layer_id)
-        self._payload = payload or {}
+        target = _layer_target(self.layer_id, self._payload.get("documentId"))
+        payload = self._session.invoke("text", "getByLayerId", target)
+        self._payload = {**target, **(payload or {})}
         self._layer_id = self.layer_id
         return self
 
@@ -1004,14 +1011,15 @@ class TextItemProxy:
         command_name: str | None = None,
         default_command_name: str,
     ) -> "TextItemProxy":
+        target = _layer_target(self.layer_id, self._payload.get("documentId"))
         payload = self._session.invoke(
             "text",
             method,
-            self.layer_id,
+            target,
             *args,
             options=self._session.modal_options(command_name=command_name, default_command_name=default_command_name),
         )
-        self._payload = payload or {}
+        self._payload = {**target, **(payload or {})}
         self._layer_id = self.layer_id
         return self
 
@@ -1104,8 +1112,8 @@ class LayerProxy:
 
     @property
     def layers(self) -> list["LayerProxy"]:
-        payload = self._session.invoke("layer", "getChildren", self.id)
-        return [LayerProxy(self._session, layer) for layer in payload or []]
+        payload = self._session.invoke("layer", "getChildren", _layer_target(self.id, self._payload.get("documentId")))
+        return [LayerProxy(self._session, {"documentId": self._payload.get("documentId"), **layer}) for layer in payload or []]
 
     @property
     def filters(self) -> "LayerFilterProxy":
@@ -1121,23 +1129,25 @@ class LayerProxy:
 
     @property
     def text_item(self) -> "TextItemProxy | None":
-        payload = self._session.invoke("text", "getByLayerId", self.id)
-        return TextItemProxy(self._session, payload.get("layerId"), payload) if payload else None
+        target = _layer_target(self.id, self._payload.get("documentId"))
+        payload = self._session.invoke("text", "getByLayerId", target)
+        return TextItemProxy(self._session, self.id, {**target, **payload}) if payload else None
 
     @property
     def textItem(self) -> "TextItemProxy | None":
         return self.text_item
 
     def hide(self, *, command_name: str | None = None) -> Any:
+        target = _layer_target(self.id, self._payload.get("documentId"))
         return self._session.action.batch_play(
-            [{"_obj": "hide", "_target": [{"_ref": "layer", "_id": self.id}]}],
+            [{"_obj": "hide", "_target": [{"_ref": "layer", "_id": target["layerId"]}, {"_ref": "document", "_id": target["documentId"]}]}],
             modal=True,
             command_name=command_name,
             default_command_name="Hide layer",
         )
 
     def _replace_payload(self, payload: dict[str, Any] | None) -> "LayerProxy":
-        self._payload = payload or {}
+        self._payload = {"id": self.id, "documentId": self._payload.get("documentId"), **(payload or {})}
         return self
 
 
@@ -1149,7 +1159,7 @@ class LayerFilterProxy:
         payload = self._layer._session.invoke(
             "filter",
             "apply",
-            self._layer.id,
+            _layer_target(self._layer.id, self._layer._payload.get("documentId")),
             method,
             *args,
             options=self._layer._session.modal_options(command_name=command_name, default_command_name=f"Apply {method}"),
@@ -1211,7 +1221,7 @@ class LayerFilterProxy:
         payload = self._layer._session.invoke(
             "filter",
             method,
-            self._layer.id,
+            _layer_target(self._layer.id, self._layer._payload.get("documentId")),
             *args,
             options=self._layer._session.modal_options(command_name=command_name, default_command_name=default_command_name),
         )
@@ -1256,7 +1266,7 @@ class SmartObjectProxy:
         payload = self._layer._session.invoke(
             "smartObject",
             method,
-            self._layer.id,
+            _layer_target(self._layer.id, self._layer._payload.get("documentId")),
             *args,
             options=self._layer._session.modal_options(command_name=command_name, default_command_name=default_command_name),
         )
