@@ -1,10 +1,9 @@
 import { BridgeRpcError, ERROR_HOST_SCRIPT, methodNotFound } from "./errors";
 import type { RpcRequest } from "./protocol";
-import { asString, isObject, maybePromise, property } from "./runtime";
+import { BLOCKED_MEMBERS, asString, isObject, maybePromise, property, readMember as readHostMember } from "./runtime";
 
 const REFERENCE_KEY = "$adobepyRef";
 const TYPE_KEY = "$adobepyType";
-const BLOCKED_MEMBERS = new Set(["__proto__", "constructor", "prototype"]);
 
 type DomRootResolver = (name: string) => unknown;
 type DomMutationRunner = (
@@ -212,11 +211,18 @@ function requiredMember(value: unknown): string | number {
   return value;
 }
 
+/**
+ * Dispatch reads go through the shared bounded helper. A function receiver must
+ * not expose Function.prototype members (`call`, `apply`, `bind`, ...) or the
+ * constructor chain behind them; otherwise `dom.get` followed by `dom.call` or
+ * `dom.construct` could reach the host's Function constructor. Object receivers
+ * still reach legitimate host DOM prototype methods.
+ */
 function readMember(receiver: unknown, member: string | number): unknown {
   if ((typeof receiver !== "object" && typeof receiver !== "function") || receiver === null) {
     throw new BridgeRpcError(ERROR_HOST_SCRIPT, `cannot read '${String(member)}' from a primitive value`);
   }
-  return (receiver as Record<string | number, unknown>)[member];
+  return readHostMember(receiver, member);
 }
 
 function writeMember(receiver: unknown, member: string | number, value: unknown): void {
@@ -229,8 +235,11 @@ function writeMember(receiver: unknown, member: string | number, value: unknown)
 function collectKeys(value: unknown): string[] {
   if ((typeof value !== "object" && typeof value !== "function") || value === null) return [];
   const keys = new Set<string>();
+  // For a function receiver the prototype chain is Function.prototype, not a
+  // host DOM capability surface, so only its own properties are enumerable.
+  const maxDepth = typeof value === "function" ? 1 : 8;
   let current: object | null = value as object;
-  for (let depth = 0; current && depth < 8; depth += 1) {
+  for (let depth = 0; current && depth < maxDepth; depth += 1) {
     try {
       for (const key of Object.getOwnPropertyNames(current)) {
         if (!BLOCKED_MEMBERS.has(key) && key !== "constructor") keys.add(key);
@@ -257,6 +266,12 @@ function domTypeName(value: unknown): string {
   if (!isObject(value)) return typeof value;
   const typename = asString(property(value, "typename")) ?? asString(property(value, "typeName"));
   if (typename) return typename;
-  const constructor = property<{ name?: unknown }>(value, "constructor");
-  return asString(constructor?.name) ?? "Object";
+  // Read the constructor name from the prototype directly: `constructor` is a
+  // blocked member for the generic property() reader.
+  try {
+    const prototype = Object.getPrototypeOf(value) as { constructor?: { name?: unknown } } | null;
+    return asString(prototype?.constructor?.name) ?? "Object";
+  } catch {
+    return "Object";
+  }
 }

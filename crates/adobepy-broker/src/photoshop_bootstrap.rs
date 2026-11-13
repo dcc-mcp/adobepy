@@ -1445,6 +1445,18 @@ fn bootstrap_config(
     ))
 }
 
+// Keep the cross-language regression on the same config generator used by
+// prepare(); this is not a second test implementation of its JavaScript.
+#[cfg(test)]
+pub(super) fn photoshop_bootstrap_config_for_test(
+    websocket_url: &str,
+    token: &str,
+    target: &str,
+    nonce: &str,
+) -> anyhow::Result<String> {
+    bootstrap_config(websocket_url, token, target, Some(nonce))
+}
+
 fn illustrator_bootstrap_config(
     websocket_url: &str,
     token: &str,
@@ -1656,7 +1668,7 @@ fn observe_process(pid: u32) -> anyhow::Result<ObservedHostProcess> {
         let creation_ticks = (u64::from(creation.high) << 32) | u64::from(creation.low);
         Ok(ObservedHostProcess {
             pid,
-            process_start_identity: format!("windows:{creation_ticks}"),
+            process_start_identity: format!("windows-filetime:{creation_ticks}"),
             executable_path: String::from_utf16(&path[..usize::try_from(path_len)?])?,
         })
     })();
@@ -2224,14 +2236,16 @@ mod tests {
     #[test]
     #[ignore = "launched only by the nested owned-host integration regression"]
     fn nested_owned_host_descendant_fixture() {
-        std::thread::sleep(Duration::from_secs(10));
+        loop {
+            std::thread::park();
+        }
     }
 
     #[cfg(windows)]
     #[test]
     #[ignore = "launched only by the nested owned-host integration regression"]
     fn nested_owned_host_parent_fixture() {
-        let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
+        let descendant = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
                 "--exact",
@@ -2243,10 +2257,9 @@ mod tests {
         let marker =
             std::env::temp_dir().join(format!("adobepy-owned-host-{}.ready", std::process::id()));
         fs::write(&marker, descendant.id().to_string()).unwrap();
-        std::thread::sleep(Duration::from_secs(10));
-        let _ = descendant.kill();
-        let _ = descendant.wait();
-        let _ = fs::remove_file(marker);
+        loop {
+            std::thread::park();
+        }
     }
 
     #[cfg(windows)]
@@ -2347,10 +2360,7 @@ mod tests {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let hook_cancelled = cancelled.clone();
-        let nested_pid = Arc::new(Mutex::new(None));
-        let hook_nested_pid = nested_pid.clone();
-        let nested_marker = Arc::new(Mutex::new(None));
-        let hook_nested_marker = nested_marker.clone();
+        let (hook_done_tx, hook_done_rx) = tokio::sync::oneshot::channel();
         crate::bootstrap_transaction::set_after_host_spawn(
             fs::canonicalize(&executable).unwrap(),
             move |parent_pid| {
@@ -2361,8 +2371,7 @@ mod tests {
                 // unwrapping a partial read: a panic in this supervisor hook is
                 // caught by `catch_unwind`, which drops the Windows Job object
                 // and lets the descendant escape, failing this test for the
-                // wrong reason on a loaded runner. The ceiling is only a hang
-                // detector and stays below the fixture's own 10 s lifetime.
+                // wrong reason on a loaded runner. The ceiling only detects hangs.
                 let deadline = Instant::now() + Duration::from_secs(8);
                 let pid = loop {
                     if let Some(pid) = fs::read_to_string(&marker)
@@ -2376,9 +2385,11 @@ mod tests {
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 };
-                *hook_nested_pid.lock().unwrap() = pid;
-                *hook_nested_marker.lock().unwrap() = Some(marker);
+                let fixtures_alive = pid.is_some_and(|descendant| {
+                    observe_process(parent_pid).is_ok() && observe_process(descendant).is_ok()
+                });
                 hook_cancelled.store(true, Ordering::SeqCst);
+                let _ = hook_done_tx.send((parent_pid, pid, marker, fixtures_alive));
             },
         );
 
@@ -2387,10 +2398,14 @@ mod tests {
             tokio::task::spawn_blocking(move || launch_backend.launch_owned(&target, cancelled))
                 .await
                 .unwrap();
-        let descendant_pid = nested_pid
-            .lock()
-            .unwrap()
-            .expect("the nested host fixture never published its descendant PID");
+        // The supervisor hook can outlive the five-second spawn reply budget.
+        let (parent_pid, descendant_pid, marker, fixtures_alive) =
+            tokio::time::timeout(Duration::from_secs(10), hook_done_rx)
+                .await
+                .expect("the post-spawn hook did not finish")
+                .expect("the post-spawn hook failed");
+        let descendant_pid =
+            descendant_pid.expect("the nested host fixture never published its descendant PID");
         // `quiesce` completes once broker reaping is idle, but a Windows Job
         // close terminates its members asynchronously. Keep a generous hang
         // detector here rather than a machine-speed ceiling.
@@ -2400,9 +2415,8 @@ mod tests {
             .await;
         // Sample the state the assertion actually cares about instead of a
         // single `observe_process` sample that can catch the descendant in its
-        // terminating window. The ceiling is well below the fixture's own 10 s
-        // lifetime, so a genuine escape cannot be masked by the fixture's later
-        // kill of the descendant.
+        // terminating window. Fixtures never exit naturally, so a genuine escape
+        // cannot be masked by their lifetime.
         let reap_deadline = Instant::now() + Duration::from_secs(5);
         let descendant_was_alive = loop {
             if observe_process(descendant_pid).is_err() {
@@ -2416,9 +2430,11 @@ mod tests {
         if descendant_was_alive {
             terminate_test_process(descendant_pid);
         }
-        if let Some(marker) = nested_marker.lock().unwrap().take() {
-            let _ = fs::remove_file(marker);
+        let parent_was_alive = observe_process(parent_pid).is_ok();
+        if parent_was_alive {
+            terminate_test_process(parent_pid);
         }
+        let _ = fs::remove_file(marker);
         let _ = fs::remove_dir_all(root.parent().unwrap());
 
         assert!(
@@ -2426,6 +2442,11 @@ mod tests {
             "cancellation did not reject the public launch"
         );
         assert!(quiesced, "post-spawn failure lost broker reap ownership");
+        assert!(
+            fixtures_alive,
+            "fixtures exited before cancellation was requested"
+        );
+        assert!(!parent_was_alive, "the original host escaped cancellation");
         assert!(
             !descendant_was_alive,
             "a descendant escaped before Windows Job ownership was established"

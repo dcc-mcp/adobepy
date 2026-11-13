@@ -12,9 +12,9 @@
 | `adobepy-standalone-<version>-linux-x64.zip` | GitHub Release | Linux x86_64 standalone interpreter |
 | `adobepy-standalone-<version>-linux-x64.zip.sha256` | GitHub Release | Integrity verification |
 
-The two channels are independent: PyPI contains **only** the Python SDK, and the
-GitHub Release asset contains **only** the broker/runtime bundle. A consumer that
-needs both must install from both channels.
+PyPI provides the Python SDK without a native broker. The Windows GitHub Release
+bundle carries the broker/runtime and an SDK wheel; the standalone archives
+embed the SDK in their interpreter.
 
 The Windows bundle and the two standalone archives are different artifacts, not
 the same bundle built three times. The standalone archives ship a PyOxidizer
@@ -40,12 +40,13 @@ bare error.
 
 ### Publishing mechanism
 
-Trusted publishing via GitHub Actions. The release workflow
-(`.github/workflows/release.yml`) publishes after a GitHub Release is published
-or after manual dispatch with `publish_to_pypi=true`.
+The `pypi` job in `.github/workflows/release-please.yml` publishes automatically
+when Release Please creates a release. The manual rebuild workflow
+(`.github/workflows/release.yml`) publishes only after manual dispatch with
+`publish_to_pypi=true`.
 
 ```yaml
-# Extract from release.yml — PyPI job
+# Both workflows use the same PyPI environment permissions.
 environment: pypi
 permissions:
   id-token: write
@@ -57,7 +58,7 @@ permissions:
 | --- | --- |
 | Repository owner | `dcc-mcp` |
 | Repository name | `adobepy` |
-| Workflow | `release.yml` |
+| Workflow | `release-please.yml` (automatic), `release.yml` (manual publisher) |
 | Environment | `pypi` |
 
 ### Wheel tag invariant
@@ -179,8 +180,8 @@ named `adobepy-windows-x64`.
 
 `release-please.yml` is the only workflow that publishes to a release tag.
 `release.yml` is the manual rebuild path (`workflow_dispatch` with an explicit
-`release_tag`); its macOS and Linux standalone jobs are disabled with `if: false`
-so the two workflows can never upload the same asset name for one release.
+`release_tag`); it has no macOS or Linux standalone jobs, so those assets have
+one publishing owner.
 
 ### Version scheme
 
@@ -264,7 +265,7 @@ Python SDK version is bumped to match.
 | Install bridge templates | No | Yes (manual copy from archive) |
 | CI dependency (`adobepy>=0.1.0`) | Yes | No |
 | Manual Windows install | Recommend both | Yes |
-| macOS arm64 / Linux x86_64 SDK import | No | Yes (standalone archive) |
+| macOS arm64 / Linux x86_64 SDK import | Yes (requires Python) | Yes (standalone archive) |
 | macOS / Linux brokering | No | No (Phase 1) |
 
 ---

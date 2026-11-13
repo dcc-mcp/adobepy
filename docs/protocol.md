@@ -84,11 +84,13 @@ InDesign, Premiere, After Effects, and Illustrator are asserted by
 `npm run capabilities:check` against the generated IR and API source registry.
 
 Identity claims are optional for backward-compatible bridge connectivity, but
-an incomplete claim can never produce an exact runtime attestation. The
-Photoshop UXP bridge obtains its host version and installed plug-in/module
-origin from the loaded host and UXP file-system APIs. It accepts PID,
+an incomplete claim can never produce an exact runtime attestation. All hosts
+share one typed, secret-free identity contract; no host-specific identity or
+launch-receipt field is introduced. The UXP and CEP bridges obtain their host
+version and installed plug-in/module origin from the loaded host and their
+file-system APIs (a fixed, bounded version probe on CEP). They accept PID,
 process-start identity, executable path, and profile ID only from the bounded
-adapter-owned `__ADOBEPY_HOST_IDENTITY` launch context. It does not guess these
+adapter-owned `__ADOBEPY_HOST_IDENTITY` launch context. They do not guess these
 values or use arbitrary execution or UI automation to discover them.
 
 ## Runtime Identity Attestation
@@ -104,10 +106,12 @@ content-type: application/json
 ```
 
 The response binds the broker PID/start identity/executable/version/instance,
-Photoshop PID/start identity/executable/version/profile, and UXP
+the host PID/start identity/executable/version/profile, and the bridge
 target/kind/version/connection epoch/instance/plugin root/module origin. The
-token is never part of the response. `BrokerClient.runtime_identity()` and
-`Photoshop.runtime_identity()` return a typed `RuntimeIdentityAttestation`.
+token is never part of the response. `BrokerClient.runtime_identity()` and each
+host facade's `runtime_identity()` — for example `Photoshop.runtime_identity()`
+or `AfterEffects().runtime_identity()` — return a typed
+`RuntimeIdentityAttestation`.
 
 Install verification should construct an expected attestation from independent
 OS process observations plus the owned install receipt and pass it back to the
@@ -125,6 +129,63 @@ root, or module origin returns a mismatch error. Missing host facts return an
 unavailable error, and an omitted target with multiple matching sessions
 returns an ambiguous error. All identity fields are bounded and malformed
 claims are rejected before registration.
+
+### After Effects CEP identity
+
+After Effects CEP uses the same attestation above — there is no
+`adapterOwnedLaunchReceipt` field or After Effects-only broker bypass. The
+bridge reports a bounded `app.version` probe, its CEP extension root and
+`dist/main.js` module origin, one runtime instance ID, and the adapter-owned
+launch context, and the broker requires `bridgeKind: "cep"`. An adapter owns the
+bounded host launch and its install/launch receipt: it observes the After
+Effects process from the OS and cross-checks the session with
+`AfterEffects().runtime_identity(expected=expected_identity)`. Failure reasons
+stay distinguishable — a missing session or incomplete claim returns
+`ERROR_IDENTITY_UNAVAILABLE` with `missingFields`, stale PID reuse returns
+`ERROR_IDENTITY_STALE`, an ambiguous target returns
+`ERROR_IDENTITY_AMBIGUOUS`, and a foreign target/profile/executable/module, a
+non-CEP bridge, or a version mismatch returns `ERROR_IDENTITY_MISMATCH`. A
+claim-less handshake connects but never attests identity. There is no
+After Effects-specific broker-side host-launch bootstrap; the broker never runs
+arbitrary JSX/ExtendScript, executes a generic command, or falls back to UI
+automation for identity.
+
+## Broker Runtime Identity
+
+`POST /v1/runtime-identity` requires a live host/bridge session. When an adapter
+needs only the broker's own identity — before a session exists, or from a
+pre-session watchdog — it reads the session-free authenticated endpoint:
+
+```http
+GET /v1/broker-identity
+x-adobepy-token: <token>
+```
+
+Response (HTTP 200):
+
+```json
+{
+  "pid": 4100,
+  "processStartIdentity": "windows-filetime:133700000000000000",
+  "executablePath": "C:/adobepy/adobepy.exe",
+  "runtimeVersion": "0.6.2",
+  "instanceId": "76db1078-74c9-45c1-87e1-e8258649815e"
+}
+```
+
+Without a valid `x-adobepy-token` the endpoint returns `401` and discloses
+nothing; identity is never placed on the unauthenticated `/health` liveness
+probe. `BrokerClient.broker_identity()` and `broker_identity_async()` return a
+typed `BrokerRuntimeIdentity`.
+
+`runtimeVersion` is the release-managed product version (see ADR 0002), not the
+pinned Rust crate version, so it equals the `installer_version` an adapter
+records in its owned install receipt. `processStartIdentity` uses one canonical
+encoding per platform — Windows `windows-filetime:{ticks}`, macOS
+`macos:{seconds}:{microseconds:06}`, Linux `linux:{boot_id}:{start_ticks}` —
+byte-identical whether the broker describes itself or an observed host, so an
+adapter can reproduce the value from independent OS process observations. A
+change to any encoding is a coordinated broker+adapter protocol change.
 
 ## Bounded Photoshop bootstrap
 
@@ -249,7 +310,9 @@ shape without inspecting bridge internals.
 
 ## Authentication
 
-All broker HTTP client calls use `x-adobepy-token`. Bridge WebSocket sessions
+All broker HTTP client calls use `x-adobepy-token`, including the identity
+endpoints `/v1/broker-identity` and `/v1/runtime-identity`; `/health` is the only
+unauthenticated route and carries no identity. Bridge WebSocket sessions
 authenticate with the `token` field in the first `hello` message. A blank broker
 token disables auth only for local development tests.
 
@@ -265,6 +328,9 @@ dispatcher. `options.timeoutMs` overrides the broker default for a single call.
 Additive namespace, method, feature, and diagnostics fields are compatible.
 Changing existing field names, error codes, or response envelope shapes is a
 breaking change and requires a protocol version bump plus migration notes.
+Changing a `processStartIdentity` encoding (ADR 0002) is likewise a breaking
+change: brokers and adapters derive and compare the token independently, so they
+must adopt a new scheme together.
 
 New facade methods must be capability-gated and should keep both Adobe
 JavaScript-shaped names and Pythonic aliases when the upstream API is camelCase.

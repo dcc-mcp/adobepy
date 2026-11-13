@@ -170,6 +170,7 @@
       "name": "ClipProxy",
       "properties": [
         {"name": "id", "type": "Any"},
+        {"name": "id_source", "type": "str | None"},
         {"name": "name", "type": "str | None"},
         {"name": "project_item_id", "type": "Any"},
         {"name": "media_path", "type": "str | None"},
