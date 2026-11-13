@@ -5,6 +5,7 @@ from adobe.after_effects.session import LayerProxy
 from adobe.indesign import InDesign
 from adobe.illustrator import Illustrator
 from adobe.photoshop import Photoshop, PhotoshopSession, connect as connect_photoshop
+from adobe.photoshop.session import LayerProxy as PhotoshopLayerProxy
 from adobe.premiere import Premiere
 from adobe.premiere.session import ClipProxy
 from adobe.raw import RawSession
@@ -54,7 +55,7 @@ class CapturingClient:
         if host == "photoshop" and namespace == "layer":
             if method == "getChildren":
                 return [{"id": 12, "name": "Child", "kind": "pixel"}]
-            return {"id": 11, "name": "Layer 1", "kind": "text", "isSmartObject": False}
+            return {"id": 11, "documentId": 7, "name": "Layer 1", "kind": "text", "isSmartObject": False}
         if namespace == "selection":
             if method == "get":
                 return {"bounds": {"top": 1, "left": 2, "bottom": 40, "right": 50}, "docId": args[0], "solid": True, "typename": "Selection"}
@@ -132,7 +133,7 @@ class CapturingClient:
         if namespace == "filter":
             return {"id": args[0], "name": "Layer 1", "kind": "pixel", "lastFilter": method}
         if namespace == "smartObject":
-            return {"id": args[0], "name": "Layer 1", "kind": "smartObject", "isSmartObject": True}
+            return {"id": args[0]["layerId"], "name": "Layer 1", "kind": "smartObject", "isSmartObject": True}
         if namespace == "export":
             if method == "getPresets":
                 return [
@@ -1077,6 +1078,22 @@ class CapturingClient:
 
 
 class FacadeTests(unittest.TestCase):
+    def test_smart_object_targets_owning_document_across_calls(self):
+        client = CapturingClient()
+        layer = PhotoshopLayerProxy(PhotoshopSession(client), {"id": 11, "documentId": 7})
+        for method, args in (("convert_to_smart_object", ()), ("new_smart_object_via_copy", ()), ("edit_contents", ()), ("replace_contents", ("C:/replacement.psb",))):
+            getattr(layer.smart_object, method)(*args)
+            self.assertEqual(client.calls[-1]["args"][0], {"layerId": 11, "documentId": 7})
+        child = layer.layers[0]
+        child.smart_object.edit_contents()
+        self.assertEqual(client.calls[-1]["args"][0], {"layerId": 12, "documentId": 7})
+        PhotoshopSession(client).app.active_document.layers[0].smart_object.edit_contents()
+        self.assertEqual(client.calls[-1]["args"][0], {"layerId": 11, "documentId": 7})
+        before = len(client.calls)
+        with self.assertRaisesRegex(ValueError, "document"):
+            PhotoshopLayerProxy(PhotoshopSession(client), {"id": 11}).smart_object.edit_contents()
+        self.assertEqual(len(client.calls), before)
+
     def test_premiere_clip_id_source(self):
         for source in ("derived", "native", None):
             with self.subTest(source=source):

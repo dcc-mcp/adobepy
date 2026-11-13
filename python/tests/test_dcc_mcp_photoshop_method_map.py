@@ -72,7 +72,7 @@ class CapturingClient:
         if namespace == "export" and method == "exportWithPreset":
             return {"id": args[0]["id"], "path": args[0]["path"], "preset": args[0]["preset"]}
         if namespace == "layer" and method == "getActive":
-            return {"id": 11, "name": "Hero", "kind": "text", "visible": True}
+            return {"id": 11, "documentId": 7, "name": "Hero", "kind": "text", "visible": True}
         if namespace == "text" and method in {"getByLayerId", "getActive"}:
             return {"layerId": 11, "contents": "Old", "characterStyle": {}, "paragraphStyle": {}}
         if namespace == "text" and method in {"setContents", "setCharacterStyle", "setParagraphStyle"}:
@@ -80,7 +80,7 @@ class CapturingClient:
         if namespace == "filter":
             return {"id": args[0], "name": "Hero", "lastFilter": method}
         if namespace == "smartObject":
-            return {"id": args[0], "name": "Hero", "isSmartObject": True}
+            return {"id": args[0]["layerId"], "documentId": args[0]["documentId"], "name": "Hero", "isSmartObject": True}
         if namespace == "raw":
             return {"path": list(args[0]) if args else [], "args": list(args[1]) if len(args or []) > 1 and isinstance(args[1], list) else []}
         if namespace == "action":

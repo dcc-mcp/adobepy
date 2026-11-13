@@ -252,6 +252,7 @@ function serializeLayer(layer: unknown) {
   if (!isObject(layer)) return null;
   return {
     id: property(layer, "id"),
+    documentId: property(property(layer, "document"), "id"),
     name: asString(property(layer, "name")),
     kind: asString(property(layer, "kind")),
     opacity: asNumber(property(layer, "opacity")) ?? property(layer, "opacity"),
@@ -581,7 +582,8 @@ async function smartObjectConvert(request: RpcRequest) {
 async function smartObjectReplaceContents(request: RpcRequest) {
   const path = asString(request.args?.[1]);
   if (!path) unavailable("Photoshop smart object replacement path");
-  const layerId = request.args?.[0];
+  const layerTarget = request.args?.[0];
+  const layerId = isObject(layerTarget) ? property(layerTarget, "layerId") : layerTarget;
   const descriptor: Record<string, unknown> = {
     _obj: "placedLayerReplaceContents",
     null: await actionFileReference(path)
@@ -592,14 +594,18 @@ async function smartObjectReplaceContents(request: RpcRequest) {
 }
 
 async function smartObjectBatchPlay(request: RpcRequest, descriptors: Record<string, unknown>[], defaultCommandName: string) {
-  const target = findLayerTarget(request.args?.[0]);
+  const argument = request.args?.[0];
+  const id = isObject(argument) ? property(argument, "layerId") : argument;
+  const documentId = isObject(argument) ? property(argument, "documentId") : undefined;
+  if (isObject(argument) && (documentId === undefined || documentId === null)) unavailable("Photoshop layer owning document");
+  const target = findLayerTarget(id, documentId);
   if (!target?.layer) unavailable("Photoshop layer");
   const { layer, document } = target;
-  const layerId = property(layer, "id") ?? request.args?.[0];
-  const documentId = asNumber(property(document, "id"));
-  if (documentId === undefined) unavailable("Photoshop layer owning document");
+  const layerId = property(layer, "id") ?? id;
+  const ownerId = asNumber(property(document, "id"));
+  if (ownerId === undefined) unavailable("Photoshop layer owning document");
   const selection = selectLayerDescriptor(layerId);
-  const references = [layerReference(layerId), { _ref: "document", _id: documentId }];
+  const references = [layerReference(layerId), { _ref: "document", _id: ownerId }];
   const commands = [{ ...selection, _target: references }, ...descriptors.map((descriptor) => ({ ...descriptor, _target: references }))];
   await runBatchPlay(request, commands, {}, defaultCommandName);
   return serializeLayer(findLayerInTree(property(document, "layers"), layerId) ?? layer);
@@ -636,13 +642,22 @@ function findLayer(id: unknown) {
   return findLayerTarget(id)?.layer;
 }
 
-function findLayerTarget(id: unknown) {
+function findLayerTarget(id: unknown, documentId?: unknown) {
+  if (documentId !== undefined && documentId !== null) {
+    const document = findDocument(documentId);
+    const layer = findLayerInTree(property(document, "layers"), id) ?? findLayerInTree(property(document, "activeLayers"), id);
+    return layer ? { document, layer } : undefined;
+  }
   if (id === undefined || id === null) return { document: activeDocument(), layer: activeLayer() };
+  let target: { document: unknown; layer: unknown } | undefined;
   for (const document of openDocuments()) {
     const match = findLayerInTree(property(document, "layers"), id) ?? findLayerInTree(property(document, "activeLayers"), id);
-    if (match) return { document, layer: match };
+    if (match) {
+      if (target) unavailable("Photoshop ambiguous layer ID; provide the owning document");
+      target = { document, layer: match };
+    }
   }
-  return undefined;
+  return target;
 }
 
 function isSmartObjectLayer(layer: unknown): boolean {

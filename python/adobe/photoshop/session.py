@@ -435,12 +435,12 @@ class DocumentProxy:
     @property
     def layers(self) -> list["LayerProxy"]:
         payload = self._session.invoke("document", "getLayers", self.id)
-        return [LayerProxy(self._session, layer) for layer in payload or []]
+        return [LayerProxy(self._session, {"documentId": self.id, **layer}) for layer in payload or []]
 
     @property
     def active_layers(self) -> list["LayerProxy"]:
         payload = self._session.invoke("document", "getActiveLayers", self.id)
-        return [LayerProxy(self._session, layer) for layer in payload or []]
+        return [LayerProxy(self._session, {"documentId": self.id, **layer}) for layer in payload or []]
 
     @property
     def activeLayers(self) -> list["LayerProxy"]:
@@ -1105,7 +1105,7 @@ class LayerProxy:
     @property
     def layers(self) -> list["LayerProxy"]:
         payload = self._session.invoke("layer", "getChildren", self.id)
-        return [LayerProxy(self._session, layer) for layer in payload or []]
+        return [LayerProxy(self._session, {"documentId": self._payload.get("documentId"), **layer}) for layer in payload or []]
 
     @property
     def filters(self) -> "LayerFilterProxy":
@@ -1137,7 +1137,7 @@ class LayerProxy:
         )
 
     def _replace_payload(self, payload: dict[str, Any] | None) -> "LayerProxy":
-        self._payload = payload or {}
+        self._payload = {"documentId": self._payload.get("documentId"), **(payload or {})}
         return self
 
 
@@ -1253,10 +1253,13 @@ class SmartObjectProxy:
         command_name: str | None = None,
         default_command_name: str,
     ) -> LayerProxy:
+        document_id = self._layer._payload.get("documentId")
+        if document_id is None:
+            raise ValueError("smart-object operations require the layer's document identity; reload the matching bridge")
         payload = self._layer._session.invoke(
             "smartObject",
             method,
-            self._layer.id,
+            {"layerId": self._layer.id, "documentId": document_id},
             *args,
             options=self._layer._session.modal_options(command_name=command_name, default_command_name=default_command_name),
         )

@@ -1414,6 +1414,7 @@ async function testNativeReviewRegressions() {
   const folderChildren = new Map([[rootItem, [parent]], [parent, [media]]]);
   const clips = new Map([[media, clip]]);
   let mutationsSucceed = true;
+  let projectLocked = false;
   const markerList = [];
   const nativeMarker = (name, markerType, start, duration, comments) => ({
     getName: () => name, getType: () => markerType, getStart: () => start,
@@ -1422,23 +1423,30 @@ async function testNativeReviewRegressions() {
   const markers = {
     getMarkers: () => markerList,
     createAddMarkerAction(name, type, start, duration, comments) {
+      assert.ok(projectLocked, "marker action requires locked project access");
       assert.ok(start instanceof TickTime && duration instanceof TickTime);
       return () => markerList.push(nativeMarker(name, type, start, duration, comments));
     }
   };
   const folders = new Map(Array.from(folderChildren, ([item, children]) => [item, {
     getItems: () => children,
-    createBinAction: (name) => () => {
-      const created = { id: `new-${children.length}`, name };
-      children.push(created);
-      folders.set(created, { getItems: () => [] });
+    createBinAction: (name) => {
+      assert.ok(projectLocked, "bin action requires locked project access");
+      return () => {
+        const created = { id: `new-${children.length}`, name };
+        children.push(created);
+        folders.set(created, { getItems: () => [] });
+      };
     }
   }]));
   const sequence = { id: "seq", name: "Sequence" };
   const project = {
     getRootItem: () => rootItem, getActiveSequence: () => sequence,
     getSequences: () => [sequence], save: () => mutationsSucceed, saveAs: () => mutationsSucceed,
-    lockedAccess(callback) { callback(); },
+    lockedAccess(callback) {
+      projectLocked = true;
+      try { callback(); } finally { projectLocked = false; }
+    },
     executeTransaction(callback) {
       if (!mutationsSucceed) return false;
       const actions = [];
@@ -1465,8 +1473,8 @@ async function testNativeReviewRegressions() {
       Markers: { getMarkers: (owner) => { assert.strictEqual(owner, sequence); return markers; } },
       Marker: { MARKER_TYPE_COMMENT: "Comment" },
       SequenceEditor: { getEditor: () => ({
-        createInsertProjectItemAction: (item, time) => { assert.ok(time instanceof TickTime); return () => {}; },
-        createOverwriteItemAction: () => () => {}
+        createInsertProjectItemAction: (item, time) => { assert.ok(projectLocked, "insert action requires locked project access"); assert.ok(time instanceof TickTime); return () => {}; },
+        createOverwriteItemAction: () => { assert.ok(projectLocked, "overwrite action requires locked project access"); return () => {}; }
       }) },
       EncoderManager: { getManager: () => ({
         encodeFile: (...args) => { encoded.push(args); assert.ok(args[3] instanceof TickTime && args[4] instanceof TickTime); return true; },
@@ -1498,6 +1506,7 @@ async function testNativeReviewRegressions() {
   }
   await check("native time factories", async () => {
     result(await rpc(env, "premiere", "sequence", "insertProjectItem", ["seq", { projectItem: "media", time: { ticks: "254016000000" } }]));
+    result(await rpc(env, "premiere", "sequence", "overwriteProjectItem", ["seq", { projectItem: "media", time: 1 }]));
     result(await rpc(env, "premiere", "export", "exportFrame", [{ sequence: "seq", outputPath: "C:/out.png", time: 1 }]));
     result(await rpc(env, "premiere", "encoder", "encodeFile", [{ sourcePath: "C:/in.mov", outputPath: "C:/out.mov" }]));
     assert.strictEqual(encoded[0][4], TickTime.TIME_INVALID);
@@ -1536,6 +1545,9 @@ async function testNativeReviewRegressions() {
   const ownerSelectedLayer = { id: 8, name: "Another selected layer" };
   const owner = { id: 9, layers: [requestedLayer, ownerSelectedLayer], activeLayers: [ownerSelectedLayer] };
   const app = { activeDocument: { id: 2, layers: [activeLayer], activeLayers: [activeLayer] }, documents: [owner] };
+  const collidingLayer = { id: 7, name: "Same ID in another document", document: app.activeDocument };
+  app.activeDocument.layers.push(collidingLayer);
+  requestedLayer.document = owner;
   app.documents.unshift(app.activeDocument);
   let pickerCalls = 0;
   const commands = [];
@@ -1547,11 +1559,27 @@ async function testNativeReviewRegressions() {
     } } }
   });
   await check("smart object owning document", async () => {
-    assert.strictEqual(result(await rpc(ps, "photoshop", "smartObject", "editContents", [7])).id, 7);
+    const snapshot = result(await rpc(ps, "photoshop", "document", "getLayers", [9]));
+    assert.strictEqual(snapshot[0].documentId, 9);
+    const returned = result(await rpc(ps, "photoshop", "smartObject", "editContents", [{ layerId: 7, documentId: 9 }]));
+    assert.strictEqual(returned.id, 7);
+    assert.strictEqual(returned.documentId, 9);
     for (const command of commands) assert.ok(command._target.some((target) => target._ref === "document" && target._id === owner.id));
   });
+  await check("ambiguous legacy layer ID refuses to mutate", async () => {
+    commands.length = 0;
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [7])).code, -32004);
+    assert.strictEqual(commands.length, 0);
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [{ layerId: 7, documentId: 999 }])).code, -32004);
+    assert.strictEqual(commands.length, 0);
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [{ layerId: 1, documentId: 9 }])).code, -32004);
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [{ layerId: 7 }])).code, -32004);
+    assert.strictEqual(commands.length, 0);
+    assert.strictEqual(result(await rpc(ps, "photoshop", "smartObject", "editContents", [{ layerId: 7, documentId: 2 }])).documentId, 2);
+    assert.ok(commands.every((command) => command._target.some((target) => target._ref === "document" && target._id === 2)));
+  });
   await check("explicit path must never invoke picker", async () => {
-    assert.match(error(await rpc(ps, "photoshop", "smartObject", "replaceContents", [7, "C:/missing.psb"])).message, /requested path missing/);
+    assert.match(error(await rpc(ps, "photoshop", "smartObject", "replaceContents", [{ layerId: 7, documentId: 9 }, "C:/missing.psb"])).message, /requested path missing/);
     assert.strictEqual(pickerCalls, 0);
   });
   assert.deepStrictEqual(failures, [], failures.join("\n"));

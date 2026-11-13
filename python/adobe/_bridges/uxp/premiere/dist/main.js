@@ -562,8 +562,8 @@
     const method = property(editor, overwrite ? "createOverwriteItemAction" : "createInsertProjectItemAction");
     const project = await activeProject();
     if (!method) unavailable(`Premiere SequenceEditor ${overwrite ? "overwrite" : "insert"}`);
-    const action = overwrite ? method.call(editor, item, time, videoTrack, audioTrack) : method.call(editor, item, time, videoTrack, audioTrack, booleanValue(property(payload, "limitShift") ?? property(payload, "limit_shift")) ?? false);
-    await executeProjectAction(project, action, asString(request.options?.commandName) ?? (overwrite ? "Overwrite project item" : "Insert project item"));
+    const createAction = () => overwrite ? method.call(editor, item, time, videoTrack, audioTrack) : method.call(editor, item, time, videoTrack, audioTrack, booleanValue(property(payload, "limitShift") ?? property(payload, "limit_shift")) ?? false);
+    await executeProjectAction(project, createAction, asString(request.options?.commandName) ?? (overwrite ? "Overwrite project item" : "Insert project item"));
     return { edited: true, mode: overwrite ? "overwrite" : "insert", sequence: await serializeSequence(sequence), projectItem: await serializeProjectItem(item) };
   }
   function premiereTickTime(value) {
@@ -580,7 +580,7 @@
     if (!createWithSeconds) unavailable("Premiere TickTime.createWithSeconds");
     return createWithSeconds.call(tickTime, seconds);
   }
-  async function executeProjectAction(project, action, commandName) {
+  async function executeProjectAction(project, createAction, commandName) {
     const execute = property(project, "executeTransaction");
     if (!execute) unavailable("Premiere project.executeTransaction");
     let result;
@@ -588,7 +588,7 @@
       result = execute.call(project, (compound) => {
         const add = property(compound, "addAction") ?? property(compound, "add");
         if (!add) unavailable("Premiere compound action");
-        add.call(compound, action);
+        add.call(compound, createAction());
       }, commandName);
     };
     const lockedAccess = property(project, "lockedAccess");
@@ -722,7 +722,7 @@
     } else {
       const createAction = property(parent, "createBinAction");
       if (!createAction) unavailable("Premiere bin.create");
-      await executeProjectAction(project, createAction.call(parent, name, makeUnique), asString(request.options?.commandName) ?? "Create bin");
+      await executeProjectAction(project, () => createAction.call(parent, name, makeUnique), asString(request.options?.commandName) ?? "Create bin");
     }
     const createdChildren = [];
     for (const child of await projectItemChildObjects(parent)) {
@@ -899,7 +899,7 @@
       if ((asNumber(property(duration, "seconds")) ?? 0) < 0) unavailable("Premiere marker duration");
       const markerType = asString(property(payload, "markerType") ?? property(payload, "marker_type")) ?? asString(property(property(premiereModule(), "Marker"), "MARKER_TYPE_COMMENT"));
       if (!markerType) unavailable("Premiere marker type");
-      const action = createAction.call(
+      const action = () => createAction.call(
         markers,
         asString(property(payload, "name")) ?? "",
         markerType,

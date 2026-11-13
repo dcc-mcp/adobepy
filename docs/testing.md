@@ -157,6 +157,12 @@ the manifest, creates the archive, and writes the SHA256 file.
 - Bridge protocol tests: run bundled bridge JavaScript in Node VM contexts with
   mocked host modules and WebSocket transport, without requiring Adobe apps in
   CI.
+- Photoshop targeting tests give two open documents the same layer ID and keep
+  the requested layer unselected. They check document-bound commands and replies,
+  refusal of ambiguous legacy IDs, and Python target preservation across calls.
+- Premiere mutation fixtures require action construction inside `lockedAccess`,
+  covering bin, marker, insert and overwrite factories. These are contract mocks,
+  not evidence of native host acceptance.
 - Premiere export tests: mock coverage verifies EncoderManager/Exporter RPC
   dispatch, option pass-through, capability snapshots, and normalized export job
   metadata. A live Premiere host is still required to prove actual media output,

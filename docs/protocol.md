@@ -318,6 +318,14 @@ token disables auth only for local development tests.
 
 ## Modal And Timeout Behavior
 
+Photoshop layer snapshots include `documentId` from the native layer's owning
+document. Smart-object methods accept `{ "layerId": 7, "documentId": 9 }` as
+their first argument; `replaceContents` keeps its input path as the second.
+The Python facade carries that target through document, child-layer and mutation
+proxies. Use the matching bundled bridge with the SDK. Legacy scalar layer IDs
+remain accepted only when they resolve to one open document; ambiguous IDs and
+missing explicit document targets fail before mutation.
+
 Mutating methods should expose `options.modal = true` or use a facade method
 that sets it internally. UXP hosts should route those calls through
 `executeAsModal`; CEP hosts should keep the behavior explicit in their
