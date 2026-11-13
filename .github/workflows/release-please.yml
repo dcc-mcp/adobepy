@@ -259,7 +259,7 @@ jobs:
               shasum -a 256 "$1" | cut -d' ' -f1
             fi
           }
-          build_dir=$(ls -d build/*/release/install 2>/dev/null | head -1)
+          build_dir=$(ls -d pyadobe/build/*/release/install 2>/dev/null | head -1)
           if [ -z "$build_dir" ]; then echo "PyOxidizer build output not found"; exit 1; fi
           echo "STANDALONE_BUILD_DIR=$build_dir" >> "$GITHUB_ENV"
           version=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
