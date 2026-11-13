@@ -7,6 +7,9 @@ name: Release
 # published from the UI can no longer publish to PyPI here, and keeping the
 # trigger would run four packaging jobs only to attach assets to a release
 # without publishing it. Publish with `workflow_dispatch` instead.
+#
+# macOS/Linux standalone assets are owned only by release-please.yml.
+# The Windows standalone job below remains available for manual rebuilds.
 on:
   workflow_dispatch:
     inputs:
@@ -152,6 +155,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.release_tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -167,7 +174,7 @@ jobs:
           python -m pip install pyoxidizer
           $wheel = (Get-ChildItem dist -Filter "adobepy-*.whl" | Select-Object -First 1).FullName
           if (-not $wheel) { throw "adobepy wheel was not built" }
-          pyoxidizer build --path pyadobe --var ADOBEPY_WHEEL "$wheel"
+          pyoxidizer build --release --path pyadobe --var ADOBEPY_WHEEL "$wheel"
       - name: Locate build output and package
         shell: pwsh
         run: |
@@ -205,130 +212,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.resolve-target.outputs.tag }}
 
-  macos-standalone-package:
-    needs:
-      - resolve-target
-    name: Build macOS standalone interpreter (PyOxidizer)
-    runs-on: macos-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.release_tag || github.ref }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build adobepy wheel
-        shell: bash
-        run: |
-          python3 -m pip install --upgrade build wheel
-          python3 -m build --wheel --outdir dist
-      - name: Build standalone interpreter with PyOxidizer
-        shell: bash
-        run: |
-          python3 -m pip install pyoxidizer
-          wheel=$(ls dist/adobepy-*.whl 2>/dev/null | head -1)
-          if [ -z "$wheel" ]; then echo "adobepy wheel was not built"; exit 1; fi
-          wheel_abs="$(cd "$(dirname "$wheel")" && pwd)/$(basename "$wheel")"
-          pyoxidizer build --path pyadobe --var ADOBEPY_WHEEL "$wheel_abs"
-      - name: Locate build output and package
-        shell: bash
-        run: |
-          build_dir=$(ls -d build/*/release/install 2>/dev/null | head -1)
-          if [ -z "$build_dir" ]; then echo "PyOxidizer build output not found"; exit 1; fi
-          echo "STANDALONE_BUILD_DIR=$build_dir" >> $GITHUB_ENV
-          arch="$(uname -m)"
-          if [ "$arch" = "arm64" ]; then runtime_id="macos-arm64"; else runtime_id="macos-x64"; fi
-          version=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
-          package_name="adobepy-standalone-$version-$runtime_id"
-          dist_dir="${{ github.workspace }}/dist"
-          mkdir -p "$dist_dir"
-          (cd "$build_dir" && zip -r "$dist_dir/$package_name.zip" .)
-          hash=$(sha256sum "$dist_dir/$package_name.zip" | cut -d' ' -f1)
-          echo "$hash  $package_name.zip" > "$dist_dir/$package_name.zip.sha256"
-      - name: Smoke test standalone interpreter
-        shell: bash
-        run: |
-          "$STANDALONE_BUILD_DIR/adobepy-python" -c "import sys; from adobe.photoshop import Photoshop; assert sys.version_info >= (3, 8); print('standalone smoke OK')"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: adobepy-standalone-macos
-          path: |
-            dist/adobepy-standalone-*.zip
-            dist/adobepy-standalone-*.zip.sha256
-      - name: Upload to GitHub Release
-        if: needs.resolve-target.outputs.tag != ''
-        shell: bash
-        run: |
-          assets=$(ls dist/adobepy-standalone-*.zip dist/adobepy-standalone-*.zip.sha256 2>/dev/null | tr '\n' ' ')
-          if [ -z "$assets" ]; then echo "No standalone release assets found in dist/"; exit 1; fi
-          gh release upload "$TAG" $assets --clobber
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.resolve-target.outputs.tag }}
-
-  linux-standalone-package:
-    needs:
-      - resolve-target
-    name: Build Linux standalone interpreter (PyOxidizer)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.release_tag || github.ref }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build adobepy wheel
-        shell: bash
-        run: |
-          python3 -m pip install --upgrade build wheel
-          python3 -m build --wheel --outdir dist
-      - name: Build standalone interpreter with PyOxidizer
-        shell: bash
-        run: |
-          python3 -m pip install pyoxidizer
-          wheel=$(ls dist/adobepy-*.whl 2>/dev/null | head -1)
-          if [ -z "$wheel" ]; then echo "adobepy wheel was not built"; exit 1; fi
-          wheel_abs="$(cd "$(dirname "$wheel")" && pwd)/$(basename "$wheel")"
-          pyoxidizer build --path pyadobe --var ADOBEPY_WHEEL "$wheel_abs"
-      - name: Locate build output and package
-        shell: bash
-        run: |
-          build_dir=$(ls -d build/*/release/install 2>/dev/null | head -1)
-          if [ -z "$build_dir" ]; then echo "PyOxidizer build output not found"; exit 1; fi
-          echo "STANDALONE_BUILD_DIR=$build_dir" >> $GITHUB_ENV
-          arch="$(uname -m)"
-          if [ "$arch" = "aarch64" ]; then runtime_id="linux-arm64"; else runtime_id="linux-x64"; fi
-          version=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
-          package_name="adobepy-standalone-$version-$runtime_id"
-          dist_dir="${{ github.workspace }}/dist"
-          mkdir -p "$dist_dir"
-          (cd "$build_dir" && zip -r "$dist_dir/$package_name.zip" .)
-          hash=$(sha256sum "$dist_dir/$package_name.zip" | cut -d' ' -f1)
-          echo "$hash  $package_name.zip" > "$dist_dir/$package_name.zip.sha256"
-      - name: Smoke test standalone interpreter
-        shell: bash
-        run: |
-          "$STANDALONE_BUILD_DIR/adobepy-python" -c "import sys; from adobe.photoshop import Photoshop; assert sys.version_info >= (3, 8); print('standalone smoke OK')"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: adobepy-standalone-linux
-          path: |
-            dist/adobepy-standalone-*.zip
-            dist/adobepy-standalone-*.zip.sha256
-      - name: Upload to GitHub Release
-        if: needs.resolve-target.outputs.tag != ''
-        shell: bash
-        run: |
-          assets=$(ls dist/adobepy-standalone-*.zip dist/adobepy-standalone-*.zip.sha256 2>/dev/null | tr '\n' ' ')
-          if [ -z "$assets" ]; then echo "No standalone release assets found in dist/"; exit 1; fi
-          gh release upload "$TAG" $assets --clobber
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.resolve-target.outputs.tag }}
+  # macOS/Linux standalone assets have one publisher: release-please.yml.

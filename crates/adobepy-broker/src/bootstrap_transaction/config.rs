@@ -1159,11 +1159,35 @@ fn remove_owned_config_platform(file: fs::File, path: &Path) -> anyhow::Result<(
 mod tests {
     use super::*;
 
+    /// Fresh directory under the system temp dir, with symlinks resolved.
+    ///
+    /// `FileReceipt` rejects any configuration whose parent path contains a
+    /// symlink, and on macOS the system temp dir is reached through one:
+    /// `TMPDIR` is `/var/folders/...`, a symlink to `/private/var/folders/...`.
+    /// Creating a directory under the unresolved `temp_dir()` therefore yields
+    /// a parent chain that the production guard rejects, and every test that
+    /// captures a receipt inside it fails — on macOS only. Canonicalizing here
+    /// keeps the guard's own coverage intact: it still rejects a symlink that a
+    /// test introduces deliberately, because that one is created after this
+    /// call.
+    fn isolated_dir(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "adobepy-config-{label}-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        match fs::canonicalize(&root) {
+            Ok(canonical) => canonical,
+            // `canonicalize` needs the path to exist, which it does, so a
+            // failure here is environmental rather than a test condition. Fall
+            // back to the unresolved root instead of masking it.
+            Err(_) => root,
+        }
+    }
+
     #[test]
     fn receipt_rejects_same_identity_growth_beyond_the_bound_after_metadata() {
-        let root =
-            std::env::temp_dir().join(format!("adobepy-config-growth-{}", Uuid::new_v4().simple()));
-        fs::create_dir(&root).unwrap();
+        let root = isolated_dir("growth");
         let config = root.join("config.js");
         fs::write(&config, b"x").unwrap();
         let grow_path = config.clone();
@@ -1187,11 +1211,7 @@ mod tests {
 
     #[test]
     fn begin_recapture_io_error_releases_exact_reservation() {
-        let root = std::env::temp_dir().join(format!(
-            "adobepy-config-begin-recapture-{}",
-            Uuid::new_v4().simple()
-        ));
-        fs::create_dir(&root).unwrap();
+        let root = isolated_dir("begin-recapture");
         let config = root.join("config.js");
         fs::write(&config, b"old").unwrap();
         let owner = ConfigTransactionOwner::default();
@@ -1217,11 +1237,7 @@ mod tests {
 
     #[test]
     fn begin_recapture_cleanup_preserves_a_concurrent_new_owner_token() {
-        let root = std::env::temp_dir().join(format!(
-            "adobepy-config-begin-replacement-{}",
-            Uuid::new_v4().simple()
-        ));
-        fs::create_dir(&root).unwrap();
+        let root = isolated_dir("begin-replacement");
         let config = root.join("config.js");
         let replacement_config = root.join("replacement.js");
         fs::write(&config, b"old").unwrap();
@@ -1273,11 +1289,7 @@ mod tests {
 
     #[test]
     fn activate_rejects_an_identity_swap_after_the_final_recapture() {
-        let root = std::env::temp_dir().join(format!(
-            "adobepy-config-recapture-{}",
-            Uuid::new_v4().simple()
-        ));
-        fs::create_dir(&root).unwrap();
+        let root = isolated_dir("recapture");
         let config = root.join("config.js");
         fs::write(&config, b"old").unwrap();
         let owner = ConfigTransactionOwner::default();
@@ -1304,11 +1316,7 @@ mod tests {
 
     #[test]
     fn authoritative_confirmation_moves_active_ownership_to_pending_publication() {
-        let root = std::env::temp_dir().join(format!(
-            "adobepy-config-confirmation-state-{}",
-            Uuid::new_v4().simple()
-        ));
-        fs::create_dir(&root).unwrap();
+        let root = isolated_dir("confirmation-state");
         let config = root.join("config.js");
         fs::write(&config, b"old").unwrap();
         let owner = ConfigTransactionOwner::default();
