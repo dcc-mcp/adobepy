@@ -2245,7 +2245,7 @@ mod tests {
     #[test]
     #[ignore = "launched only by the nested owned-host integration regression"]
     fn nested_owned_host_parent_fixture() {
-        let descendant = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
                 "--exact",
@@ -2257,9 +2257,8 @@ mod tests {
         let marker =
             std::env::temp_dir().join(format!("adobepy-owned-host-{}.ready", std::process::id()));
         fs::write(&marker, descendant.id().to_string()).unwrap();
-        loop {
-            std::thread::park();
-        }
+        let _ = descendant.wait();
+        let _ = fs::remove_file(marker);
     }
 
     #[cfg(windows)]
