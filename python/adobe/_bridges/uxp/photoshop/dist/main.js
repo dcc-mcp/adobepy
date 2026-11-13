@@ -762,7 +762,7 @@
     const references = [layerReference(layerId), { _ref: "document", _id: documentId }];
     const commands = [{ ...selection, _target: references }, ...descriptors.map((descriptor) => ({ ...descriptor, _target: references }))];
     await runBatchPlay(request, commands, {}, defaultCommandName);
-    return serializeLayer(asArray(property(document, "activeLayers"))[0] ?? findLayerInTree(property(document, "layers"), layerId) ?? layer);
+    return serializeLayer(findLayerInTree(property(document, "layers"), layerId) ?? layer);
   }
   async function exportWithPreset(request) {
     const payload = requestPayload(request);

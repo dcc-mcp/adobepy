@@ -1533,7 +1533,8 @@ async function testNativeReviewRegressions() {
   });
   const activeLayer = { id: 1, name: "User layer" };
   const requestedLayer = { id: 7, name: "Requested" };
-  const owner = { id: 9, layers: [requestedLayer], activeLayers: [requestedLayer] };
+  const ownerSelectedLayer = { id: 8, name: "Another selected layer" };
+  const owner = { id: 9, layers: [requestedLayer, ownerSelectedLayer], activeLayers: [ownerSelectedLayer] };
   const app = { activeDocument: { id: 2, layers: [activeLayer], activeLayers: [activeLayer] }, documents: [owner] };
   app.documents.unshift(app.activeDocument);
   let pickerCalls = 0;
