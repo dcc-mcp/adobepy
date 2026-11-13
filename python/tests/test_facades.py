@@ -20,6 +20,8 @@ class CapturingClient:
 
     def call(self, host, namespace, method, args=None, options=None, target=None):
         self.calls.append({"host": host, "namespace": namespace, "method": method, "args": list(args or []), "options": options or {}})
+        if host == "photoshop" and namespace in {"layer", "text", "filter"} and args and isinstance(args[0], dict):
+            args = [args[0]["layerId"], *args[1:]]
         if namespace == "app":
             if method == "getDocuments":
                 return [{"id": 7, "name": "demo", "path": "C:/demo", "width": 100, "height": 50}]
@@ -115,7 +117,7 @@ class CapturingClient:
                 "paragraphStyle": {"justification": "left", "hyphenation": False},
             }
             if method == "getActive":
-                return payload
+                return {"documentId": 7, **payload}
             if method == "getByLayerId":
                 return payload if args[0] == 11 else None
             if method == "setContents":
@@ -1078,6 +1080,32 @@ class CapturingClient:
 
 
 class FacadeTests(unittest.TestCase):
+    def test_all_photoshop_layer_calls_preserve_document_scope(self):
+        client = CapturingClient()
+        session = PhotoshopSession(client)
+        layer = session.app.active_document.layers[0]
+        child = layer.layers[0]
+        self.assertEqual(client.calls[-1]["args"][0], {"layerId": 11, "documentId": 7})
+        child.hide()
+        self.assertEqual(client.calls[-1]["args"][0][0]["_target"], [{"_ref": "layer", "_id": 12}, {"_ref": "document", "_id": 7}])
+        for operation in (lambda: layer.filters.apply_gaussian_blur(2), lambda: layer.filters.apply("applyHighPass", 2)):
+            operation()
+            self.assertEqual(client.calls[-1]["args"][0], {"layerId": 11, "documentId": 7})
+        text = layer.text_item
+        self.assertEqual(client.calls[-1]["args"][0], {"layerId": 11, "documentId": 7})
+        for operation in (text.refresh, lambda: text.set_contents("Scoped"), lambda: text.character_style.update(size=32), lambda: text.paragraph_style.update(justification="center"), lambda: session.app.active_text.set_contents("Active")):
+            operation()
+            self.assertEqual(client.calls[-1]["args"][0], {"layerId": 11, "documentId": 7})
+        layer.hide()
+        self.assertIn({"_ref": "document", "_id": 7}, client.calls[-1]["args"][0][0]["_target"])
+        for payload in ({"id": 11}, {"documentId": 7}):
+            unbound = PhotoshopLayerProxy(session, payload)
+            for operation in (lambda: unbound.layers, lambda: unbound.text_item, unbound.hide, lambda: unbound.filters.apply_sharpen(), lambda: unbound.smart_object.edit_contents()):
+                before = len(client.calls)
+                with self.assertRaisesRegex(ValueError, "identity"):
+                    operation()
+                self.assertEqual(len(client.calls), before)
+
     def test_smart_object_targets_owning_document_across_calls(self):
         client = CapturingClient()
         layer = PhotoshopLayerProxy(PhotoshopSession(client), {"id": 11, "documentId": 7})

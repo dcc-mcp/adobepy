@@ -319,12 +319,15 @@ token disables auth only for local development tests.
 ## Modal And Timeout Behavior
 
 Photoshop layer snapshots include `documentId` from the native layer's owning
-document. Smart-object methods accept `{ "layerId": 7, "documentId": 9 }` as
-their first argument; `replaceContents` keeps its input path as the second.
-The Python facade carries that target through document, child-layer and mutation
-proxies. Use the matching bundled bridge with the SDK. Legacy scalar layer IDs
-remain accepted only when they resolve to one open document; ambiguous IDs and
-missing explicit document targets fail before mutation.
+document; text snapshots include the same owning `documentId`. Layer-child,
+text-by-layer, filter and smart-object methods require
+`{ "layerId": 7, "documentId": 9 }` as their first argument; later arguments
+retain their positions. The Python facade carries this context through document,
+nested-layer, text, style and mutation proxies, including document references in
+layer `hide` descriptors. Use the matching bundled bridge with the SDK.
+ID-only raw calls and missing document/layer identities now fail explicitly,
+even if a layer ID is unique. They never fall back to the active document or
+layer. Explicit `getActive` read methods still return the current selection.
 
 Mutating methods should expose `options.modal = true` or use a facade method
 that sets it internally. UXP hosts should route those calls through

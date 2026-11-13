@@ -61,6 +61,8 @@ class CapturingClient:
                 "target": target,
             }
         )
+        if namespace in {"layer", "text", "filter"} and args and isinstance(args[0], dict):
+            args = [args[0]["layerId"], *args[1:]]
         if namespace == "app" and method == "getDocuments":
             return [{"id": 7, "name": "hero.psd"}]
         if namespace == "document" and method == "getActive":
@@ -74,7 +76,7 @@ class CapturingClient:
         if namespace == "layer" and method == "getActive":
             return {"id": 11, "documentId": 7, "name": "Hero", "kind": "text", "visible": True}
         if namespace == "text" and method in {"getByLayerId", "getActive"}:
-            return {"layerId": 11, "contents": "Old", "characterStyle": {}, "paragraphStyle": {}}
+            return {"layerId": 11, "documentId": 7, "contents": "Old", "characterStyle": {}, "paragraphStyle": {}}
         if namespace == "text" and method in {"setContents", "setCharacterStyle", "setParagraphStyle"}:
             return {"layerId": args[0], "contents": args[1] if method == "setContents" else "Old", "characterStyle": {}, "paragraphStyle": {}}
         if namespace == "filter":

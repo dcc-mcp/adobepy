@@ -230,6 +230,10 @@ async function testPhotoshopBridge() {
       jpg: async (entry, options, asCopy) => events.push({ kind: "saveAs", url: entry.url, options, asCopy })
     }
   };
+  for (const layer of document.layers) {
+    layer.document = document;
+    for (const child of layer.layers ?? []) child.document = document;
+  }
   const env = await loadBundle("bridges/uxp/photoshop/dist/main.js", {
     photoshop: {
       app: { version: "26.5.1", activeDocument: document, documents: [document], SolidColor },
@@ -304,7 +308,7 @@ async function testPhotoshopBridge() {
   assert.strictEqual(result(await rpc(env, "photoshop", "document", "getLayers", [9]))[1].hasChildren, true);
   assert.strictEqual(result(await rpc(env, "photoshop", "document", "getActiveLayers", [9]))[0].opacity, 80);
   assert.strictEqual(result(await rpc(env, "photoshop", "layer", "getActive")).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "layer", "getChildren", [8]))[0].name, "Child");
+  assert.strictEqual(result(await rpc(env, "photoshop", "layer", "getChildren", [{ layerId: 8, documentId: 9 }]))[0].name, "Child");
   assert.strictEqual(result(await rpc(env, "photoshop", "selection", "get", [9])).bounds.right, 100);
   assert.strictEqual(
     result(await rpc(env, "photoshop", "selection", "selectRectangle", [9, { top: 4, left: 5, bottom: 9, right: 10 }, null, 0, true], { modal: true })).bounds.left,
@@ -319,28 +323,28 @@ async function testPhotoshopBridge() {
   assert.strictEqual(result(await rpc(env, "photoshop", "channel", "add", [9, "Mask"], { modal: true })).name, "Mask");
   assert.strictEqual(result(await rpc(env, "photoshop", "channel", "remove", [9, 21], { modal: true })).id, 21);
   assert.strictEqual(result(await rpc(env, "photoshop", "text", "getActive")).contents, "Hello");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "getByLayerId", [7])).characterStyle.size, 24);
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setContents", [7, "World"], { modal: true })).contents, "World");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setCharacterStyle", [7, { size: 36, tracking: 20 }], { modal: true })).characterStyle.size, 36);
-  await rpc(env, "photoshop", "text", "setCharacterStyle", [7, { color: { rgb: { red: 77, green: 232, blue: 255 } } }], { modal: true });
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "getByLayerId", [{ layerId: 7, documentId: 9 }])).characterStyle.size, 24);
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setContents", [{ layerId: 7, documentId: 9 }, "World"], { modal: true })).contents, "World");
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setCharacterStyle", [{ layerId: 7, documentId: 9 }, { size: 36, tracking: 20 }], { modal: true })).characterStyle.size, 36);
+  await rpc(env, "photoshop", "text", "setCharacterStyle", [{ layerId: 7, documentId: 9 }, { color: { rgb: { red: 77, green: 232, blue: 255 } } }], { modal: true });
   assert.ok(textItem.characterStyle.color instanceof SolidColor);
   assert.deepStrictEqual(textItem.characterStyle.color.rgb, { red: 77, green: 232, blue: 255 });
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setParagraphStyle", [7, { justification: "center" }], { modal: true })).paragraphStyle.justification, "center");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setTextClickPoint", [7, { x: 4, y: 5 }], { modal: true })).textClickPoint.x, 4);
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setOrientation", [7, "vertical"], { modal: true })).orientation, "vertical");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "resetCharacterStyle", [7], { modal: true })).typename, "TextItem");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToParagraphText", [7], { modal: true })).isParagraphText, true);
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToPointText", [7], { modal: true })).isPointText, true);
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToShape", [7], { modal: true })).typename, "TextItem");
-  assert.strictEqual(result(await rpc(env, "photoshop", "text", "createWorkPath", [7], { modal: true })).typename, "TextItem");
-  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applyGaussianBlur", [7, 2], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "apply", [7, "applyHighPass", 4], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySharpen", [7], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySmartBlur", [7, 3, 12, "high"], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "convertToSmartObject", [7], { modal: true })).isSmartObject, true);
-  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "newSmartObjectViaCopy", [7], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "editContents", [7], { modal: true })).id, 7);
-  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "replaceContents", [7, "C:/replacement.psb"], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setParagraphStyle", [{ layerId: 7, documentId: 9 }, { justification: "center" }], { modal: true })).paragraphStyle.justification, "center");
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setTextClickPoint", [{ layerId: 7, documentId: 9 }, { x: 4, y: 5 }], { modal: true })).textClickPoint.x, 4);
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "setOrientation", [{ layerId: 7, documentId: 9 }, "vertical"], { modal: true })).orientation, "vertical");
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "resetCharacterStyle", [{ layerId: 7, documentId: 9 }], { modal: true })).typename, "TextItem");
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToParagraphText", [{ layerId: 7, documentId: 9 }], { modal: true })).isParagraphText, true);
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToPointText", [{ layerId: 7, documentId: 9 }], { modal: true })).isPointText, true);
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "convertToShape", [{ layerId: 7, documentId: 9 }], { modal: true })).typename, "TextItem");
+  assert.strictEqual(result(await rpc(env, "photoshop", "text", "createWorkPath", [{ layerId: 7, documentId: 9 }], { modal: true })).typename, "TextItem");
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applyGaussianBlur", [{ layerId: 7, documentId: 9 }, 2], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "apply", [{ layerId: 7, documentId: 9 }, "applyHighPass", 4], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySharpen", [{ layerId: 7, documentId: 9 }], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "filter", "applySmartBlur", [{ layerId: 7, documentId: 9 }, 3, 12, "high"], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "convertToSmartObject", [{ layerId: 7, documentId: 9 }], { modal: true })).isSmartObject, true);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "newSmartObjectViaCopy", [{ layerId: 7, documentId: 9 }], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "editContents", [{ layerId: 7, documentId: 9 }], { modal: true })).id, 7);
+  assert.strictEqual(result(await rpc(env, "photoshop", "smartObject", "replaceContents", [{ layerId: 7, documentId: 9 }, "C:/replacement.psb"], { modal: true })).id, 7);
   assert.strictEqual(result(await rpc(env, "photoshop", "export", "getPresets"))[0].name, "png");
   const exportResult = result(await rpc(env, "photoshop", "export", "exportWithPreset", [{ id: 9, path: "C:/out.jpg", preset: "jpg_high", options: { quality: 10 } }], { modal: true }));
   assert.strictEqual(exportResult.id, 9);
@@ -1548,6 +1552,12 @@ async function testNativeReviewRegressions() {
   const collidingLayer = { id: 7, name: "Same ID in another document", document: app.activeDocument };
   app.activeDocument.layers.push(collidingLayer);
   requestedLayer.document = owner;
+  const layerCalls = [];
+  requestedLayer.textItem = { parent: requestedLayer, contents: "Owner" };
+  requestedLayer.applyGaussianBlur = async () => { layerCalls.push(9); };
+  requestedLayer.layers = [{ id: 77, name: "Nested", document: owner }];
+  collidingLayer.textItem = { parent: collidingLayer, contents: "User" };
+  collidingLayer.applyGaussianBlur = async () => { layerCalls.push(2); };
   app.documents.unshift(app.activeDocument);
   let pickerCalls = 0;
   const commands = [];
@@ -1566,9 +1576,26 @@ async function testNativeReviewRegressions() {
     assert.strictEqual(returned.documentId, 9);
     for (const command of commands) assert.ok(command._target.some((target) => target._ref === "document" && target._id === owner.id));
   });
-  await check("ambiguous legacy layer ID refuses to mutate", async () => {
+  await check("all layer handlers bind the owning document", async () => {
+    const target = { layerId: 7, documentId: 9 };
+    assert.strictEqual(result(await rpc(ps, "photoshop", "layer", "getChildren", [target]))[0].documentId, 9);
+    assert.strictEqual(result(await rpc(ps, "photoshop", "filter", "applyGaussianBlur", [target, 2])).documentId, 9);
+    assert.deepStrictEqual(layerCalls, [9]);
+    assert.strictEqual(result(await rpc(ps, "photoshop", "text", "getByLayerId", [target])).documentId, 9);
+    assert.strictEqual(result(await rpc(ps, "photoshop", "text", "setContents", [target, "Changed"])).documentId, 9);
+    assert.strictEqual(collidingLayer.textItem.contents, "User");
+    for (const [namespace, method] of [["layer", "getChildren"], ["text", "getByLayerId"], ["text", "setContents"], ["filter", "applyGaussianBlur"], ["smartObject", "editContents"]]) {
+      for (const argument of [7, 1, undefined, { layerId: 7 }, { documentId: 9 }, { layerId: 7, documentId: 999 }]) {
+        assert.strictEqual(error(await rpc(ps, "photoshop", namespace, method, [argument])).code, -32004);
+      }
+    }
+    assert.deepStrictEqual(layerCalls, [9]);
+  });
+  await check("legacy layer IDs refuse to mutate", async () => {
     commands.length = 0;
     assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [7])).code, -32004);
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [1])).code, -32004);
+    assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [])).code, -32004);
     assert.strictEqual(commands.length, 0);
     assert.strictEqual(error(await rpc(ps, "photoshop", "smartObject", "editContents", [{ layerId: 7, documentId: 999 }])).code, -32004);
     assert.strictEqual(commands.length, 0);

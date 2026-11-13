@@ -151,8 +151,8 @@ export const photoshopAdapter: HostAdapter = {
     if (request.namespace === "channel" && request.method === "getByName") return channelByName(request);
     if (request.namespace === "channel" && request.method === "add") return channelAdd(request);
     if (request.namespace === "channel" && request.method === "remove") return channelRemove(request);
-    if (request.namespace === "text" && request.method === "getActive") return serializeTextItem(textItemForLayer(undefined));
-    if (request.namespace === "text" && request.method === "getByLayerId") return serializeTextItem(textItemForLayer(request.args?.[0]));
+    if (request.namespace === "text" && request.method === "getActive") return serializeTextItem(textItemForLayer(activeLayer()));
+    if (request.namespace === "text" && request.method === "getByLayerId") return serializeTextItem(textItemForLayer(findLayer(request.args?.[0])));
     if (request.namespace === "text" && request.method === "setContents") return textSetProperty(request, "contents", request.args?.[1], "Set text contents");
     if (request.namespace === "text" && request.method === "setTextClickPoint") {
       return textSetProperty(request, "textClickPoint", request.args?.[1], "Set text click point");
@@ -317,8 +317,10 @@ function safeProperty(target: unknown, name: string): unknown {
 
 function serializeTextItem(textItem: unknown, layer?: unknown) {
   if (!isObject(textItem)) return null;
+  const owner = layer ?? property(textItem, "parent");
   return {
-    layerId: property(layer, "id") ?? property(property(textItem, "parent"), "id"),
+    layerId: property(owner, "id"),
+    documentId: property(property(owner, "document"), "id"),
     contents: asString(property(textItem, "contents")),
     isParagraphText: property(textItem, "isParagraphText"),
     isPointText: property(textItem, "isPointText"),
@@ -594,14 +596,10 @@ async function smartObjectReplaceContents(request: RpcRequest) {
 }
 
 async function smartObjectBatchPlay(request: RpcRequest, descriptors: Record<string, unknown>[], defaultCommandName: string) {
-  const argument = request.args?.[0];
-  const id = isObject(argument) ? property(argument, "layerId") : argument;
-  const documentId = isObject(argument) ? property(argument, "documentId") : undefined;
-  if (isObject(argument) && (documentId === undefined || documentId === null)) unavailable("Photoshop layer owning document");
-  const target = findLayerTarget(id, documentId);
+  const target = findLayerTarget(request.args?.[0]);
   if (!target?.layer) unavailable("Photoshop layer");
   const { layer, document } = target;
-  const layerId = property(layer, "id") ?? id;
+  const layerId = property(layer, "id");
   const ownerId = asNumber(property(document, "id"));
   if (ownerId === undefined) unavailable("Photoshop layer owning document");
   const selection = selectLayerDescriptor(layerId);
@@ -639,25 +637,20 @@ function exportPreset(name: string) {
 }
 
 function findLayer(id: unknown) {
-  return findLayerTarget(id)?.layer;
+  const target = findLayerTarget(id);
+  if (!target?.layer) unavailable("Photoshop layer in owning document");
+  return target.layer;
 }
 
-function findLayerTarget(id: unknown, documentId?: unknown) {
-  if (documentId !== undefined && documentId !== null) {
-    const document = findDocument(documentId);
-    const layer = findLayerInTree(property(document, "layers"), id) ?? findLayerInTree(property(document, "activeLayers"), id);
-    return layer ? { document, layer } : undefined;
+function findLayerTarget(argument: unknown) {
+  const id = property(argument, "layerId");
+  const documentId = property(argument, "documentId");
+  if ((typeof id !== "number" && typeof id !== "string") || (typeof documentId !== "number" && typeof documentId !== "string")) {
+    unavailable("Photoshop layer target requires layerId and owning documentId");
   }
-  if (id === undefined || id === null) return { document: activeDocument(), layer: activeLayer() };
-  let target: { document: unknown; layer: unknown } | undefined;
-  for (const document of openDocuments()) {
-    const match = findLayerInTree(property(document, "layers"), id) ?? findLayerInTree(property(document, "activeLayers"), id);
-    if (match) {
-      if (target) unavailable("Photoshop ambiguous layer ID; provide the owning document");
-      target = { document, layer: match };
-    }
-  }
-  return target;
+  const document = findDocument(documentId);
+  const layer = findLayerInTree(property(document, "layers"), id) ?? findLayerInTree(property(document, "activeLayers"), id);
+  return layer ? { document, layer } : undefined;
 }
 
 function isSmartObjectLayer(layer: unknown): boolean {
@@ -670,8 +663,7 @@ function isSmartObjectLayer(layer: unknown): boolean {
   }
 }
 
-function textItemForLayer(layerId: unknown) {
-  const layer = findLayer(layerId);
+function textItemForLayer(layer: unknown) {
   if (!layer) return undefined;
   try {
     return property(layer, "textItem");
@@ -681,7 +673,7 @@ function textItemForLayer(layerId: unknown) {
 }
 
 function requiredTextItem(layerId: unknown) {
-  const textItem = textItemForLayer(layerId);
+  const textItem = textItemForLayer(findLayer(layerId));
   if (!textItem) unavailable("Photoshop layer.textItem");
   return textItem;
 }
