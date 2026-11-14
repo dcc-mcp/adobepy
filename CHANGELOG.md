@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.14.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.13.0...adobepy-v0.14.0) (2026-11-14)
+
+
+### Features
+
+* bundle built bridge templates in the wheel ([#93](https://github.com/dcc-mcp/adobepy/issues/93)) ([2cb865f](https://github.com/dcc-mcp/adobepy/commit/2cb865f715fe0f8cdd446cceca1d3ef3d8ff7d1f))
+* publish standalone platform assets ([#92](https://github.com/dcc-mcp/adobepy/issues/92)) ([a76d2fa](https://github.com/dcc-mcp/adobepy/commit/a76d2faea40d95a254389580b2b64bf1835b4caf))
+* show truthful Adobe bridge lifecycle status ([4142914](https://github.com/dcc-mcp/adobepy/commit/41429142bc8a8b98a7380854d5de327981ea0928))
+
+
+### Bug Fixes
+
+* bound DOM dispatch member reads to the shared safe-member helper ([655b4df](https://github.com/dcc-mcp/adobepy/commit/655b4df8909b77a5b18d8f26a178326ef3509565))
+* harden Premiere native collections, ID serialization, and bridge frame handling ([9b42c4f](https://github.com/dcc-mcp/adobepy/commit/9b42c4f63482e610cf75772dbde9cf0d9a7af1e2))
+* preserve deadline cleanup and locate standalone output ([7a9ec4f](https://github.com/dcc-mcp/adobepy/commit/7a9ec4fb1a9ccdaeaa43a2755184235da84b86d0))
+* repair Premiere queries and report bridge lifecycle status ([efe0424](https://github.com/dcc-mcp/adobepy/commit/efe0424f3eb3c39e053066f3cdb20609e84ba8fa))
+* repair Premiere queries and report bridge lifecycle status ([#110](https://github.com/dcc-mcp/adobepy/issues/110)) ([efe0424](https://github.com/dcc-mcp/adobepy/commit/efe0424f3eb3c39e053066f3cdb20609e84ba8fa))
+* repair Premiere UXP queries and bridge entrypoints ([31d0e3e](https://github.com/dcc-mcp/adobepy/commit/31d0e3ef334d65ddc9ce6ea2843e0cd214b525d2))
+* unblock standalone release validation ([a17134a](https://github.com/dcc-mcp/adobepy/commit/a17134a2f86869ab640fcab761caa00c5d388b82))
+
 ## [0.13.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.12.0...adobepy-v0.13.0) (2026-11-05)
 
 
