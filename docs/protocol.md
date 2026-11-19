@@ -64,7 +64,7 @@ Every bridge must send a first WebSocket message:
   "identity": {
     "host": {
       "pid": 4200,
-      "processStartIdentity": "windows:133700000000000100",
+      "processStartIdentity": "windows-filetime:133700000000000100",
       "executablePath": "C:/Adobe/Photoshop.exe",
       "hostVersion": "26.0",
       "profileId": "profile-production"
@@ -107,7 +107,11 @@ content-type: application/json
 
 The response binds the broker PID/start identity/executable/version/instance,
 the host PID/start identity/executable/version/profile, and the bridge
-target/kind/version/connection epoch/instance/plugin root/module origin. The
+target/kind/version/connection ID/connection epoch/instance/plugin root/module
+origin. `connectionId` is a broker-assigned generation and remains unique when
+two reconnects share the same millisecond epoch. The module origin must come
+from a host-observable loaded-module URL. If the host cannot provide that fact,
+the bridge omits it and exact identity attestation returns unavailable. The
 token is never part of the response. `BrokerClient.runtime_identity()` and each
 host facade's `runtime_identity()` — for example `Photoshop.runtime_identity()`
 or `AfterEffects().runtime_identity()` — return a typed

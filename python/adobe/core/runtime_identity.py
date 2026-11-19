@@ -132,6 +132,7 @@ class BridgeRuntimeIdentity:
     target: str
     bridge_kind: str
     bridge_version: str
+    connection_id: int
     connected_at_epoch_ms: int
     instance_id: str
     installed_plugin_root: str
@@ -145,6 +146,7 @@ class BridgeRuntimeIdentity:
                 "target",
                 "bridgeKind",
                 "bridgeVersion",
+                "connectionId",
                 "connectedAtEpochMs",
                 "instanceId",
                 "installedPluginRoot",
@@ -171,6 +173,7 @@ class BridgeRuntimeIdentity:
             target=target,
             bridge_kind=bridge_kind,
             bridge_version=_bounded_text(value["bridgeVersion"], "bridge.bridgeVersion", 64),
+            connection_id=_positive_int(value["connectionId"], "bridge.connectionId", (1 << 64) - 1),
             connected_at_epoch_ms=_positive_int(
                 value["connectedAtEpochMs"], "bridge.connectedAtEpochMs", (1 << 64) - 1
             ),
@@ -184,6 +187,7 @@ class BridgeRuntimeIdentity:
             "target": self.target,
             "bridgeKind": self.bridge_kind,
             "bridgeVersion": self.bridge_version,
+            "connectionId": self.connection_id,
             "connectedAtEpochMs": self.connected_at_epoch_ms,
             "instanceId": self.instance_id,
             "installedPluginRoot": self.installed_plugin_root,

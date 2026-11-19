@@ -267,9 +267,12 @@ async function testPhotoshopBridge() {
   }, {
     __ADOBEPY_TARGET: "retouch",
     __ADOBEPY_BOOTSTRAP_NONCE: "e".repeat(64),
+    document: {
+      currentScript: { src: "file:///C:/UXP/External/com.adobepy.bridge.photoshop/dist/main.js" }
+    },
     __ADOBEPY_HOST_IDENTITY: {
       pid: 4200,
-      processStartIdentity: "windows:133700000000000100",
+      processStartIdentity: "windows-filetime:133700000000000100",
       executablePath: "C:/Adobe/Photoshop.exe",
       profileId: "profile-production"
     }
@@ -282,7 +285,7 @@ async function testPhotoshopBridge() {
   assert.deepStrictEqual(JSON.parse(JSON.stringify(env.sent[0].identity)), {
     host: {
       pid: 4200,
-      processStartIdentity: "windows:133700000000000100",
+      processStartIdentity: "windows-filetime:133700000000000100",
       executablePath: "C:/Adobe/Photoshop.exe",
       hostVersion: "26.5.1",
       profileId: "profile-production"
@@ -1417,7 +1420,11 @@ async function emitPhotoshopGeneratedConfigHello() {
         }
       }
     }
-  }, {}, generatedConfig);
+  }, {
+    document: {
+      currentScript: { src: "file:///C:/UXP/External/com.adobepy.bridge.photoshop/dist/main.js" }
+    }
+  }, generatedConfig);
   assert.strictEqual(env.sent.length, 1);
   assert.strictEqual(env.sent[0].type, "hello");
   process.stdout.write(JSON.stringify({ url: env.socket.url, hello: env.sent[0] }));

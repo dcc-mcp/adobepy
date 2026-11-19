@@ -80,6 +80,7 @@ export interface Capabilities {
 export interface BridgeSessionInfo {
   target: string;
   capabilities: Capabilities;
+  connectionId: number;
   connectedAtEpochMs: number;
 }
 
@@ -122,6 +123,7 @@ export interface BridgeRuntimeIdentity {
   target: string;
   bridgeKind: BridgeKind;
   bridgeVersion: string;
+  connectionId: number;
   connectedAtEpochMs: number;
   instanceId: string;
   installedPluginRoot: string;

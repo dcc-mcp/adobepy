@@ -3615,6 +3615,7 @@ async fn bridge_socket(mut socket: WebSocket, state: BrokerState, expected_host:
         BridgeSessionInfo {
             target,
             capabilities,
+            connection_id,
             connected_at_epoch_ms,
         },
     );
@@ -4167,6 +4168,7 @@ fn complete_runtime_identity(
             target: session.target.clone(),
             bridge_kind: session.capabilities.bridge_kind,
             bridge_version: session.capabilities.bridge_version.clone(),
+            connection_id: session.connection_id,
             connected_at_epoch_ms: session.connected_at_epoch_ms,
             instance_id: identity.bridge.instance_id.clone().expect("checked"),
             installed_plugin_root: identity
@@ -4196,6 +4198,7 @@ fn validate_runtime_identity_shape(
     let bridge_uuid = Uuid::parse_str(&identity.bridge.instance_id);
     let bridge_valid = is_bounded_identifier(&identity.bridge.target, 128)
         && is_bounded_text(&identity.bridge.bridge_version, 64)
+        && identity.bridge.connection_id > 0
         && identity.bridge.connected_at_epoch_ms > 0
         && bridge_uuid.is_ok_and(|instance| !instance.is_nil())
         && module_belongs_to_plugin(
@@ -4229,6 +4232,8 @@ fn validate_expected_identity(
         && actual.host.process_start_identity != expected.host.process_start_identity
     {
         Some("host.processStartIdentity")
+    } else if actual.bridge.connection_id != expected.bridge.connection_id {
+        Some("bridge.connectionId")
     } else if actual.bridge.connected_at_epoch_ms != expected.bridge.connected_at_epoch_ms {
         Some("bridge.connectedAtEpochMs")
     } else if actual.bridge.instance_id != expected.bridge.instance_id {
@@ -4834,7 +4839,7 @@ mod tests {
             Ok(LaunchedHostProcess::fake(
                 ObservedHostProcess {
                     pid: 4200,
-                    process_start_identity: "windows:133700000000000100".into(),
+                    process_start_identity: "windows-filetime:133700000000000100".into(),
                     executable_path: target.executable_path.clone(),
                 },
                 self.launch_live.clone(),
@@ -5167,7 +5172,7 @@ mod tests {
         BridgeIdentityClaim {
             host: adobepy_protocol::HostIdentityClaim {
                 pid: Some(4200),
-                process_start_identity: Some("windows:133700000000000100".into()),
+                process_start_identity: Some("windows-filetime:133700000000000100".into()),
                 executable_path: Some("C:/Adobe/Photoshop.exe".into()),
                 host_version: Some("26.5.1".into()),
                 profile_id: Some("profile-production".into()),
@@ -5200,7 +5205,7 @@ mod tests {
         BridgeIdentityClaim {
             host: adobepy_protocol::HostIdentityClaim {
                 pid: Some(4200),
-                process_start_identity: Some("windows:133700000000000100".into()),
+                process_start_identity: Some("windows-filetime:133700000000000100".into()),
                 executable_path: Some("C:/Program Files/Adobe/Adobe Illustrator 2026/Support Files/Contents/Windows/Illustrator.exe".into()),
                 host_version: Some("30.0.0".into()),
                 profile_id: Some("illustrator-production".into()),
@@ -5231,7 +5236,7 @@ mod tests {
         BridgeIdentityClaim {
             host: adobepy_protocol::HostIdentityClaim {
                 pid: Some(4200),
-                process_start_identity: Some("windows:133700000000000100".into()),
+                process_start_identity: Some("windows-filetime:133700000000000100".into()),
                 executable_path: Some("C:/Program Files/Adobe/After Effects 2025/Support Files/AfterFX.exe".into()),
                 host_version: Some("25.0.0".into()),
                 profile_id: Some("after-effects-production".into()),
@@ -5282,6 +5287,7 @@ mod tests {
             BridgeSessionInfo {
                 target: "illustration".into(),
                 capabilities: illustrator_caps(),
+                connection_id: 41,
                 connected_at_epoch_ms: 1_720_000_000_000,
             },
         );
@@ -5340,6 +5346,7 @@ mod tests {
             BridgeSessionInfo {
                 target: target.into(),
                 capabilities: caps(),
+                connection_id: 1,
                 connected_at_epoch_ms,
             },
         );
@@ -6077,6 +6084,7 @@ mod tests {
             BridgeSessionInfo {
                 target: DEFAULT_TARGET.into(),
                 capabilities: caps(),
+                connection_id: 1,
                 connected_at_epoch_ms: 1,
             },
         );
@@ -6116,6 +6124,7 @@ mod tests {
             BridgeSessionInfo {
                 target: DEFAULT_TARGET.into(),
                 capabilities: caps(),
+                connection_id: 1,
                 connected_at_epoch_ms: 1,
             },
         );
@@ -6154,6 +6163,7 @@ mod tests {
             BridgeSessionInfo {
                 target: DEFAULT_TARGET.into(),
                 capabilities: caps(),
+                connection_id: 1,
                 connected_at_epoch_ms: 1,
             },
         );
@@ -6231,7 +6241,7 @@ mod tests {
         assert_eq!(state.runtime_identity(exact_query).await.unwrap(), actual);
 
         let mut stale = actual.clone();
-        stale.host.process_start_identity = "windows:133700000000000101".into();
+        stale.host.process_start_identity = "windows-filetime:133700000000000101".into();
         let mut stale_query = identity_query(Some("retouch"));
         stale_query.expected = Some(stale);
         let error = state.runtime_identity(stale_query).await.unwrap_err();
@@ -6327,6 +6337,7 @@ mod tests {
             BridgeSessionInfo {
                 target: target.into(),
                 capabilities,
+                connection_id: 1,
                 connected_at_epoch_ms,
             },
         );
@@ -6387,7 +6398,7 @@ mod tests {
         assert_eq!(state.runtime_identity(exact_query).await.unwrap(), actual);
 
         let mut stale = actual.clone();
-        stale.host.process_start_identity = "windows:133700000000000101".into();
+        stale.host.process_start_identity = "windows-filetime:133700000000000101".into();
         let mut stale_query = after_effects_identity_query(Some("default"));
         stale_query.expected = Some(stale);
         let error = state.runtime_identity(stale_query).await.unwrap_err();
@@ -6532,6 +6543,7 @@ mod tests {
             BridgeSessionInfo {
                 target: "default".into(),
                 capabilities: after_effects_caps(),
+                connection_id,
                 connected_at_epoch_ms,
             },
         );
@@ -6603,6 +6615,29 @@ mod tests {
         reconnector
             .await
             .expect("reconnect loop must finish cleanly");
+    }
+
+    #[tokio::test]
+    async fn runtime_identity_rejects_same_epoch_reconnect_with_old_expected_connection() {
+        let state = state();
+        let key = session_key(HostKind::AfterEffects, "default");
+        install_runtime_identity_generation(&state, &key, 4200, 1111, 1).await;
+        let old = state
+            .runtime_identity(after_effects_identity_query(Some("default")))
+            .await
+            .expect("the first connection must attest");
+
+        // Reconnects can occur within one millisecond. The generation must
+        // remain distinguishable even when the public epoch is unchanged.
+        install_runtime_identity_generation(&state, &key, 4200, 1111, 2).await;
+        let mut query = after_effects_identity_query(Some("default"));
+        query.expected = Some(old);
+        let error = state.runtime_identity(query).await.unwrap_err();
+        assert_eq!(error.error.code, ERROR_IDENTITY_STALE);
+        assert_eq!(
+            error.error.data.as_ref().unwrap()["field"],
+            "bridge.connectionId"
+        );
     }
 
     #[tokio::test]
@@ -6716,6 +6751,7 @@ mod tests {
             BridgeSessionInfo {
                 target: "illustration".into(),
                 capabilities: illustrator_caps(),
+                connection_id: 41,
                 connected_at_epoch_ms: 1_710_000_000_000,
             },
         );
@@ -7343,7 +7379,7 @@ mod tests {
         assert_eq!(bound.host.pid, Some(observed.pid));
         assert_eq!(
             bound.host.process_start_identity.as_deref(),
-            Some("windows:133700000000000100")
+            Some("windows-filetime:133700000000000100")
         );
         let replay = state
             .bind_photoshop_bootstrap_claim(

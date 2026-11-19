@@ -4,9 +4,11 @@ import { asString, isObject, maybePromise, optionalRequire, property } from "../
 type Callable = (...args: unknown[]) => unknown;
 
 let bridgeInstanceId: string | undefined;
+const loadedModuleSource = currentModuleSource();
 
 export async function photoshopRuntimeIdentity(): Promise<BridgeIdentityClaim> {
   const pluginRoot = await installedPluginRoot();
+  const moduleOrigin = moduleOriginFor(pluginRoot);
   return {
     host: {
       ...externalHostIdentity(),
@@ -14,14 +16,38 @@ export async function photoshopRuntimeIdentity(): Promise<BridgeIdentityClaim> {
     },
     bridge: {
       instanceId: runtimeInstanceId(),
-      ...(pluginRoot
+      ...(pluginRoot && moduleOrigin
         ? {
             installedPluginRoot: pluginRoot,
-            moduleOrigin: `${pluginRoot.replace(/[\\/]+$/, "")}/dist/main.js`
+            moduleOrigin
           }
         : {})
     }
   };
+}
+
+function currentModuleSource(): string | undefined {
+  const documentValue = (globalThis as { document?: unknown }).document;
+  const currentScript = property(documentValue, "currentScript");
+  return asString(property(currentScript, "src"));
+}
+
+function moduleOriginFor(pluginRoot: string | undefined): string | undefined {
+  const source = loadedModuleSource;
+  if (!source) return undefined;
+  if (source.startsWith("plugin:/") && pluginRoot) {
+    const relativePath = source.slice("plugin:/".length);
+    if (!relativePath || relativePath.split("/").some((part) => part === "." || part === "..")) return undefined;
+    return absolutePath(`${pluginRoot}/${relativePath}`);
+  }
+  if (!/^file:\/\//i.test(source)) return absolutePath(source);
+  try {
+    let path = decodeURI(source).replace(/^file:\/\//i, "");
+    if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+    return absolutePath(path);
+  } catch {
+    return undefined;
+  }
 }
 
 function externalHostIdentity(): HostIdentityClaim {

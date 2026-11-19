@@ -42,14 +42,14 @@ RESULT = {
     "identityFingerprint": "b" * 64,
     "broker": {
         "pid": 4100,
-        "processStartIdentity": "windows:133700000000000000",
+        "processStartIdentity": "windows-filetime:133700000000000000",
         "runtimeVersion": "0.7.0",
         "instanceId": "76db1078-74c9-45c1-87e1-e8258649815e",
         "executableSha256": "c" * 64,
     },
     "host": {
         "pid": 4200,
-        "processStartIdentity": "windows:133700000000000100",
+        "processStartIdentity": "windows-filetime:133700000000000100",
         "hostVersion": "27.0.1",
         "profileId": "production-profile",
         "executableSha256": "a" * 64,

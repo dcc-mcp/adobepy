@@ -216,8 +216,8 @@ bypass: the broker validates After Effects claims through the shared
 The bridge builds its claim from bounded, non-executing inputs only:
 
 - a fixed `app.version` probe with a 1 s timeout,
-- the CEP extension root and `dist/main.js` module origin from
-  `getSystemPath("extension")`,
+- the CEP extension root from `getSystemPath("extension")` and the loaded
+  module origin from the host-observable `document.currentScript.src`,
 - one runtime instance UUID, and
 - PID, process-start identity, executable path, and profile ID taken only from
   the bounded adapter-owned `__ADOBEPY_HOST_IDENTITY` launch context.
