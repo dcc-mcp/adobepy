@@ -321,7 +321,10 @@ jobs:
           smoke_dir="$(mktemp -d)"
           trap 'rm -rf "$smoke_dir"' EXIT
           unzip -q "$STANDALONE_ARCHIVE" -d "$smoke_dir"
-          mapfile -t executables < <(find "$smoke_dir" -type f -name "adobepy-python" -print)
+          executables=()
+          while IFS= read -r executable; do
+            executables+=("$executable")
+          done < <(find "$smoke_dir" -type f -name "adobepy-python" -print)
           [ "${#executables[@]}" -eq 1 ] || {
             echo "expected exactly one standalone executable in archive, found ${#executables[@]}"; exit 1; }
           executable="${executables[0]}"
