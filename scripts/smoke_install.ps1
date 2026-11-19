@@ -12,6 +12,12 @@ if (-not (Test-Path -LiteralPath $zipPath)) {
     throw "zip not found: $zipPath"
 }
 
+$checksumScript = Join-Path $PSScriptRoot "check_package_checksum.py"
+& $Python -I $checksumScript $zipPath
+if ($LASTEXITCODE -ne 0) {
+    throw "package checksum verification failed ($LASTEXITCODE)"
+}
+
 Write-Host "==> Smoke test: $zipPath"
 
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) "adobepy-smoke-$([System.IO.Path]::GetRandomFileName())"
@@ -19,10 +25,11 @@ try {
     Write-Host "Extracting to $tempDir..."
     Expand-Archive -LiteralPath $zipPath -DestinationPath $tempDir -Force
 
-    $extractedRoot = Get-ChildItem -LiteralPath $tempDir -Directory | Select-Object -First 1
-    if (-not $extractedRoot) {
-        throw "no root directory found inside zip"
+    $roots = @(Get-ChildItem -LiteralPath $tempDir -Directory)
+    if ($roots.Count -ne 1) {
+        throw "expected exactly one root directory inside zip, found $($roots.Count)"
     }
+    $extractedRoot = $roots[0]
     Write-Host "Extracted root: $($extractedRoot.FullName)"
 
     $installScript = Join-Path $extractedRoot.FullName "install.ps1"

@@ -25,7 +25,8 @@ fi
 
 mapfile -t entries <<< "$prs"
 if [ "${#entries[@]}" -ne 1 ]; then
-  echo "::warning title=Unexpected release PR count::Found ${#entries[@]} open release PRs; merging more than one would collide on PyPI."
+  echo "::error title=Unexpected release PR count::Found ${#entries[@]} open release PRs; refusing to merge any because they would collide on PyPI."
+  exit 1
 fi
 
 request_ci() {

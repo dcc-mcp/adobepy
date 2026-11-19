@@ -215,6 +215,33 @@ run_case() {
   rm -rf "$d"
 }
 
+run_multiple_release_pr_case() {
+  local d; d=$(mktemp -d)
+  echo '[]' > "$d/runs.json"
+  echo '{"check_runs":[]}' > "$d/checks.json"
+  GH_LOG="$d/gh.log" MERGED_FLAG="$d/merged" RERead_FLAG="$d/reread" AUTO_REFUSAL_MOVED="$d/auto-refused-head" RUNS_JSON="$d/runs.json" \
+  CHECKS_JSON="$d/checks.json" GH_TOKEN=x GH_REPO=dcc-mcp/adobepy \
+  STALL_HOURS=6 MERGE_TIMEOUT_SECONDS=5 MERGE_POLL_SECONDS=0 \
+  PR_ENTRY="89 release-please--branches--main $H1
+90 release-please--branches--main $H2" \
+  CURRENT_SHA="$H1" CREATED_AT="$CREATED_AT" STUB_DIR="$STUB_ROOT/bin" \
+  PATH="$STUB_ROOT/bin:/usr/bin:/bin:$PATH" \
+  bash "$GATE" > "$d/out" 2>&1
+  local rc=$?
+  local ok=1
+  [ "$rc" = "1" ] || ok=0
+  grep -q "::error title=Unexpected release PR count" "$d/out" || ok=0
+  [ ! -f "$d/merged" ] || ok=0
+  if [ "$ok" = "1" ]; then
+    echo "PASS  multiple release PRs fail closed"
+  else
+    echo "FAIL  multiple release PRs fail closed"
+    sed 's/^/        | /' "$d/out"
+    failures=$((failures + 1))
+  fi
+  rm -rf "$d"
+}
+
 build_stub
 
 GREEN='{"check_runs":[{"status":"completed","conclusion":"success"}]}'
@@ -323,6 +350,10 @@ EXP_MATCH="$H1" EXP_NORMAL_MERGES=0 \
 EXP_MATCH="$H1" EXP_NORMAL_MERGES=1 AUTO_MERGE_ERROR="$NO_AUTO" MOVE_ON_AUTO_REFUSAL_SHA="$H2" \
   run_case "19 fallback refuses a moved head" \
   "$OKRUNS" "$GREEN" "$H1" "" 1 "error"
+
+# 20. More than one release PR is an invariant violation. Refuse the whole
+# pass instead of merging multiple versions into the same release line.
+run_multiple_release_pr_case
 
 rm -rf "$STUB_ROOT"
 

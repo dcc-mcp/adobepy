@@ -221,13 +221,22 @@ jobs:
           $packageName = "adobepy-standalone-$version-$runtimeId"
           $distDir = Join-Path (Resolve-Path ".") "dist"
           New-Item -ItemType Directory -Force -Path $distDir | Out-Null
-          Compress-Archive -Path "$($buildDir.FullName)/*" -DestinationPath (Join-Path $distDir "$packageName.zip") -Force
-          $hash = -join ((Get-FileHash (Join-Path $distDir "$packageName.zip") -Algorithm SHA256).Hash | ForEach-Object { $_.ToLower() })
-          "$hash  $packageName.zip" | Out-File -FilePath (Join-Path $distDir "$packageName.zip.sha256") -Encoding ASCII
+          $archive = Join-Path $distDir "$packageName.zip"
+          Compress-Archive -Path "$($buildDir.FullName)/*" -DestinationPath $archive -Force
+          $hash = -join ((Get-FileHash $archive -Algorithm SHA256).Hash | ForEach-Object { $_.ToLower() })
+          "$hash  $packageName.zip" | Out-File -FilePath "$archive.sha256" -Encoding ASCII
+          echo "STANDALONE_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ASCII
       - name: Smoke test standalone interpreter
         shell: pwsh
         run: |
-          $exe = Join-Path $env:STANDALONE_BUILD_DIR "adobepy-python"
+          & python -I scripts/check_package_checksum.py $env:STANDALONE_ARCHIVE
+          if ($LASTEXITCODE -ne 0) { throw "standalone archive checksum verification failed ($LASTEXITCODE)" }
+          $extractRoot = Join-Path $env:RUNNER_TEMP "adobepy-standalone-smoke"
+          if (Test-Path -LiteralPath $extractRoot) { Remove-Item -LiteralPath $extractRoot -Recurse -Force }
+          Expand-Archive -LiteralPath $env:STANDALONE_ARCHIVE -DestinationPath $extractRoot -Force
+          $executables = @(Get-ChildItem -LiteralPath $extractRoot -Recurse -File -Filter "adobepy-python.exe")
+          if ($executables.Count -ne 1) { throw "expected exactly one standalone executable in archive, found $($executables.Count)" }
+          $exe = $executables[0].FullName
           & $exe -c "import sys; from adobe.photoshop import Photoshop; assert sys.version_info >= (3, 8); print('standalone smoke OK')"
           if ($LASTEXITCODE -ne 0) { throw "standalone interpreter smoke failed" }
       - uses: actions/upload-artifact@v4
