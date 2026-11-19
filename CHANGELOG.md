@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.14.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.14.0...adobepy-v0.14.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* bind runtime identity to bridge connection generation ([fef2efd](https://github.com/dcc-mcp/adobepy/commit/fef2efdff076380c63ce68847e2b654d11f3863a))
+* bind runtime identity to bridge connection generation ([faad2e6](https://github.com/dcc-mcp/adobepy/commit/faad2e68c75b5cc173726e41496000efb9283b30))
+* harden Premiere bridge startup and reconnect ([#112](https://github.com/dcc-mcp/adobepy/issues/112)) ([b339299](https://github.com/dcc-mcp/adobepy/commit/b339299191125cbdd7f1021113581366925fb0e0))
+* harden release publication gates ([0d8cbbf](https://github.com/dcc-mcp/adobepy/commit/0d8cbbf1935c4c52a569db1a2584e2c4679338ad))
+* harden release publication gates ([1088756](https://github.com/dcc-mcp/adobepy/commit/1088756a8b663d2bc088f71511f2afe247189b76))
+
 ## [0.14.0](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.13.0...adobepy-v0.14.0) (2026-11-14)
 
 
