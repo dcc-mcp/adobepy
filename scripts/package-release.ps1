@@ -55,10 +55,35 @@ function Assert-ChildPath {
 }
 
 function Ensure-PythonBuildDependencies {
-    $probe = "import importlib.metadata as m, importlib.util, sys; missing = [name for name in ('coverage', 'setuptools', 'wheel') if importlib.util.find_spec(name) is None]; ok = not missing and tuple(map(int, m.version('setuptools').split('.')[:2])) >= (77, 0); sys.exit(0 if ok else 1)"
-    & python -c $probe 2>$null
+    $probe = @'
+import importlib.metadata as metadata
+import importlib.util
+import sys
+
+if sys.version_info[:2] >= (3, 9):
+    requirement, lower, upper = "setuptools>=77", 77, None
+else:
+    requirement, lower, upper = "setuptools>=69,<77", 69, 77
+
+missing = [name for name in ("coverage", "setuptools", "wheel")
+           if importlib.util.find_spec(name) is None]
+ok = not missing
+if ok:
+    try:
+        current = tuple(map(int, metadata.version("setuptools").split(".")[:2]))
+    except metadata.PackageNotFoundError:
+        current = (0,)
+    ok = current >= (lower,) and (upper is None or current < upper)
+
+if not ok:
+    print(requirement)
+'@
+    $buildRequirement = (& python -c $probe 2>$null | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) {
-        Invoke-External "python" @("-m", "pip", "install", "--upgrade", "coverage[toml]", "setuptools>=77", "wheel")
+        throw "could not determine the Python build dependency requirement"
+    }
+    if ($buildRequirement) {
+        Invoke-External "python" @("-m", "pip", "install", "--upgrade", "coverage[toml]", $buildRequirement, "wheel")
     }
 }
 
@@ -242,6 +267,7 @@ Invoke-Step "Build bridge bundles" {
 }
 
 Invoke-Step "Stage bridge templates into the wheel package tree" {
+    Invoke-External "python" @("scripts\stage_wheel_bridges.py", "--check")
     Invoke-External "python" @("scripts\stage_wheel_bridges.py")
 }
 

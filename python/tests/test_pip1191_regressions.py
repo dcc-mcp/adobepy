@@ -48,6 +48,7 @@ from scripts.check_wheel_bridges import REQUIRED_BRIDGE_FILES  # noqa: E402
 
 CI_FILE = ROOT / ".github/workflows/ci.yml"
 RELEASE_FILE = ROOT / ".github/workflows/release.yml"
+RELEASE_PLEASE_FILE = ROOT / ".github/workflows/release-please.yml"
 PACKAGE_FILE = ROOT / "package.json"
 CHECK_WHEEL_BRIDGES = ROOT / "scripts" / "check_wheel_bridges.py"
 
@@ -388,6 +389,49 @@ class ReleasePathFailPropagationTests(unittest.TestCase):
         for job_name in RETIRED_STANDALONE_JOBS:
             job = _job_block(text, job_name)
             self.assertFalse(job, f"{job_name} belongs only to release-please.yml")
+
+    def test_release_please_pypi_waits_for_every_release_artifact(self) -> None:
+        text = RELEASE_PLEASE_FILE.read_text(encoding="utf-8")
+        job = _job_block(text, "pypi")
+        self.assertTrue(job, "release-please.yml must define a PyPI publisher")
+        for dependency in ("release-please", "python-package", "windows-package", "standalone-package"):
+            self.assertRegex(
+                job,
+                rf"(?m)^\s+-\s+{re.escape(dependency)}\s*$",
+                f"PyPI publication must wait for {dependency}",
+            )
+
+    def test_release_please_standalone_smoke_reads_the_final_archive(self) -> None:
+        text = RELEASE_PLEASE_FILE.read_text(encoding="utf-8")
+        job = _job_block(text, "standalone-package")
+        self.assertTrue(job, "release-please.yml must define standalone publishing")
+        self.assertIn("STANDALONE_ARCHIVE", job)
+        self.assertIn("scripts/check_package_checksum.py", job)
+        self.assertIn('unzip -q "$STANDALONE_ARCHIVE"', job)
+        self.assertIn('find "$smoke_dir" -type f -name "adobepy-python"', job)
+        self.assertNotIn('"$STANDALONE_BUILD_DIR/adobepy-python"', job)
+
+    def test_windows_standalone_smoke_reads_the_final_archive(self) -> None:
+        text = RELEASE_FILE.read_text(encoding="utf-8")
+        job = _job_block(text, "windows-standalone-package")
+        self.assertTrue(job, "release.yml must define the Windows standalone publisher")
+        self.assertIn("STANDALONE_ARCHIVE", job)
+        self.assertIn("scripts/check_package_checksum.py", job)
+        self.assertIn("Expand-Archive -LiteralPath $env:STANDALONE_ARCHIVE", job)
+        self.assertIn('Get-ChildItem -LiteralPath $extractRoot -Recurse -File -Filter "adobepy-python.exe"', job)
+        self.assertNotIn('Join-Path $env:STANDALONE_BUILD_DIR "adobepy-python"', job)
+
+    def test_windows_package_smoke_verifies_the_release_zip(self) -> None:
+        text = RELEASE_FILE.read_text(encoding="utf-8")
+        job = _job_block(text, "windows-package")
+        self.assertIn("scripts/smoke_install.ps1", job)
+        self.assertIn("check_package_checksum.py", (ROOT / "scripts/smoke_install.ps1").read_text(encoding="utf-8"))
+
+    def test_package_release_keeps_python_38_setuptools_compatible(self) -> None:
+        text = (ROOT / "scripts/package-release.ps1").read_text(encoding="utf-8")
+        self.assertIn("sys.version_info[:2] >= (3, 9)", text)
+        self.assertIn('"setuptools>=69,<77"', text)
+        self.assertNotIn('"setuptools>=77", "wheel"', text)
 
     @unittest.skipUnless(_find_pwsh(), "pwsh is not available")
     def test_real_native_fail_then_succeed_is_false_green_only_when_unguarded(
