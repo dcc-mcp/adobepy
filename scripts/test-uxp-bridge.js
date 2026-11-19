@@ -1420,7 +1420,11 @@ async function emitPhotoshopGeneratedConfigHello() {
         }
       }
     }
-  }, {}, generatedConfig);
+  }, {
+    document: {
+      currentScript: { src: "file:///C:/UXP/External/com.adobepy.bridge.photoshop/dist/main.js" }
+    }
+  }, generatedConfig);
   assert.strictEqual(env.sent.length, 1);
   assert.strictEqual(env.sent[0].type, "hello");
   process.stdout.write(JSON.stringify({ url: env.socket.url, hello: env.sent[0] }));
