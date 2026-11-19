@@ -205,9 +205,13 @@ async function activeSequence() {
 
 async function findSequence(idOrName: unknown) {
   const active = await activeSequence();
-  if (sequenceMatches(active, idOrName) || idOrName === undefined || idOrName === null) return active;
+  if (idOrName === undefined || idOrName === null) return active;
+  if (sequenceIdentityMatches(active, idOrName)) return active;
   const sequences = await projectSequences(await activeProject());
-  return sequences.find((sequence) => sequenceMatches(sequence, idOrName));
+  const byIdentity = sequences.find((sequence) => sequenceIdentityMatches(sequence, idOrName));
+  if (byIdentity) return byIdentity;
+  if (sequenceNameMatches(active, idOrName)) return active;
+  return sequences.find((sequence) => sequenceNameMatches(sequence, idOrName));
 }
 
 async function requireSequence(idOrName: unknown) {
@@ -219,13 +223,17 @@ async function requireSequence(idOrName: unknown) {
 function sequenceMatches(sequence: unknown, idOrName: unknown): boolean {
   if (!isObject(sequence)) return false;
   if (idOrName === undefined || idOrName === null) return true;
+  return sequenceIdentityMatches(sequence, idOrName) || sequenceNameMatches(sequence, idOrName);
+}
+
+function sequenceIdentityMatches(sequence: unknown, idOrName: unknown): boolean {
+  if (!isObject(sequence) || idOrName === undefined || idOrName === null) return false;
   const target = String(idOrName);
   const values = [
     property(sequence, "id"),
     property(sequence, "guid"),
     property(sequence, "sequenceId"),
-    property(sequence, "sequenceID"),
-    property(sequence, "name")
+    property(sequence, "sequenceID")
   ];
   return values.some((value) => {
     if (value === undefined || value === null) return false;
@@ -234,6 +242,11 @@ function sequenceMatches(sequence: unknown, idOrName: unknown): boolean {
     // accidentally match a caller that passed the string "undefined".
     return serialized !== undefined && String(serialized) === target;
   });
+}
+
+function sequenceNameMatches(sequence: unknown, idOrName: unknown): boolean {
+  if (!isObject(sequence) || idOrName === undefined || idOrName === null) return false;
+  return asString(property(sequence, "name")) === String(idOrName);
 }
 
 function isThenable(value: unknown): boolean {
@@ -1093,9 +1106,14 @@ function booleanValue(value: unknown): boolean | undefined {
 function serializeTime(value: unknown): unknown {
   if (!isObject(value)) return asNumber(value) ?? asString(value) ?? value;
   const seconds = asNumber(property(value, "seconds"));
-  const ticks = asString(property(value, "ticks")) ?? asString(property(value, "ticksPerSecond"));
-  if (seconds !== undefined && ticks !== undefined) return { seconds, ticks };
-  if (seconds !== undefined) return seconds;
-  if (ticks !== undefined) return ticks;
+  const ticks = asString(property(value, "ticks"));
+  const ticksPerSecond = asString(property(value, "ticksPerSecond"));
+  if (seconds !== undefined && ticks === undefined && ticksPerSecond === undefined) return seconds;
+  const result = {
+    ...(seconds === undefined ? {} : { seconds }),
+    ...(ticks === undefined ? {} : { ticks }),
+    ...(ticksPerSecond === undefined ? {} : { ticksPerSecond })
+  };
+  if (Object.keys(result).length > 0) return result;
   return asNumber(value) ?? value;
 }

@@ -1064,6 +1064,12 @@ async function testPremiereNativeReadQueries() {
   assert.strictEqual(sequences[0].duration.ticks, "30481920000000");
   assert.strictEqual(sequences[0].timebase, "10160640000");
   assert.strictEqual(result(await rpc(env, "premiere", "project", "getActiveSequence")).id, "sequence-native");
+  sequence.getEndTime = async () => ({ seconds: 4, ticksPerSecond: 254016000000 });
+  assert.deepStrictEqual(
+    result(await rpc(env, "premiere", "project", "getActiveSequence")).duration,
+    { seconds: 4, ticksPerSecond: "254016000000" },
+    "ticksPerSecond must remain a rate instead of being reported as absolute ticks"
+  );
   assert.strictEqual(result(await rpc(env, "premiere", "sequence", "getVideoTracks", ["nested-sequence-native"])).length, 2);
   const serializedAudioTracks = result(await rpc(env, "premiere", "sequence", "getAudioTracks", ["sequence-native"]));
   assert.strictEqual(serializedAudioTracks.length, 1);
@@ -1246,6 +1252,35 @@ async function testPremiereIdSerializationBoundaries() {
   });
   const rejected = error(await rpc(env, "premiere", "sequence", "getVideoTracks", ["undefined"]));
   assert.strictEqual(rejected.code, -32004, "the string 'undefined' must not match an unserializable ID");
+
+  const active = { guid: "active-guid", name: "seq-2", videoTracks: [{ id: "active-track", clips: [] }], audioTracks: [] };
+  const selected = { guid: "seq-2", name: "Selected sequence", videoTracks: [{ id: "selected-track", clips: [] }], audioTracks: [] };
+  const collisionProject = {
+    getActiveSequence: async () => active,
+    getSequences: async () => [active, selected]
+  };
+  class CollisionProject { static async getActiveProject() { return collisionProject; } }
+  const collisionEnv = await loadBundle("bridges/uxp/premiere/dist/main.js", {
+    premierepro: { version: "25.6.0", Project: CollisionProject }
+  });
+  const selectedTracks = result(await rpc(collisionEnv, "premiere", "sequence", "getVideoTracks", ["seq-2"]));
+  assert.strictEqual(selectedTracks[0].id, "selected-track", "an identity match must win over an active sequence name match");
+
+  let sequenceEnumerationCount = 0;
+  const activeIdentityProject = {
+    getActiveSequence: async () => active,
+    getSequences: async () => {
+      sequenceEnumerationCount += 1;
+      throw new Error("active identity should bypass sequence enumeration");
+    }
+  };
+  class ActiveIdentityProject { static async getActiveProject() { return activeIdentityProject; } }
+  const activeIdentityEnv = await loadBundle("bridges/uxp/premiere/dist/main.js", {
+    premierepro: { version: "25.6.0", Project: ActiveIdentityProject }
+  });
+  const activeTracks = result(await rpc(activeIdentityEnv, "premiere", "sequence", "getVideoTracks", ["active-guid"]));
+  assert.strictEqual(activeTracks[0].id, "active-track", "an active identity match should use the direct fast path");
+  assert.strictEqual(sequenceEnumerationCount, 0);
 }
 
 // End-to-end regression through the real RPC/DOM dispatch. A function receiver
@@ -1355,7 +1390,13 @@ function testManifestPermissions() {
       `${host} manifest must allow broker WebSocket`
     );
     if (host === "photoshop") assert.strictEqual(manifest.requiredPermissions.localFileSystem, "fullAccess");
-    if (host === "premiere") assert.strictEqual(manifest.host.app, "premierepro");
+    if (host === "premiere") {
+      assert.strictEqual(manifest.host.app, "premierepro");
+      assert.strictEqual(manifest.host.data.apiVersion, 2);
+      assert.strictEqual(manifest.host.data.loadEvent, "startup");
+      assert.ok(manifest.entrypoints.some((entry) => entry.hostUIContext?.hideFromMenu === true),
+        "Premiere must load its bridge entrypoint without exposing a menu item");
+    }
     assert.ok(manifest.entrypoints.some((entry) => entry.type === "panel"), `${host} must declare an invokable panel`);
   }
 }

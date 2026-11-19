@@ -587,8 +587,17 @@ class ProjectProxy:
         return self.selected_items
 
     def get_sequence(self, id_or_name: Any) -> "SequenceProxy | None":
-        for sequence in self.sequences:
-            if id_or_name in {sequence.id, sequence.sequence_id, sequence.name}:
+        if not _is_sequence_lookup_value(id_or_name):
+            return None
+        sequences = self.sequences
+        for sequence in sequences:
+            if any(
+                _sequence_value_matches(id_or_name, value)
+                for value in (sequence.id, sequence.sequence_id, sequence.guid)
+            ):
+                return sequence
+        for sequence in sequences:
+            if _sequence_value_matches(id_or_name, sequence.name):
                 return sequence
         return None
 
@@ -1438,8 +1447,16 @@ def _item_key(item: "ProjectItemProxy | str | None") -> Any:
 
 def _sequence_key(sequence: "SequenceProxy | str | None") -> Any:
     if isinstance(sequence, SequenceProxy):
-        return sequence.id or sequence.sequence_id or sequence.name
+        return sequence.id or sequence.sequence_id or sequence.guid or sequence.name
     return sequence
+
+
+def _is_sequence_lookup_value(value: Any) -> bool:
+    return value is not None and isinstance(value, (str, int, float, bool))
+
+
+def _sequence_value_matches(query: Any, value: Any) -> bool:
+    return value is not None and (query == value or str(query) == str(value))
 
 
 def _export_payload(options: dict[str, Any] | None = None, **values: Any) -> dict[str, Any]:

@@ -83,7 +83,15 @@ async function main() {
     assert.match(panel.status.textContent, /not verified/, "a host RPC is not client identity attestation");
     await panel.sockets[0].emit("close");
     assert.match(panel.status.textContent, /^Disconnected/);
-    assert.strictEqual(panel.sockets.length, 1, "status UI must not introduce automatic reconnects");
+    if (host === "premiere") {
+      await new Promise((resolve) => setTimeout(resolve, 550));
+      assert.strictEqual(panel.sockets.length, 2, "Premiere must retry a transport disconnect");
+      await panel.sockets[1].emit("open");
+      assert.strictEqual(panel.sent[2].type, "hello", "reconnect must perform a fresh handshake");
+      await panel.sockets[1].emit("close");
+    } else {
+      assert.strictEqual(panel.sockets.length, 1, "CEP lifecycle remains single-shot");
+    }
 
     const missingToken = await loadPanel(host, { token: "" });
     assert.match(missingToken.status.textContent, /Bridge not ready/);
