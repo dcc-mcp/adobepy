@@ -56,90 +56,142 @@
       return;
     }
     const target = globalThis.__ADOBEPY_TARGET || "default";
-    onStatus?.("connecting");
-    let failed = false;
+    const initialRetryDelayMs = 500;
+    const maxRetryDelayMs = 3e4;
+    let retryDelayMs = initialRetryDelayMs;
+    let reconnectTimer;
+    let terminalFailure = false;
     let socket;
-    try {
-      socket = new WebSocket(url);
-    } catch (error) {
-      onStatus?.("error");
-      throw error;
-    }
-    socket.addEventListener("error", () => {
-      failed = true;
-      onStatus?.("error");
-    });
-    socket.addEventListener("close", () => onStatus?.(failed ? "error" : "disconnected"));
-    socket.addEventListener("open", async () => {
-      let identity;
-      try {
-        identity = await identityProvider?.();
-      } catch {
-        failed = true;
-        onStatus?.("error");
-        console.error("[adobepy] runtime identity is unavailable; exact-instance verification will fail closed.");
-      }
-      if (socket.readyState !== 1) return;
-      const bootstrapNonce = boundedBootstrapNonce(globalThis.__ADOBEPY_BOOTSTRAP_NONCE);
-      try {
-        socket.send(JSON.stringify({
-          type: "hello",
-          token,
-          target,
-          capabilities: adapter.capabilities(),
-          ...identity ? { identity } : {},
-          ...bootstrapNonce ? { bootstrapNonce } : {}
-        }));
-      } catch (error) {
-        failed = true;
-        onStatus?.("error");
-        throw error;
-      }
-      onStatus?.(failed ? "error" : "ready");
-    });
-    const reportProtocolViolation = (reason) => {
-      failed = true;
-      onStatus?.("error");
-      console.error(`[adobepy] ${reason}`);
-      try {
-        socket.send(JSON.stringify({
-          type: "error",
-          error: {
-            jsonrpc: "2.0",
-            id: null,
-            error: { code: ERROR_CODES.ERROR_PARSE, message: "Invalid bridge frame" }
-          }
-        }));
-      } catch {
-      }
-      if (typeof socket.close === "function") socket.close();
+    const scheduleReconnect = () => {
+      if (terminalFailure || reconnectTimer !== void 0) return;
+      const delay = retryDelayMs;
+      retryDelayMs = Math.min(maxRetryDelayMs, retryDelayMs * 2);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = void 0;
+        openSocket();
+      }, delay);
+      reconnectTimer.unref?.();
     };
-    socket.addEventListener("message", async (event) => {
-      let message;
+    const reportTerminalFailure = (candidate, reason, notifyBroker = true) => {
+      if (candidate !== socket) return;
+      terminalFailure = true;
+      onStatus?.("error");
+      if (reason) console.error(`[adobepy] ${reason}`);
+      if (notifyBroker) {
+        try {
+          candidate.send(JSON.stringify({
+            type: "error",
+            error: {
+              jsonrpc: "2.0",
+              id: null,
+              error: { code: ERROR_CODES.ERROR_PARSE, message: "Invalid bridge frame" }
+            }
+          }));
+        } catch {
+        }
+      }
+      if (typeof candidate.close === "function") candidate.close();
+    };
+    const scheduleTransportRetry = (candidate) => {
+      if (candidate !== socket || terminalFailure) return;
       try {
-        message = JSON.parse(event.data);
+        if (typeof candidate.close === "function") candidate.close();
       } catch {
-        reportProtocolViolation("Invalid JSON frame from broker");
-        return;
       }
-      if (!isBridgeEnvelope(message)) {
-        reportProtocolViolation("Invalid bridge frame from broker");
-        return;
-      }
-      if (isBrokerError(message)) {
-        failed = true;
-        onStatus?.("error");
-        return;
-      }
-      if (message.type !== "request") return;
-      const request = message.request;
+      scheduleReconnect();
+    };
+    function openSocket() {
+      if (terminalFailure) return;
+      onStatus?.("connecting");
       try {
-        const result = await adapter.dispatch(request);
-        socket.send(JSON.stringify({ type: "response", response: { jsonrpc: "2.0", id: request.id, result: result ?? null } }));
-      } catch (error) {
-        socket.send(JSON.stringify({ type: "error", error: hostError(request.id, error) }));
+        socket = new WebSocket(url);
+      } catch {
+        onStatus?.("error");
+        scheduleReconnect();
+        return;
       }
-    });
+      const candidate = socket;
+      let transportFailed = false;
+      candidate.addEventListener("error", () => {
+        if (candidate !== socket || terminalFailure) return;
+        transportFailed = true;
+        onStatus?.("error");
+        scheduleTransportRetry(candidate);
+      });
+      candidate.addEventListener("close", () => {
+        if (candidate !== socket) return;
+        if (terminalFailure) {
+          onStatus?.("error");
+          return;
+        }
+        onStatus?.(transportFailed ? "error" : "disconnected");
+        scheduleReconnect();
+      });
+      candidate.addEventListener("open", async () => {
+        if (candidate !== socket || terminalFailure) return;
+        let identity;
+        try {
+          identity = await identityProvider?.();
+        } catch {
+          reportTerminalFailure(candidate, "runtime identity is unavailable; exact-instance verification will fail closed.", false);
+          return;
+        }
+        if (candidate !== socket || terminalFailure || candidate.readyState !== 1) return;
+        const bootstrapNonce = boundedBootstrapNonce(globalThis.__ADOBEPY_BOOTSTRAP_NONCE);
+        try {
+          candidate.send(JSON.stringify({
+            type: "hello",
+            token,
+            target,
+            capabilities: adapter.capabilities(),
+            ...identity ? { identity } : {},
+            ...bootstrapNonce ? { bootstrapNonce } : {}
+          }));
+        } catch {
+          transportFailed = true;
+          onStatus?.("error");
+          scheduleTransportRetry(candidate);
+          return;
+        }
+        onStatus?.("ready");
+      });
+      candidate.addEventListener("message", async (event) => {
+        if (candidate !== socket || terminalFailure) return;
+        let message;
+        try {
+          message = JSON.parse(event.data);
+        } catch {
+          reportTerminalFailure(candidate, "Invalid JSON frame from broker");
+          return;
+        }
+        if (!isBridgeEnvelope(message)) {
+          reportTerminalFailure(candidate, "Invalid bridge frame from broker");
+          return;
+        }
+        retryDelayMs = initialRetryDelayMs;
+        if (isBrokerError(message)) {
+          reportTerminalFailure(candidate, void 0, false);
+          return;
+        }
+        if (message.type !== "request") return;
+        const request = message.request;
+        try {
+          const result = await adapter.dispatch(request);
+          if (candidate !== socket || candidate.readyState !== 1) return;
+          candidate.send(JSON.stringify({ type: "response", response: { jsonrpc: "2.0", id: request.id, result: result ?? null } }));
+        } catch (error) {
+          if (candidate !== socket || candidate.readyState !== 1) return;
+          try {
+            candidate.send(JSON.stringify({ type: "error", error: hostError(request.id, error) }));
+          } catch {
+            transportFailed = true;
+            onStatus?.("error");
+            scheduleTransportRetry(candidate);
+          }
+        }
+      });
+    }
+    openSocket();
   }
   function isBridgeEnvelope(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);

@@ -652,6 +652,7 @@ class CapturingClient:
             sequence = {
                 "id": "seq-1",
                 "sequenceId": "sequence-1",
+                "guid": "guid-1",
                 "name": "Main edit",
                 "duration": 120.0,
                 "timebase": 25,
@@ -1378,6 +1379,8 @@ class FacadeTests(unittest.TestCase):
         self.assertEqual(premiere.sequences[0].sequenceId, "sequence-1")
         self.assertEqual(premiere.active_sequence.name, "Main edit")
         self.assertEqual(premiere.project.getSequence("Main edit").duration, 120.0)
+        self.assertEqual(premiere.project.get_sequence("guid-1").name, "Main edit")
+        self.assertIsNone(premiere.project.get_sequence({"guid": "guid-1"}))
         self.assertEqual(premiere.project.save(command_name="Save project").path, "C:/cut")
         self.assertEqual(premiere_client.calls[-1]["options"]["commandName"], "Save project")
         self.assertEqual(premiere.project.save_as("C:/out/cut.prproj").path, "C:/out/cut.prproj")
