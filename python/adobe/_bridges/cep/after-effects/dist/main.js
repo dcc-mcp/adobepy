@@ -233,18 +233,37 @@
 
   // bridges/cep/after-effects/src/identity.ts
   var bridgeInstanceId;
+  var loadedModuleSource = currentModuleSource();
   async function afterEffectsRuntimeIdentity() {
     var _a;
     const cep = globalThis.__adobe_cep__;
     const pluginRoot = absolutePath(cepSystemPath((_a = cep == null ? void 0 : cep.getSystemPath) == null ? void 0 : _a.call(cep, "extension")));
+    const moduleOrigin = moduleOriginFor(pluginRoot);
     const hostVersion = await afterEffectsHostVersion(cep);
     return {
       host: { ...externalHostIdentity(), ...hostVersion ? { hostVersion } : {} },
       bridge: {
         ...bridgeInstanceIdValue() ? { instanceId: bridgeInstanceIdValue() } : {},
-        ...pluginRoot ? { installedPluginRoot: pluginRoot, moduleOrigin: "".concat(pluginRoot, "/dist/main.js") } : {}
+        ...pluginRoot && moduleOrigin ? { installedPluginRoot: pluginRoot, moduleOrigin } : {}
       }
     };
+  }
+  function currentModuleSource() {
+    const documentValue = globalThis.document;
+    const currentScript = documentValue && typeof documentValue === "object" ? documentValue.currentScript : void 0;
+    return currentScript && typeof currentScript === "object" ? typeof currentScript.src === "string" ? currentScript.src : void 0 : void 0;
+  }
+  function moduleOriginFor(pluginRoot) {
+    const source = loadedModuleSource;
+    if (!source) return void 0;
+    const path = cepSystemPath(source);
+    if (path) return path;
+    if (source.startsWith("plugin:/") && pluginRoot) {
+      const relativePath = source.slice("plugin:/".length);
+      if (!relativePath || relativePath.split("/").some((part) => part === "." || part === "..")) return void 0;
+      return absolutePath("".concat(pluginRoot, "/").concat(relativePath));
+    }
+    return void 0;
   }
   function externalHostIdentity() {
     const configured = globalThis.__ADOBEPY_HOST_IDENTITY;

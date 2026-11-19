@@ -248,6 +248,7 @@ pub struct Capabilities {
 pub struct BridgeSessionInfo {
     pub target: String,
     pub capabilities: Capabilities,
+    pub connection_id: u64,
     pub connected_at_epoch_ms: u128,
 }
 
@@ -312,6 +313,7 @@ pub struct BridgeRuntimeIdentity {
     pub target: String,
     pub bridge_kind: BridgeKind,
     pub bridge_version: String,
+    pub connection_id: u64,
     pub connected_at_epoch_ms: u128,
     pub instance_id: String,
     pub installed_plugin_root: String,
@@ -616,14 +618,14 @@ mod tests {
             identity_version: 1,
             broker: BrokerRuntimeIdentity {
                 pid: 4100,
-                process_start_identity: "windows:133700000000000000".into(),
+                process_start_identity: "windows-filetime:133700000000000000".into(),
                 executable_path: "C:/adobepy/adobepy.exe".into(),
                 runtime_version: "0.1.0".into(),
                 instance_id: "76db1078-74c9-45c1-87e1-e8258649815e".into(),
             },
             host: HostRuntimeIdentity {
                 pid: 4200,
-                process_start_identity: "windows:133700000000000100".into(),
+                process_start_identity: "windows-filetime:133700000000000100".into(),
                 executable_path: "C:/Adobe/Photoshop.exe".into(),
                 host_version: "26.5.1".into(),
                 profile_id: "profile-production".into(),
@@ -632,6 +634,7 @@ mod tests {
                 target: "retouch".into(),
                 bridge_kind: BridgeKind::Uxp,
                 bridge_version: "0.1.0".into(),
+                connection_id: 1,
                 connected_at_epoch_ms: 1_720_000_000_000,
                 instance_id: "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99".into(),
                 installed_plugin_root: "C:/UXP/External/com.adobepy.bridge.photoshop".into(),
@@ -679,14 +682,14 @@ mod tests {
             identity_fingerprint: "b".repeat(64),
             broker: BootstrapBrokerBinding {
                 pid: 1,
-                process_start_identity: "windows:1".into(),
+                process_start_identity: "windows-filetime:1".into(),
                 runtime_version: "0.7.0".into(),
                 instance_id: UuidForTest::VALUE.into(),
                 executable_sha256: "c".repeat(64),
             },
             host: BootstrapHostBinding {
                 pid: 2,
-                process_start_identity: "windows:2".into(),
+                process_start_identity: "windows-filetime:2".into(),
                 host_version: "27.0.1".into(),
                 profile_id: "production".into(),
                 executable_sha256: "a".repeat(64),
@@ -718,14 +721,14 @@ mod tests {
             identity_fingerprint: "a".repeat(64),
             broker: IllustratorBrokerBinding {
                 pid: 1,
-                process_start_identity: "windows:1".into(),
+                process_start_identity: "windows-filetime:1".into(),
                 runtime_version: "0.8.0".into(),
                 instance_id: UuidForTest::VALUE.into(),
                 executable_sha256: "b".repeat(64),
             },
             host: IllustratorHostBinding {
                 pid: 2,
-                process_start_identity: "windows:2".into(),
+                process_start_identity: "windows-filetime:2".into(),
                 host_version: "30.0.0".into(),
                 profile_id: "production".into(),
                 instance_id: UuidForTest::VALUE.into(),

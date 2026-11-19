@@ -39,14 +39,14 @@ RESULT = {
     "identityFingerprint": "e" * 64,
     "broker": {
         "pid": 100,
-        "processStartIdentity": "windows:1000",
+        "processStartIdentity": "windows-filetime:1000",
         "runtimeVersion": "0.8.0",
         "instanceId": "5449d2f9-f9a2-4445-9f97-43b8c2d47f2e",
         "executableSha256": "f" * 64,
     },
     "host": {
         "pid": 200,
-        "processStartIdentity": "windows:2000",
+        "processStartIdentity": "windows-filetime:2000",
         "hostVersion": "30.0.0",
         "profileId": "illustrator-production",
         "instanceId": "9d31eb71-26cb-4c87-8b5a-4cadcc8e2f99",

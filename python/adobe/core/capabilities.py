@@ -14,6 +14,7 @@ class HostCapabilities:
     namespaces: tuple[str, ...]
     features: tuple[str, ...]
     methods: Mapping[str, tuple[str, ...]]
+    connection_id: int | None = None
     connected_at_epoch_ms: int | None = None
 
     @classmethod
@@ -32,6 +33,7 @@ class HostCapabilities:
                 str(namespace): tuple(str(method) for method in namespace_methods)
                 for namespace, namespace_methods in methods.items()
             },
+            connection_id=payload.get("connectionId"),
             connected_at_epoch_ms=payload.get("connectedAtEpochMs"),
         )
 

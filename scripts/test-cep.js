@@ -84,7 +84,10 @@ async function main() {
     setImmediate,
     WebSocket: FakeWebSocket,
     __adobe_cep__: fakeCep,
-    document: { getElementById() { return { textContent: "", addEventListener() {} }; } },
+    document: {
+      currentScript: { src: "file:///C:/extension/dist/main.js" },
+      getElementById() { return { textContent: "", addEventListener() {} }; }
+    },
     __ADOBEPY_TOKEN: "test-token",
     __ADOBEPY_BROKER_URL: "ws://127.0.0.1:47391/v1/bridge/after-effects/ws",
   };
@@ -186,9 +189,14 @@ async function testIllustratorIdentityHello() {
     __ADOBEPY_TOKEN: "PRIVATE_TEST_TOKEN",
     __ADOBEPY_TARGET: "illustration",
     __ADOBEPY_BOOTSTRAP_NONCE: "a".repeat(64),
+    document: {
+      currentScript: {
+        src: "file:///C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.illustrator/dist/main.js"
+      }
+    },
     __ADOBEPY_HOST_IDENTITY: {
       pid: 4242,
-      processStartIdentity: "windows:133700000000000100",
+      processStartIdentity: "windows-filetime:133700000000000100",
       executablePath: "C:/Program Files/Adobe/Adobe Illustrator 2026/Support Files/Contents/Windows/Illustrator.exe",
       profileId: "illustrator-production"
     },
@@ -209,7 +217,7 @@ async function testIllustratorIdentityHello() {
   assert.deepStrictEqual(JSON.parse(JSON.stringify(hello.identity)), {
     host: {
       pid: 4242,
-      processStartIdentity: "windows:133700000000000100",
+      processStartIdentity: "windows-filetime:133700000000000100",
       executablePath: "C:/Program Files/Adobe/Adobe Illustrator 2026/Support Files/Contents/Windows/Illustrator.exe",
       hostVersion: "28.2.0",
       profileId: "illustrator-production"
@@ -266,7 +274,12 @@ async function testAfterEffectsIdentityHello() {
     setImmediate,
     WebSocket: FakeWebSocket,
     __adobe_cep__: fakeCep,
-    document: { getElementById() { return { textContent: "", addEventListener() {} }; } },
+    document: {
+      currentScript: {
+        src: "file:///C:/Users/Public/Adobe/CEP/extensions/com.adobepy.bridge.after-effects/dist/main.js"
+      },
+      getElementById() { return { textContent: "", addEventListener() {} }; }
+    },
     __ADOBEPY_TOKEN: "PRIVATE_TEST_TOKEN",
     __ADOBEPY_TARGET: "retouch",
     // AE CEP has no broker-owned bootstrap: the generated adobepy.config.js
@@ -275,7 +288,7 @@ async function testAfterEffectsIdentityHello() {
     // fail-closed by the broker instead of being an AE-specific field.
     __ADOBEPY_HOST_IDENTITY: {
       pid: 4200,
-      processStartIdentity: "windows:133700000000000100",
+      processStartIdentity: "windows-filetime:133700000000000100",
       executablePath: "C:/Program Files/Adobe/Adobe After Effects 2026/Support Files/AfterFX.exe",
       profileId: "after-effects-production"
     },
@@ -298,7 +311,7 @@ async function testAfterEffectsIdentityHello() {
   assert.deepStrictEqual(JSON.parse(JSON.stringify(hello.identity)), {
     host: {
       pid: 4200,
-      processStartIdentity: "windows:133700000000000100",
+      processStartIdentity: "windows-filetime:133700000000000100",
       executablePath: "C:/Program Files/Adobe/Adobe After Effects 2026/Support Files/AfterFX.exe",
       hostVersion: "25.0.0",
       profileId: "after-effects-production"

@@ -16,7 +16,7 @@ That comparison only works if both sides derive every identity field the same
 way, byte for byte, on every supported platform. In practice three divergences
 appeared:
 
-- The broker reported its own `processStartIdentity` as `windows:{ticks}` while
+- The broker reported its own `processStartIdentity` as `windows-filetime:{ticks}` while
   the adapter already used `windows-filetime:{ticks}`. The values were computed
   from the same `GetProcessTimes` creation time but stringified differently, so
   a broker/adapter pair could never agree.

@@ -2,19 +2,46 @@ import type { BridgeIdentityClaim, HostIdentityClaim } from "../../core/src/prot
 import { cepSystemPath } from "../../core/src/system-path";
 
 let bridgeInstanceId: string | undefined;
+const loadedModuleSource = currentModuleSource();
 
 /** Return only bounded, host-observable identity; no commands or JSX are accepted. */
 export async function afterEffectsRuntimeIdentity(): Promise<BridgeIdentityClaim> {
   const cep = (globalThis as any).__adobe_cep__;
   const pluginRoot = absolutePath(cepSystemPath(cep?.getSystemPath?.("extension")));
+  const moduleOrigin = moduleOriginFor(pluginRoot);
   const hostVersion = await afterEffectsHostVersion(cep);
   return {
     host: { ...externalHostIdentity(), ...(hostVersion ? { hostVersion } : {}) },
     bridge: {
       ...(bridgeInstanceIdValue() ? { instanceId: bridgeInstanceIdValue() } : {}),
-      ...(pluginRoot ? { installedPluginRoot: pluginRoot, moduleOrigin: `${pluginRoot}/dist/main.js` } : {})
+      ...(pluginRoot && moduleOrigin ? { installedPluginRoot: pluginRoot, moduleOrigin } : {})
     }
   };
+}
+
+function currentModuleSource(): string | undefined {
+  const documentValue = (globalThis as { document?: unknown }).document;
+  const currentScript = documentValue && typeof documentValue === "object"
+    ? (documentValue as Record<string, unknown>).currentScript
+    : undefined;
+  return currentScript && typeof currentScript === "object"
+    ? typeof (currentScript as Record<string, unknown>).src === "string"
+      ? (currentScript as Record<string, string>).src
+      : undefined
+    : undefined;
+}
+
+function moduleOriginFor(pluginRoot: string | undefined): string | undefined {
+  const source = loadedModuleSource;
+  if (!source) return undefined;
+  const path = cepSystemPath(source);
+  if (path) return path;
+  if (source.startsWith("plugin:/") && pluginRoot) {
+    const relativePath = source.slice("plugin:/".length);
+    if (!relativePath || relativePath.split("/").some((part) => part === "." || part === "..")) return undefined;
+    return absolutePath(`${pluginRoot}/${relativePath}`);
+  }
+  return undefined;
 }
 
 function externalHostIdentity(): HostIdentityClaim {

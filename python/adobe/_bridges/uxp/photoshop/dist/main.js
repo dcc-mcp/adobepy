@@ -1134,8 +1134,10 @@
 
   // bridges/uxp/photoshop/src/identity.ts
   var bridgeInstanceId;
+  var loadedModuleSource = currentModuleSource();
   async function photoshopRuntimeIdentity() {
     const pluginRoot = await installedPluginRoot();
+    const moduleOrigin = moduleOriginFor(pluginRoot);
     return {
       host: {
         ...externalHostIdentity(),
@@ -1143,12 +1145,34 @@
       },
       bridge: {
         instanceId: runtimeInstanceId(),
-        ...pluginRoot ? {
+        ...pluginRoot && moduleOrigin ? {
           installedPluginRoot: pluginRoot,
-          moduleOrigin: `${pluginRoot.replace(/[\\/]+$/, "")}/dist/main.js`
+          moduleOrigin
         } : {}
       }
     };
+  }
+  function currentModuleSource() {
+    const documentValue = globalThis.document;
+    const currentScript = property(documentValue, "currentScript");
+    return asString(property(currentScript, "src"));
+  }
+  function moduleOriginFor(pluginRoot) {
+    const source = loadedModuleSource;
+    if (!source) return void 0;
+    if (source.startsWith("plugin:/") && pluginRoot) {
+      const relativePath = source.slice("plugin:/".length);
+      if (!relativePath || relativePath.split("/").some((part) => part === "." || part === "..")) return void 0;
+      return absolutePath(`${pluginRoot}/${relativePath}`);
+    }
+    if (!/^file:\/\//i.test(source)) return absolutePath(source);
+    try {
+      let path = decodeURI(source).replace(/^file:\/\//i, "");
+      if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+      return absolutePath(path);
+    } catch {
+      return void 0;
+    }
   }
   function externalHostIdentity() {
     const configured = globalThis.__ADOBEPY_HOST_IDENTITY;
