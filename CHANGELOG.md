@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.2](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.14.1...adobepy-v0.14.2) (2026-11-19)
+
+
+### Bug Fixes
+
+* support macOS standalone release smoke ([ce725c3](https://github.com/dcc-mcp/adobepy/commit/ce725c3871c0ae7bdb3383d809dfd804ee3a95e6))
+* support macOS standalone release smoke ([ce725c3](https://github.com/dcc-mcp/adobepy/commit/ce725c3871c0ae7bdb3383d809dfd804ee3a95e6))
+* support macOS standalone release smoke ([21290f5](https://github.com/dcc-mcp/adobepy/commit/21290f5b6a2db6503cea2ff8e6eaef996560800a))
+
 ## [0.14.1](https://github.com/dcc-mcp/adobepy/compare/adobepy-v0.14.0...adobepy-v0.14.1) (2026-11-19)
 
 
