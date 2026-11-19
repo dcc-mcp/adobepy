@@ -660,21 +660,17 @@
   async function findSequence(idOrName) {
     const active = await activeSequence();
     if (idOrName === void 0 || idOrName === null) return active;
+    if (sequenceIdentityMatches(active, idOrName)) return active;
     const sequences = await projectSequences(await activeProject());
     const byIdentity = sequences.find((sequence) => sequenceIdentityMatches(sequence, idOrName));
     if (byIdentity) return byIdentity;
-    if (sequenceMatches(active, idOrName)) return active;
+    if (sequenceNameMatches(active, idOrName)) return active;
     return sequences.find((sequence) => sequenceNameMatches(sequence, idOrName));
   }
   async function requireSequence(idOrName) {
     const sequence = await findSequence(idOrName);
     if (!sequence) unavailable("Premiere sequence");
     return sequence;
-  }
-  function sequenceMatches(sequence, idOrName) {
-    if (!isObject(sequence)) return false;
-    if (idOrName === void 0 || idOrName === null) return true;
-    return sequenceIdentityMatches(sequence, idOrName) || sequenceNameMatches(sequence, idOrName);
   }
   function sequenceIdentityMatches(sequence, idOrName) {
     if (!isObject(sequence) || idOrName === void 0 || idOrName === null) return false;

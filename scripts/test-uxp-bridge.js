@@ -1265,6 +1265,22 @@ async function testPremiereIdSerializationBoundaries() {
   });
   const selectedTracks = result(await rpc(collisionEnv, "premiere", "sequence", "getVideoTracks", ["seq-2"]));
   assert.strictEqual(selectedTracks[0].id, "selected-track", "an identity match must win over an active sequence name match");
+
+  let sequenceEnumerationCount = 0;
+  const activeIdentityProject = {
+    getActiveSequence: async () => active,
+    getSequences: async () => {
+      sequenceEnumerationCount += 1;
+      throw new Error("active identity should bypass sequence enumeration");
+    }
+  };
+  class ActiveIdentityProject { static async getActiveProject() { return activeIdentityProject; } }
+  const activeIdentityEnv = await loadBundle("bridges/uxp/premiere/dist/main.js", {
+    premierepro: { version: "25.6.0", Project: ActiveIdentityProject }
+  });
+  const activeTracks = result(await rpc(activeIdentityEnv, "premiere", "sequence", "getVideoTracks", ["active-guid"]));
+  assert.strictEqual(activeTracks[0].id, "active-track", "an active identity match should use the direct fast path");
+  assert.strictEqual(sequenceEnumerationCount, 0);
 }
 
 // End-to-end regression through the real RPC/DOM dispatch. A function receiver

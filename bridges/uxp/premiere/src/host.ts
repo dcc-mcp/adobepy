@@ -206,10 +206,11 @@ async function activeSequence() {
 async function findSequence(idOrName: unknown) {
   const active = await activeSequence();
   if (idOrName === undefined || idOrName === null) return active;
+  if (sequenceIdentityMatches(active, idOrName)) return active;
   const sequences = await projectSequences(await activeProject());
   const byIdentity = sequences.find((sequence) => sequenceIdentityMatches(sequence, idOrName));
   if (byIdentity) return byIdentity;
-  if (sequenceMatches(active, idOrName)) return active;
+  if (sequenceNameMatches(active, idOrName)) return active;
   return sequences.find((sequence) => sequenceNameMatches(sequence, idOrName));
 }
 
