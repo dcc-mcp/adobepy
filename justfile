@@ -35,3 +35,8 @@ package:
 
 package-quick:
     powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -SkipTests
+
+
+# Verify the pinned VX and just toolchain.
+toolchain-ci:
+    vx just@1.58 --version
